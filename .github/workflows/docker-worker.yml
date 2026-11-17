@@ -190,7 +190,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${{ github.repository_owner }}/vast-video-upscaler-worker"
+          OWNER_LC="${{ github.repository_owner }}"
+          OWNER_LC="${OWNER_LC,,}"
+          IMAGE="ghcr.io/${OWNER_LC}/vast-video-upscaler-worker"
           TAGS="${IMAGE}:dev-sha-${GITHUB_SHA::12}"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
