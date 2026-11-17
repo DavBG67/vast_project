@@ -47,22 +47,64 @@ jobs:
     needs: quality
     env:
       IMAGE_NAME: vast-video-upscaler-worker:ci-smoke
+      MIN_FREE_GB: "35"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Disk diagnostics (before cleanup)
+        run: |
+          set -euo pipefail
+          echo "== df -h =="
+          df -h
+          echo "== df -i =="
+          df -i
+          echo "== docker system df (before) =="
+          docker system df || true
+          echo "== top runner directories =="
+          sudo du -sh /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache 2>/dev/null || true
+
+      - name: Free runner disk space (safe cleanup for this job)
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /tmp/* || true
+
+      - name: Disk diagnostics (after cleanup)
+        run: |
+          set -euo pipefail
+          echo "== df -h =="
+          df -h
+          echo "== docker system df (after cleanup) =="
+          docker system df || true
+
+      - name: "Guardrail: fail early if free space is too low"
+        run: |
+          set -euo pipefail
+          FREE_GB=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "Free space on /: ${FREE_GB} GB"
+          if [ "${FREE_GB}" -lt "${MIN_FREE_GB}" ]; then
+            echo "Insufficient disk space before Docker build: ${FREE_GB} GB available, ${MIN_FREE_GB} GB required." >&2
+            exit 1
+          fi
 
       - name: Build worker image (no push)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: worker/Dockerfile
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          docker build --file worker/Dockerfile --tag "$IMAGE_NAME" .
+
+      - name: Disk diagnostics (after build)
+        run: |
+          set -euo pipefail
+          echo "== df -h =="
+          df -h
+          echo "== docker system df (after build) =="
+          docker system df || true
+          echo "== image history =="
+          docker history --no-trunc "$IMAGE_NAME" || true
 
       - name: Smoke run (entrypoint --help)
         run: |
@@ -111,6 +153,7 @@ jobs:
             echo "- Ruff: passed";
             echo "- Pytest: passed";
             echo "- Docker build (linux/amd64): passed";
+            echo "- Runner disk guardrail: passed (>= $MIN_FREE_GB GB before build)";
             echo "- Entrypoint --help: passed";
             echo "- FFmpeg/ffprobe: passed";
             echo "- AI imports: passed";

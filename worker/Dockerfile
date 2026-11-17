@@ -5,6 +5,7 @@ ARG REALESRGAN_X4PLUS_SHA256=4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     WORKER_HOME=/app/worker \
@@ -18,14 +19,20 @@ WORKDIR ${WORKER_HOME}
 
 COPY worker/requirements.txt ./requirements.txt
 RUN pip install --upgrade pip \
-    # Install pinned runtime deps except realesrgan/basicsr first.
-    # This keeps torch/torchvision from the CUDA12.1 base image as the active runtime.
-    && grep -v -E '^(realesrgan|basicsr)==' requirements.txt > requirements.core.txt \
+    # Install pinned runtime deps except torch/torchvision/realesrgan/basicsr first.
+    # Torch/CUDA comes from the base image; avoiding resolver touches prevents heavyweight redownloads.
+    && grep -v -E '^(realesrgan|basicsr|torch|torchvision)==' requirements.txt > requirements.core.txt \
     && pip install --prefer-binary -r requirements.core.txt \
-    # Install basicsr explicitly without build isolation so setup.py reuses already-installed torch.
-    && pip install --no-build-isolation basicsr==1.4.2 \
+    # Ensure runtime torch/torchvision versions expected by this image.
+    && python -c "import torch; assert torch.__version__ == '2.4.1', f'unexpected torch version: {torch.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'" \
+    && pip install --no-deps torchvision==0.19.1 \
+    # Install BasicSR runtime deps explicitly (excluding torch/torchvision managed above).
+    && pip install --prefer-binary addict future lmdb Pillow requests scikit-image scipy tb-nightly tqdm yapf \
+    # Install basicsr without build isolation and without dependency resolution.
+    && pip install --no-build-isolation --no-deps basicsr==1.4.2 \
     # Install realesrgan without dependency resolution to avoid re-triggering basicsr install.
     && pip install --no-deps realesrgan==0.3.0 \
+    && rm -rf /root/.cache/pip /tmp/pip-* \
     && rm -f requirements.core.txt
 
 RUN mkdir -p ${MODELS_DIR} \
