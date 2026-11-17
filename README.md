@@ -3,7 +3,7 @@
 Python CLI orchestrator to inspect and prepare AI upscaling workflows on Vast.ai,
 with strict financial and security guardrails.
 
-This repository currently implements phases 1, 2, and 3:
+This repository currently implements phases 1, 2, 3, 4A, 4B, 4C, 4D, and 4E:
 
 - Packaging and CLI.
 - Config loading and validation.
@@ -14,9 +14,12 @@ This repository currently implements phases 1, 2, and 3:
 - Cost estimation with explicit assumptions.
 - Offline fixture mode for tests and demos.
 - Worker Docker image with Real-ESRGAN pipeline (phase 3).
+- Instance lifecycle orchestration (phase 4E).
+- SSH/SCP transfer with strict host-key policy (phase 4C).
+- Remote worker execution and artifact validation (phase 4D).
 - Unit tests.
 
-No paid Vast.ai operation is executed in this phase.
+Paid operations are possible only through explicit user confirmation in `upscale` real mode.
 
 ## Current CLI commands
 
@@ -28,12 +31,24 @@ No paid Vast.ai operation is executed in this phase.
 - `upscaler status`
 - `upscaler history`
 
-The following commands exist as safe placeholders and return "not implemented":
+The following command remains a placeholder:
 
 - `upscaler benchmark "D:\Videos\extrait.mkv"`
-- `upscaler upscale "D:\Videos\film.mkv"`
+
+Phase 4E commands:
+
+- `upscaler upscale "D:\Videos\film.mkv" --worker-image ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>`
+- `upscaler upscale "D:\Videos\film.mkv" --worker-image <image> --dry-run`
 - `upscaler instances`
-- `upscaler destroy INSTANCE_ID`
+- `upscaler destroy 123456 --yes`
+- `upscaler session resume --session-id sess-<id>`
+- `upscaler session cleanup`
+
+Detailed docs:
+
+- Integration audit: `docs/phase4-integration-audit.md`
+- Real-test runbook (do not execute without approval): `docs/runbook-first-real-test.md`
+- Security controls: `docs/security.md`
 
 ## Worker (Phase 3)
 
@@ -78,6 +93,7 @@ Manual publish workflow (do not run without approval):
 
 - Python 3.11+
 - FFmpeg and ffprobe available in `PATH`
+- OpenSSH client tools in `PATH`: `ssh`, `scp`, `ssh-keyscan`
 - PowerShell
 
 ## Installation
@@ -99,6 +115,21 @@ pip install -e ".[dev]"
 
 Never commit `config.yaml`, `.env`, private keys, or API tokens.
 
+Required runtime parameters for real orchestration:
+
+- API key: `VAST_API_KEY`
+- SSH key path: `VAST_SSH_PRIVATE_KEY`
+- Worker image: CLI option `--worker-image`
+- Known-hosts file: CLI option `--known-hosts` (default: `%USERPROFILE%\.ssh\known_hosts`)
+
+Initial SSH trust bootstrap (operator-assisted):
+
+1. Obtain host/port from workflow output.
+2. Run `ssh-keyscan -p <port> <host>`.
+3. Verify fingerprint out-of-band.
+4. Add validated key to known_hosts.
+5. Confirm CLI prompt.
+
 ## Quick start
 
 ```powershell
@@ -107,6 +138,50 @@ upscaler inspect "D:\Videos\film.mkv"
 upscaler offers
 upscaler estimate "D:\Videos\film.mkv" --fps-processing 5
 ```
+
+Phase 4E dry-run example (no paid operation):
+
+```powershell
+upscaler upscale "D:\Videos\film.mkv" ^
+	--worker-image "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>" ^
+	--dry-run ^
+	--config "config.yaml" ^
+	--known-hosts "$HOME\.ssh\known_hosts"
+```
+
+Phase 4E real run example (requires explicit confirmation):
+
+```powershell
+upscaler upscale "D:\Videos\film.mkv" ^
+	--worker-image "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>" ^
+	--config "config.yaml" ^
+	--known-hosts "$HOME\.ssh\known_hosts"
+```
+
+Other operational commands:
+
+```powershell
+upscaler instances --config "config.yaml"
+upscaler destroy 123456 --config "config.yaml" --yes
+upscaler session resume --session-id sess-<id> --config "config.yaml" --known-hosts "$HOME\.ssh\known_hosts"
+upscaler session cleanup --config "config.yaml"
+upscaler status
+upscaler history --limit 20
+```
+
+Produced files and local state:
+
+- Output video default: `<input-dir>/<input-stem>-upscaled.<ext>`
+- Output report default: `<output-video>.report.json`
+- Session store: `%USERPROFILE%\.vast_upscaler\sessions.json`
+- Workflow lock: `%USERPROFILE%\.vast_upscaler\workflow.lock`
+
+Common errors and actions:
+
+- `Session store is corrupted`: stop paid runs and reconcile active instances in Vast console first.
+- `SSH trust bootstrap required`: validate fingerprint manually, update known_hosts, then retry.
+- `Destroy requested but disappearance not verified`: run `upscaler instances`, then `upscaler destroy <id> --yes`, then `upscaler session cleanup`.
+- `Cancelled before paid operation`: rerun and confirm only if estimate/risk is acceptable.
 
 Offline mode (no Vast API call):
 
@@ -137,13 +212,18 @@ pytest
 - `src/vast_upscaler/`: Python package.
 - `tests/`: unit tests.
 
-## Limits in phase 1
+Phase 4E safeguards:
 
-Phase 3 limits and safeguards:
-
-- Client only uses read-only endpoints.
-- No create/stop/start/destroy instance path is implemented.
+- Paid creation requires explicit confirmation.
+- `--dry-run` never creates or destroys instances.
+- Strict SSH host key checking remains enabled.
+- Local timeout is not a billing ceiling guarantee.
+- Cleanup verifies instance disappearance; API success alone is insufficient.
+- Ambiguous creation/processing outcomes are preserved for manual reconciliation.
 - Cost estimation is hypothesis-driven and can be partial.
 - No benchmark-derived processing speed is available yet.
-- Worker CI is CPU-only (no paid GPU validation in CI).
-- CUDA execution must be validated on a real NVIDIA environment.
+- Worker CI remains CPU-only (no paid GPU validation in CI).
+
+Financial note:
+
+- Max session duration and hourly price constraints are guardrails, not absolute billing guarantees.

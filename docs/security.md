@@ -1,4 +1,4 @@
-# Security and Cost Controls (Phase 3)
+# Security and Cost Controls (Phase 4E)
 
 ## Secrets
 
@@ -10,37 +10,58 @@
 
 ## Financial safety
 
-Phase 2 still does not perform paid operations.
+Implemented controls in phase 4E:
 
-Implemented controls:
+- Read-only and write clients are separated (`vast_client` vs `vast_write_client`).
+- Paid creation requires explicit confirmation in `upscaler upscale` real mode.
+- `--dry-run` never creates or destroys instances.
+- Offer selection enforces configured price/reliability/disk constraints.
+- Session records persist estimated costs and variable-cost notes.
+- Local max session duration is enforced as a guardrail.
+- Automatic cleanup targets only session-owned instances.
+- Destruction verification requires disappearance polling; API success alone is insufficient.
 
-- Read-only endpoint allowlist in `vast_client`.
-- Runtime block on non-whitelisted endpoints.
-- No create/start/stop/destroy instance method in CLI.
-- Explicit offline mode for tests and demos.
-- Retry with bounded backoff for transient errors only.
-- Worker image contains no API keys or private SSH keys.
-- Worker runs as non-root user in container.
+Important limitation:
 
-Future phases must enforce:
-
-- Explicit confirmation before any rental.
-- Session budget ceiling.
-- Time limit and watchdog strategy.
-- Verified instance destruction by API response.
+- Price ceilings and local timeouts reduce risk but do not guarantee final billed cost.
 
 ## File safety
 
-- Source local videos are never deleted by phase 1 code.
-- Existing output overwrite logic is not implemented yet and must be explicit in phase 4.
+- Source local videos are never deleted by orchestration code.
+- Download publication is atomic.
+- Local overwrite is refused by default unless explicitly enabled.
+- Session diagnostics are preserved for recovery on ambiguous failures.
 
-## SSH policy (future)
+## SSH trust policy (phase 4C+)
 
-When transfers are implemented:
+Current transport policy:
 
-- Host key validation must remain enabled.
-- No plaintext transfer channels.
-- Transfer completion requires size/checksum verification.
+- Host key validation is mandatory (`StrictHostKeyChecking=yes`).
+- A dedicated known_hosts file is required before any SSH/SCP call.
+- No plaintext transfer channel is allowed.
+- Download publication remains atomic and overwrite is refused unless explicitly requested.
+
+Trust bootstrap strategy for a newly created Vast.ai instance:
+
+1. Acquire SSH endpoint details from Vast API and verify expected provider/offer metadata.
+2. Retrieve host keys with `ssh-keyscan -p <port> <host>` from a trusted operator workstation.
+3. Compare fingerprint out-of-band with the instance details visible in Vast console/provider context.
+4. Append only validated keys to the dedicated known_hosts file used by the session.
+5. Keep host key checking strict for all subsequent SSH/SCP operations.
+
+Operator interaction in phase 4E CLI (`upscaler upscale` / `upscaler session resume`):
+
+1. CLI detects missing/untrusted host key entry for `<host>:<port>`.
+2. CLI pauses and asks explicit operator confirmation.
+3. Operator validates fingerprint and updates the dedicated `known_hosts` file.
+4. Operator confirms only after validation.
+5. CLI proceeds with strict host-key verification still enabled.
+
+If host identity changes unexpectedly:
+
+- Abort automation immediately.
+- Preserve diagnostics.
+- Require explicit operator re-validation before any reconnection.
 
 ## Estimation safety
 
@@ -48,6 +69,22 @@ When transfers are implemented:
 - Without benchmark data, estimates are labeled as simulation.
 - Unknown costs remain unknown and are not silently fabricated.
 - Storage is not double-counted when already included in hourly total pricing.
+- Transfer costs can still vary in real billing and are treated as variable/uncertain.
+
+## Crash and orphan recovery
+
+- Local interruption transitions session to `PRESERVED_FOR_RECOVERY`.
+- `upscaler session resume` performs manual-first recovery checks.
+- `upscaler session cleanup` attempts cleanup only for owned instances.
+- If destroy verification fails, session remains in cleanup-required state and operator action is required.
+
+Manual orphan procedure:
+
+1. Run `upscaler instances`.
+2. Run `upscaler destroy <instance_id> --yes` for the orphan.
+3. Run `upscaler session cleanup`.
+4. Re-check with `upscaler instances`.
+5. If still active, destroy in Vast console and keep diagnostics.
 
 ## Worker runtime safety
 

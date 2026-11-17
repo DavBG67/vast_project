@@ -1,8 +1,8 @@
-# Vast Video Upscaler Architecture (Phase 3)
+# Vast Video Upscaler Architecture (Phase 4E)
 
 ## Scope
 
-Phases 1 to 3 deliver:
+Phases 1 to 4E deliver:
 
 - Python package and CLI.
 - Config loading and validation.
@@ -11,7 +11,9 @@ Phases 1 to 3 deliver:
 - Read-only Vast.ai offers discovery.
 - Offer filtering, ranking, and simulation-based cost estimation.
 - Standalone worker container for Real-ESRGAN GPU upscaling.
-- No paid Vast.ai operation.
+- Writable Vast instance lifecycle orchestration with explicit confirmation guardrails.
+- Strict SSH/SCP transport with host-key verification.
+- Remote worker execution and artifact recovery paths.
 
 ## Components
 
@@ -22,6 +24,11 @@ Phases 1 to 3 deliver:
 - `vast_upscaler.vast_client`: strict read-only HTTP client for Vast API.
 - `vast_upscaler.offers`: offer query/filter/ranking logic independent from HTTP.
 - `vast_upscaler.cost`: estimation logic with explicit unknowns and assumptions.
+- `vast_upscaler.vast_write_client`: writable Vast API client for create/show/list/destroy.
+- `vast_upscaler.instances`: lifecycle helpers (create/wait/destroy ownership checks).
+- `vast_upscaler.transfer`: OpenSSH-based transfer and remote command execution.
+- `vast_upscaler.remote_worker`: remote worker command + report/output validation.
+- `vast_upscaler.orchestrator`: phase 4E workflow assembly and recovery/cleanup.
 - `worker/process.py`: end-to-end worker runtime.
 - `worker/video_probe.py`: ffprobe parsing and validation.
 - `worker/pipelines/realesrgan.py`: Real-ESRGAN CUDA inference module.
@@ -41,12 +48,10 @@ Phases 1 to 3 deliver:
 
 ## Lifecycle status
 
-The target lifecycle is documented but not yet fully executed:
+Implemented lifecycle model includes:
 
-- `CREATED -> STARTING -> READY -> UPLOADING -> PROCESSING -> DOWNLOADING -> VERIFYING -> COMPLETED -> DESTROYED`
-- `FAILED`, `INTERRUPTED`, `CLEANUP_PENDING`
-
-Full lifecycle automation is planned for phase 4.
+- `CREATED -> OFFER_SELECTED -> CONFIRMED -> INSTANCE_REQUESTED -> INSTANCE_CREATED -> INSTANCE_READY -> PROCESSING -> DOWNLOADING -> VERIFYING -> COMPLETED -> DESTROYED`
+- Recovery/cleanup states: `FAILED`, `PRESERVED_FOR_RECOVERY`, `CLEANUP_PENDING`, `CLEANUP_REQUIRED`, `CANCELLED`
 
 ## API boundaries and guardrails
 
@@ -65,10 +70,8 @@ Full lifecycle automation is planned for phase 4.
 - Balanced profile is implemented; other profiles intentionally fail explicitly.
 - CPU CI validates build and unit tests but does not validate CUDA throughput/quality.
 
-## Extension points
+## Remaining extension points
 
-The following modules are intentionally not active yet:
-
-- `instances.py` (phase 4)
-- `transfer.py` (phase 4)
-- `orchestrator.py` (phase 4)
+- UX and policy hardening around recovery decisions.
+- Expanded resume strategies for partially completed sessions.
+- Real-world performance/cost calibration from benchmark data.
