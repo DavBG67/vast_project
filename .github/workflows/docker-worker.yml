@@ -125,7 +125,7 @@ jobs:
 
       - name: Verify pinned torch/cuda compatibility
         run: |
-          docker run --rm --entrypoint python $IMAGE_NAME -c "import torch, torchvision; assert torch.__version__ == '2.4.1', f'unexpected torch version: {torch.__version__}'; assert torchvision.__version__ == '0.19.1', f'unexpected torchvision version: {torchvision.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'"
+          docker run --rm --entrypoint python $IMAGE_NAME -c "import importlib.util, torch, torchvision; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; assert Version(torch.__version__).release == (2, 4, 1), f'unexpected torch public version: {torch.__version__}'; assert Version(torchvision.__version__).release == (0, 19, 1), f'unexpected torchvision public version: {torchvision.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'"
 
       - name: Verify model file integrity in image
         run: |

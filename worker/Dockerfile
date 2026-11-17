@@ -23,8 +23,8 @@ RUN pip install --upgrade pip \
     # Torch/CUDA comes from the base image; avoiding resolver touches prevents heavyweight redownloads.
     && grep -v -E '^(realesrgan|basicsr|torch|torchvision)==' requirements.txt > requirements.core.txt \
     && pip install --prefer-binary -r requirements.core.txt \
-    # Ensure runtime torch/torchvision versions expected by this image.
-    && python -c "import torch; assert torch.__version__ == '2.4.1', f'unexpected torch version: {torch.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'" \
+    # Ensure runtime torch version and compiled CUDA version expected by this image.
+    && python -c "import importlib.util, torch; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; assert Version(torch.__version__).release == (2, 4, 1), f'unexpected torch public version: {torch.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'" \
     && pip install --no-deps torchvision==0.19.1 \
     # Install BasicSR runtime deps explicitly (excluding torch/torchvision managed above).
     && pip install --prefer-binary addict future lmdb Pillow requests scikit-image scipy tb-nightly tqdm yapf \
