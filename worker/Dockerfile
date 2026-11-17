@@ -18,7 +18,12 @@ WORKDIR ${WORKER_HOME}
 
 COPY worker/requirements.txt ./requirements.txt
 RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
+    # Install pinned runtime deps except basicsr first (reuses torch from base image).
+    && grep -v '^basicsr==' requirements.txt > requirements.nobasicsr.txt \
+    && pip install --prefer-binary -r requirements.nobasicsr.txt \
+    # basicsr is installed without build isolation to avoid pulling a second torch/CUDA stack.
+    && pip install --no-build-isolation basicsr==1.4.2 \
+    && rm -f requirements.nobasicsr.txt
 
 RUN mkdir -p ${MODELS_DIR} \
     && curl -L -o ${MODELS_DIR}/RealESRGAN_x4plus.pth \
