@@ -1,0 +1,21 @@
+vast:
+  gpu_models:
+    - RTX 3090 Ti
+    - RTX 3090
+    - RTX 4090
+  max_hourly_price_usd: 0.30
+  min_reliability: 0.99
+  verified_only: true
+  disk_gb: 50
+  max_session_hours: 12
+
+video:
+  target_width: 1920
+  target_height: 1080
+  default_profile: balanced
+  output_container: mkv
+  video_codec: hevc
+
+transfer:
+  method: sftp
+  verify_checksum: true

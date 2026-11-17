@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vast-video-upscaler"
+version = "0.1.0"
+description = "Local orchestrator for AI video upscaling on Vast.ai"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Vast Video Upscaler Maintainers" }]
+dependencies = [
+  "typer>=0.12.5,<1.0",
+  "pydantic>=2.9,<3.0",
+  "PyYAML>=6.0.2,<7.0",
+  "httpx>=0.28,<1.0",
+  "rich>=13.9,<15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9.0",
+  "ruff>=0.8,<1.0",
+]
+
+[project.scripts]
+upscaler = "vast_upscaler.cli:run"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local runtime state
+.vast_upscaler/
+*.log
+
+# Secrets
+.env
+config.yaml
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

@@ -1,0 +1,62 @@
+{
+  "offers": [
+    {
+      "id": 31129,
+      "gpu_name": "RTX 3090 Ti",
+      "num_gpus": 1,
+      "dph_total": 0.228,
+      "reliability": 0.9987,
+      "verification": "verified",
+      "direct_port_count": 2,
+      "disk_space": 70,
+      "cpu_ram": 32768,
+      "geolocation": "Korea, KR",
+      "dlperf": 25.0,
+      "total_flops": 40.0,
+      "inet_down": 800,
+      "inet_up": 500,
+      "cpu_cores_effective": 6,
+      "search": {
+        "gpuCostPerHour": 0.190,
+        "diskHour": 0.038,
+        "totalHour": 0.228
+      },
+      "storage_cost": 0.12
+    },
+    {
+      "id": 40001,
+      "gpu_name": "RTX 4090",
+      "num_gpus": 1,
+      "dph_total": 0.260,
+      "reliability": 0.9960,
+      "verification": "verified",
+      "direct_port_count": 1,
+      "disk_space": 100,
+      "cpu_ram": 65536,
+      "geolocation": "France, FR",
+      "dlperf": 32.0,
+      "total_flops": 55.0,
+      "inet_down": 1000,
+      "inet_up": 700,
+      "cpu_cores_effective": 8,
+      "search": {
+        "gpuCostPerHour": 0.210,
+        "diskHour": 0.050,
+        "totalHour": 0.260
+      },
+      "storage_cost": 0.10
+    },
+    {
+      "id": 50002,
+      "gpu_name": "RTX 3090",
+      "num_gpus": 2,
+      "dph_total": 0.240,
+      "reliability": 0.9990,
+      "verification": "verified",
+      "direct_port_count": 1,
+      "disk_space": 120,
+      "cpu_ram": 32768,
+      "geolocation": "Germany, DE"
+    }
+  ]
+}
