@@ -75,6 +75,32 @@ Goal: validate real CUDA execution and output quality on a short sample.
   - output duration/frame cadence are coherent,
   - visual quality is acceptable.
 
+## Issues found during first real GPU run (Phase 3C)
+
+1. BasicSR import compatibility issue:
+- Error: `No module named 'torchvision.transforms.functional_tensor'`.
+- Fix: build-time patch in Docker image for `basicsr/data/degradations.py`.
+
+2. FFmpeg staged output naming issue:
+- Error: ffmpeg could not infer output format from `*.mp4.tmp`.
+- Fix: staged path now keeps final extension (`*.tmp.mp4`, `*.tmp.mkv`).
+
+3. Reporting issue on late failures:
+- Symptom: `frames_processed=0` despite visible tile processing.
+- Fix: preserve processed frame count when failure happens after upscaling.
+
+## Post-fix SSH retest checklist
+
+1. Pull fixed image tag on Vast.ai SSH instance.
+2. Run:
+  - `python -c "import basicsr.data.degradations; from basicsr.data.degradations import rgb_to_grayscale; from realesrgan import RealESRGANer; print('imports-ok')"`
+3. Execute worker command on a short clip.
+4. Confirm report fields:
+  - `status=completed` on success,
+  - non-zero `frames_processed` when processing started,
+  - coherent `processing_fps` and timing.
+5. Destroy instance.
+
 9. Destroy instance
 - Terminate instance immediately after validation.
 

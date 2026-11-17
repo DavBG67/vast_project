@@ -32,6 +32,12 @@ class WorkerError(RuntimeError):
     pass
 
 
+class ProcessingStageError(WorkerError):
+    def __init__(self, message: str, frames_processed: int) -> None:
+        super().__init__(message)
+        self.frames_processed = frames_processed
+
+
 _STOP_REQUESTED = False
 
 
@@ -79,6 +85,8 @@ def main() -> int:
 
     started = time.perf_counter()
     notes: list[str] = []
+    frames_processed = 0
+    staged_output: Path | None = None
 
     try:
         if not input_path.exists():
@@ -111,9 +119,9 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="vast_worker_") as temp_dir:
             temp_dir_path = Path(temp_dir)
             encoded_video = temp_dir_path / "video_only.mkv"
-            staged_output = output_path.with_suffix(output_path.suffix + ".tmp")
+            staged_output = _build_staged_output_path(output_path)
 
-            frames = run_streaming_upscale(
+            frames_processed = run_streaming_upscale(
                 input_path=input_path,
                 encoded_video_path=encoded_video,
                 source_width=source.width,
@@ -133,14 +141,14 @@ def main() -> int:
             staged_output.rename(output_path)
 
             elapsed = time.perf_counter() - started
-            fps = (frames / elapsed) if elapsed > 0 else 0.0
+            fps = (frames_processed / elapsed) if elapsed > 0 else 0.0
             report = ProcessingReport(
                 status="completed",
                 source=str(input_path),
                 output=str(output_path),
                 model=model.name,
                 profile=args.profile,
-                frames_processed=frames,
+                frames_processed=frames_processed,
                 processing_seconds=elapsed,
                 processing_fps=fps,
                 gpu=RealesrganUpscaler.detect_gpu_name(),
@@ -152,11 +160,46 @@ def main() -> int:
         return 0
 
     except ProfileNotSupportedError as exc:
-        return _fail(report_path, args, started, notes + [str(exc)], status="failed")
+        _cleanup_staged_output(staged_output)
+        return _fail(
+            report_path,
+            args,
+            started,
+            notes + [str(exc)],
+            status="failed",
+            frames_processed=frames_processed,
+        )
+    except ProcessingStageError as exc:
+        _cleanup_staged_output(staged_output)
+        frames_processed = max(frames_processed, exc.frames_processed)
+        return _fail(
+            report_path,
+            args,
+            started,
+            notes + [str(exc)],
+            status="failed",
+            frames_processed=frames_processed,
+        )
     except (WorkerError, ProbeError, RealesrganError) as exc:
-        return _fail(report_path, args, started, notes + [str(exc)], status="failed")
+        _cleanup_staged_output(staged_output)
+        return _fail(
+            report_path,
+            args,
+            started,
+            notes + [str(exc)],
+            status="failed",
+            frames_processed=frames_processed,
+        )
     except Exception as exc:  # noqa: BLE001
-        return _fail(report_path, args, started, notes + [f"Unexpected error: {exc}"], status="failed")
+        _cleanup_staged_output(staged_output)
+        return _fail(
+            report_path,
+            args,
+            started,
+            notes + [f"Unexpected error: {exc}"],
+            status="failed",
+            frames_processed=frames_processed,
+        )
 
 
 def run_streaming_upscale(
@@ -255,10 +298,10 @@ def run_streaming_upscale(
 
         if decode_code != 0:
             stderr = _safe_decode(decoder.stderr)
-            raise WorkerError(f"FFmpeg decode failed: {stderr}")
+            raise ProcessingStageError(f"FFmpeg decode failed: {stderr}", frames_processed=frames)
         if encode_code != 0:
             stderr = _safe_decode(encoder.stderr)
-            raise WorkerError(f"FFmpeg encode failed: {stderr}")
+            raise ProcessingStageError(f"FFmpeg encode failed: {stderr}", frames_processed=frames)
 
         if frames == 0:
             raise WorkerError("No frames were processed")
@@ -361,6 +404,24 @@ def mux_with_source_streams(input_path: Path, video_only_path: Path, output_path
         raise WorkerError(result_fallback.stderr.strip() or "Failed to mux output streams")
 
 
+def _build_staged_output_path(output_path: Path) -> Path:
+    suffix = output_path.suffix
+    if suffix:
+        return output_path.with_name(f"{output_path.stem}.tmp{suffix}")
+    return output_path.with_name(f"{output_path.name}.tmp")
+
+
+def _cleanup_staged_output(staged_output: Path | None) -> None:
+    if staged_output is None:
+        return
+    try:
+        if staged_output.exists():
+            staged_output.unlink()
+    except OSError:
+        # Keep original failure reason; temp cleanup is best effort.
+        pass
+
+
 def validate_output(output_path: Path, source_duration: float | None, source_fps: float) -> None:
     if not output_path.exists():
         raise WorkerError("Output file was not produced")
@@ -400,7 +461,14 @@ def write_report(path: Path, report: ProcessingReport) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _fail(report_path: Path, args: argparse.Namespace, started: float, notes: list[str], status: str) -> int:
+def _fail(
+    report_path: Path,
+    args: argparse.Namespace,
+    started: float,
+    notes: list[str],
+    status: str,
+    frames_processed: int = 0,
+) -> int:
     elapsed = time.perf_counter() - started
     report = ProcessingReport(
         status=status,
@@ -408,9 +476,9 @@ def _fail(report_path: Path, args: argparse.Namespace, started: float, notes: li
         output=str(args.output),
         model="realesrgan",
         profile=str(args.profile),
-        frames_processed=0,
+        frames_processed=max(0, frames_processed),
         processing_seconds=elapsed,
-        processing_fps=0.0,
+        processing_fps=(max(0, frames_processed) / elapsed) if elapsed > 0 else 0.0,
         gpu=RealesrganUpscaler.detect_gpu_name(),
         notes=notes,
     )

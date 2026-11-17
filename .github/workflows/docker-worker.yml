@@ -123,6 +123,18 @@ jobs:
         run: |
           docker run --rm --entrypoint python $IMAGE_NAME -c "import torch, torchvision, realesrgan, basicsr, cv2; print('torch=' + torch.__version__); print('torchvision=' + torchvision.__version__); print('realesrgan=' + realesrgan.__version__); print('basicsr=' + basicsr.__version__); print('opencv=' + cv2.__version__); print('torch_cuda_compiled=' + str(torch.version.cuda)); print('cudnn_compiled=' + str(torch.backends.cudnn.version())); print('cuda_available_runtime=' + str(torch.cuda.is_available()))" | tee runtime-info.txt
 
+      - name: Verify BasicSR and Real-ESRGAN import path compatibility
+        run: |
+          docker run --rm --entrypoint python $IMAGE_NAME -c "import basicsr.data.degradations; from basicsr.data.degradations import rgb_to_grayscale; from basicsr.archs.rrdbnet_arch import RRDBNet; from realesrgan import RealESRGANer; print('imports_ok')"
+
+      - name: Verify staged temporary output path keeps container extension
+        run: |
+          docker run --rm --entrypoint python $IMAGE_NAME -c "from pathlib import Path; from process import _build_staged_output_path; p = _build_staged_output_path(Path('/workspace/output/test-upscaled.mp4')); assert p.name == 'test-upscaled.tmp.mp4', p; q = _build_staged_output_path(Path('/workspace/output/test-upscaled.mkv')); assert q.name == 'test-upscaled.tmp.mkv', q; print('temp_path_ok')"
+
+      - name: Verify CPU ffmpeg short encode and ffprobe
+        run: |
+          docker run --rm --entrypoint bash $IMAGE_NAME -lc "set -euo pipefail; TMPDIR=\$(mktemp -d); ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=320x180:rate=24 -t 1 -c:v libx264 -pix_fmt yuv420p \$TMPDIR/src.mp4; ffmpeg -hide_banner -loglevel error -y -i \$TMPDIR/src.mp4 -c:v libx265 -an \$TMPDIR/out.mp4; ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=codec_name,width,height -of default=noprint_wrappers=1 \$TMPDIR/out.mp4 | tee \$TMPDIR/ffprobe.txt; grep -q 'codec_name=hevc' \$TMPDIR/ffprobe.txt; grep -q 'width=320' \$TMPDIR/ffprobe.txt; grep -q 'height=180' \$TMPDIR/ffprobe.txt"
+
       - name: Verify pinned torch/cuda compatibility
         run: |
           docker run --rm --entrypoint python $IMAGE_NAME -c "import importlib.util, torch, torchvision; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; assert Version(torch.__version__).release == (2, 4, 1), f'unexpected torch public version: {torch.__version__}'; assert Version(torchvision.__version__).release == (0, 19, 1), f'unexpected torchvision public version: {torchvision.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'"
@@ -157,11 +169,14 @@ jobs:
             echo "- Entrypoint --help: passed";
             echo "- FFmpeg/ffprobe: passed";
             echo "- AI imports: passed";
+            echo "- BasicSR/Real-ESRGAN targeted imports: passed";
+            echo "- Temp output path (.tmp.<ext>): passed";
+            echo "- CPU ffmpeg short encode + ffprobe: passed";
             echo "- Runtime versions:";
             sed 's/^/  - /' runtime-info.txt;
             echo "- Model SHA256 check: passed";
             echo "- Image size: ${{ steps.image-size.outputs.size_mb }} MB (${{ steps.image-size.outputs.size_bytes }} bytes)";
-            echo "- Note: GPU runtime compatibility is NOT validated by this workflow.";
+            echo "- Note: GPU runtime compatibility and CUDA inference are NOT validated by this workflow.";
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish-ghcr:
