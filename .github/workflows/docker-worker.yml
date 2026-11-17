@@ -36,11 +36,11 @@ jobs:
 
       - name: Ruff
         run: |
-          ruff check .
+          python -m ruff check .
 
       - name: Pytest
         run: |
-          pytest
+          python -m pytest
 
   build-smoke:
     runs-on: ubuntu-latest

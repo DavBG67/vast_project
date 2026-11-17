@@ -26,11 +26,9 @@ dev = [
 [project.scripts]
 upscaler = "vast_upscaler.cli:run"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["vast_upscaler*", "worker*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
