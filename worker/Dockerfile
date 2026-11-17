@@ -31,7 +31,7 @@ RUN pip install --upgrade pip \
     # Install basicsr without build isolation and without dependency resolution.
     && pip install --no-build-isolation --no-deps basicsr==1.4.2 \
     # Patch BasicSR import for torchvision>=0.19 where functional_tensor module path is removed.
-    && python -c "from pathlib import Path; import basicsr; p = Path(basicsr.__file__).resolve().parent / 'data' / 'degradations.py'; old = 'from torchvision.transforms.functional_tensor import rgb_to_grayscale'; new = 'from torchvision.transforms.functional import rgb_to_grayscale'; s = p.read_text(encoding='utf-8'); assert old in s, f'expected BasicSR patch target not found in {p}'; p.write_text(s.replace(old, new), encoding='utf-8')" \
+    && python -c "import importlib.util; from pathlib import Path; spec = importlib.util.find_spec('basicsr'); assert spec is not None and spec.submodule_search_locations, 'basicsr package path not found'; base = Path(next(iter(spec.submodule_search_locations))); p = base / 'data' / 'degradations.py'; old = 'from torchvision.transforms.functional_tensor import rgb_to_grayscale'; new = 'from torchvision.transforms.functional import rgb_to_grayscale'; s = p.read_text(encoding='utf-8'); assert old in s, f'expected BasicSR patch target not found in {p}'; p.write_text(s.replace(old, new), encoding='utf-8')" \
     # Fail fast if runtime imports still cannot load the patched BasicSR path.
     && python -c "import basicsr; import basicsr.data.degradations; from basicsr.data.degradations import rgb_to_grayscale; print('basicsr_patch_ok')" \
     # Install realesrgan without dependency resolution to avoid re-triggering basicsr install.
