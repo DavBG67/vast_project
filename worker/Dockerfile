@@ -18,12 +18,15 @@ WORKDIR ${WORKER_HOME}
 
 COPY worker/requirements.txt ./requirements.txt
 RUN pip install --upgrade pip \
-    # Install pinned runtime deps except basicsr first (reuses torch from base image).
-    && grep -v '^basicsr==' requirements.txt > requirements.nobasicsr.txt \
-    && pip install --prefer-binary -r requirements.nobasicsr.txt \
-    # basicsr is installed without build isolation to avoid pulling a second torch/CUDA stack.
+    # Install pinned runtime deps except realesrgan/basicsr first.
+    # This keeps torch/torchvision from the CUDA12.1 base image as the active runtime.
+    && grep -v -E '^(realesrgan|basicsr)==' requirements.txt > requirements.core.txt \
+    && pip install --prefer-binary -r requirements.core.txt \
+    # Install basicsr explicitly without build isolation so setup.py reuses already-installed torch.
     && pip install --no-build-isolation basicsr==1.4.2 \
-    && rm -f requirements.nobasicsr.txt
+    # Install realesrgan without dependency resolution to avoid re-triggering basicsr install.
+    && pip install --no-deps realesrgan==0.3.0 \
+    && rm -f requirements.core.txt
 
 RUN mkdir -p ${MODELS_DIR} \
     && curl -L -o ${MODELS_DIR}/RealESRGAN_x4plus.pth \
