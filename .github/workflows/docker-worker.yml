@@ -47,7 +47,7 @@ jobs:
     needs: quality
     env:
       IMAGE_NAME: vast-video-upscaler-worker:ci-smoke
-      MIN_FREE_GB: "35"
+      MIN_FREE_GB: "30"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
