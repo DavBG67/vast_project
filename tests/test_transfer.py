@@ -55,6 +55,8 @@ def _conn(tmp_path: Path) -> SshConnectionInfo:
 def test_run_remote_command_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     conn = _conn(tmp_path)
 
+    monkeypatch.setattr("vast_upscaler.transfer.preferred_kex_algorithms_for_local_ssh", lambda: ["curve25519-sha256"])
+
     def fake_runner(*args, **kwargs):
         return _cp(returncode=0, stdout="ok\n", stderr="")
 
@@ -68,6 +70,27 @@ def test_run_remote_command_success(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     )
     assert result.returncode == 0
     assert result.stdout == "ok\n"
+
+
+def test_run_remote_command_passes_kex_algorithms_option(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    conn = _conn(tmp_path)
+    monkeypatch.setattr("vast_upscaler.transfer.preferred_kex_algorithms_for_local_ssh", lambda: ["curve25519-sha256"])
+
+    captured = {}
+
+    def fake_runner(args, **kwargs):
+        captured["args"] = args
+        return _cp(returncode=0, stdout="ok\n", stderr="")
+
+    transport = OpenSshTransport(runner=fake_runner)
+    transport.run_remote_command(
+        conn,
+        command=["echo", "ok"],
+        timeout_seconds=5,
+        retry_policy=RetryPolicy(max_attempts=1),
+        idempotent=True,
+    )
+    assert "KexAlgorithms=curve25519-sha256" in captured["args"]
 
 
 def test_run_remote_command_host_key_failure(tmp_path: Path) -> None:
@@ -465,3 +488,39 @@ def test_validate_local_ssh_prerequisites_creates_known_hosts(monkeypatch: pytes
     monkeypatch.setattr("vast_upscaler.transfer.shutil.which", lambda _name: "C:/Windows/System32/OpenSSH/ssh.exe")
     validate_local_ssh_prerequisites(private_key_path=key, known_hosts_path=kh)
     assert kh.exists()
+
+
+def test_fetch_host_key_fallbacks_when_ssh_keyscan_kex_unsupported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        command = args[0]
+        if command == "ssh-keyscan":
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=255,
+                stdout="",
+                stderr="choose_kex: unsupported KEX method sntrup761x25519-sha512@openssh.com",
+            )
+        if command == "ssh" and args[1:3] == ["-Q", "kex"]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="curve25519-sha256\ncurve25519-sha256@libssh.org\n",
+                stderr="",
+            )
+        if command == "ssh":
+            kh_arg = next(item for item in args if item.startswith("UserKnownHostsFile="))
+            kh_path = Path(kh_arg.split("=", 1)[1])
+            kh_path.write_text("[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==\n", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=255, stdout="", stderr="Permission denied (publickey).")
+        raise AssertionError(f"Unexpected command: {args}")
+
+    monkeypatch.setattr("vast_upscaler.transfer.subprocess.run", fake_run)
+    key = fetch_ssh_ed25519_host_key(host="1.2.3.4", port=17022)
+
+    assert key.marker == "[1.2.3.4]:17022"
+    assert key.sha256_fingerprint.startswith("SHA256:")
+    probe_call = next(cmd for cmd in calls if cmd[0] == "ssh" and "-Q" not in cmd)
+    assert any(item.startswith("KexAlgorithms=curve25519-sha256,curve25519-sha256@libssh.org") for item in probe_call)

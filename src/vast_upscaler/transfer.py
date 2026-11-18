@@ -108,6 +108,14 @@ class RemoteCommandResult:
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
+_PREFERRED_KEX_CANDIDATES = [
+    "sntrup761x25519-sha512@openssh.com",
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "diffie-hellman-group14-sha256",
+]
+
 
 class OpenSshTransport:
     def __init__(self, runner: CommandRunner | None = None) -> None:
@@ -287,7 +295,7 @@ class OpenSshTransport:
         raise TransferError("Transfer failed without a classified error.")
 
     def _build_ssh_args(self, conn: SshConnectionInfo) -> list[str]:
-        return [
+        args = [
             "ssh",
             "-i",
             str(conn.private_key_path),
@@ -303,12 +311,25 @@ class OpenSshTransport:
             f"UserKnownHostsFile={conn.known_hosts_path}",
             "-o",
             "NumberOfPasswordPrompts=0",
+        ]
+        kex_algorithms = preferred_kex_algorithms_for_local_ssh()
+        if kex_algorithms:
+            args.extend(
+                [
+                    "-o",
+                    f"KexAlgorithms={','.join(kex_algorithms)}",
+                ]
+            )
+        args.extend(
+            [
             f"{conn.username}@{conn.host}",
             "--",
-        ]
+            ]
+        )
+        return args
 
     def _build_scp_args(self, conn: SshConnectionInfo) -> list[str]:
-        return [
+        args = [
             "scp",
             "-i",
             str(conn.private_key_path),
@@ -325,6 +346,15 @@ class OpenSshTransport:
             "-o",
             "NumberOfPasswordPrompts=0",
         ]
+        kex_algorithms = preferred_kex_algorithms_for_local_ssh()
+        if kex_algorithms:
+            args.extend(
+                [
+                    "-o",
+                    f"KexAlgorithms={','.join(kex_algorithms)}",
+                ]
+            )
+        return args
 
     def _exec(self, args: list[str], *, timeout_seconds: float) -> subprocess.CompletedProcess[str]:
         try:
@@ -478,6 +508,14 @@ def fetch_ssh_ed25519_host_key(*, host: str, port: int, timeout_seconds: float =
 
     lines = [line.strip() for line in completed.stdout.splitlines() if line.strip() and not line.startswith("#")]
     if completed.returncode != 0 and not lines:
+        if _is_unsupported_kex_error(completed.stderr):
+            fallback = _fetch_ssh_ed25519_host_key_with_ssh(
+                host=host,
+                port=port,
+                timeout_seconds=timeout_seconds,
+            )
+            if fallback is not None:
+                return fallback
         stderr = completed.stderr.strip() or "ssh-keyscan failed"
         raise SshConnectionError(stderr)
     if not lines:
@@ -511,6 +549,28 @@ def add_known_host_key(*, known_hosts_path: Path, host_key: KnownHostKey) -> Non
         if kh_path.stat().st_size > 0:
             handle.write("\n")
         handle.write(host_key.source_line)
+
+
+def local_ssh_supported_kex_algorithms() -> set[str]:
+    try:
+        completed = subprocess.run(
+            ["ssh", "-Q", "kex"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+            shell=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    return {line.strip() for line in completed.stdout.splitlines() if line.strip()}
+
+
+def preferred_kex_algorithms_for_local_ssh() -> list[str]:
+    supported = local_ssh_supported_kex_algorithms()
+    return [name for name in _PREFERRED_KEX_CANDIDATES if name in supported]
 
 
 def compute_transfer_timeout_seconds(
@@ -572,3 +632,62 @@ def _fingerprint_from_key_data(key_data: str) -> str:
         raise SshKnownHostsError("Invalid SSH public key payload in known_hosts/ssh-keyscan output.") from exc
     digest = hashlib.sha256(key_bytes).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _is_unsupported_kex_error(stderr: str | None) -> bool:
+    text = (stderr or "").lower()
+    return "choose_kex" in text and "unsupported kex method" in text
+
+
+def _fetch_ssh_ed25519_host_key_with_ssh(*, host: str, port: int, timeout_seconds: float) -> KnownHostKey | None:
+    kex_algorithms = preferred_kex_algorithms_for_local_ssh()
+    if not kex_algorithms:
+        return None
+
+    fd, tmp_name = tempfile.mkstemp(prefix=".vast-bootstrap-", suffix=".known_hosts")
+    os.close(fd)
+    tmp_known_hosts = Path(tmp_name)
+    try:
+        try:
+            completed = subprocess.run(
+                [
+                    "ssh",
+                    "-p",
+                    str(port),
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    f"UserKnownHostsFile={tmp_known_hosts}",
+                    "-o",
+                    "NumberOfPasswordPrompts=0",
+                    "-o",
+                    "HostKeyAlgorithms=ssh-ed25519",
+                    "-o",
+                    f"KexAlgorithms={','.join(kex_algorithms)}",
+                    f"root@{host}",
+                    "exit",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                shell=False,
+            )
+        except FileNotFoundError as exc:
+            raise SshBinaryNotFoundError("OpenSSH binary not found in PATH: ssh") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SshConnectionError(f"SSH probe timed out after {timeout_seconds:.1f}s") from exc
+
+        key = lookup_known_host_key(known_hosts_path=tmp_known_hosts, host=host, port=port)
+        if key is not None:
+            return key
+
+        stderr = completed.stderr.strip()
+        if stderr:
+            raise SshConnectionError(stderr)
+        return None
+    finally:
+        if tmp_known_hosts.exists():
+            tmp_known_hosts.unlink()

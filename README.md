@@ -131,6 +131,7 @@ Initial SSH trust bootstrap (operator-assisted):
 4. Confirm explicitly to append the key to `known_hosts`.
 5. If an approved key exists and a different fingerprint is observed, the workflow is refused.
 6. Optional strict mode (`--ssh-bootstrap-mode strict`) keeps explicit confirmation and also asks for an independently verified fingerprint.
+7. SSH/SCP keep strict host-key checks and now force a compatible modern KEX set from local OpenSSH support to avoid provider KEX mismatches.
 
 ## Quick start
 
