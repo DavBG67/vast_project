@@ -16,7 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WORKER_VENV=/opt/worker-venv
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl python3.12-venv \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR ${WORKER_HOME}

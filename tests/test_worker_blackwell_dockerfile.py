@@ -15,6 +15,7 @@ def test_blackwell_dockerfile_uses_newer_cuda_stack() -> None:
 
 def test_blackwell_dockerfile_uses_venv_for_pep668_compatibility() -> None:
     content = DOCKERFILE_PATH.read_text(encoding="utf-8")
+    assert "python3.12-venv" in content
     assert "command -v python" in content
     assert "command -v python3" in content
     assert "[python-diagnostics] python sys.executable=" in content
