@@ -35,7 +35,8 @@ From these references, this phase uses:
 ## PEP 668 compatibility (GitHub Actions build)
 
 - Base image Python can be externally managed (PEP 668), making global `pip install --upgrade pip` fail.
-- `Dockerfile.blackwell` now creates a dedicated venv with `--system-site-packages` from `/opt/conda/bin/python` so preinstalled torch/CUDA remain available without reinstalling torch.
+- `Dockerfile.blackwell` now performs runtime interpreter diagnostics (`python` / `python3`) and auto-selects the first interpreter that can import preinstalled `torch`.
+- It then creates a dedicated venv with `--system-site-packages` from that detected interpreter so preinstalled torch/CUDA remain available without reinstalling torch.
 - All install commands run through the same environment (`python -m pip` with `PATH` preferring `${WORKER_VENV}/bin`).
 
 ## Compatibility table (prepared, not hardware-validated)

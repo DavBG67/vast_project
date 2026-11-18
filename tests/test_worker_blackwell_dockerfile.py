@@ -15,9 +15,14 @@ def test_blackwell_dockerfile_uses_newer_cuda_stack() -> None:
 
 def test_blackwell_dockerfile_uses_venv_for_pep668_compatibility() -> None:
     content = DOCKERFILE_PATH.read_text(encoding="utf-8")
-    assert "TORCH_BASE_PYTHON=/opt/conda/bin/python" in content
+    assert "command -v python" in content
+    assert "command -v python3" in content
+    assert "[python-diagnostics] python sys.executable=" in content
+    assert "[python-diagnostics] python3 sys.executable=" in content
+    assert "selected_base_python=$BASE_PY" in content
+    assert "No base Python interpreter with preinstalled torch found in this image" in content
     assert "-m venv --system-site-packages ${WORKER_VENV}" in content
-    assert "ENV PATH=${WORKER_VENV}/bin:/opt/conda/bin:${PATH}" in content
+    assert "ENV PATH=${WORKER_VENV}/bin:${PATH}" in content
     assert "python -m pip install --upgrade pip" in content
     assert "--break-system-packages" not in content
     assert "\nRUN pip install --upgrade pip" not in content

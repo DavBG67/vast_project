@@ -13,7 +13,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     WORKER_HOME=/app/worker \
     MODELS_DIR=/opt/models \
-    TORCH_BASE_PYTHON=/opt/conda/bin/python \
     WORKER_VENV=/opt/worker-venv
 
 RUN apt-get update \
@@ -23,10 +22,34 @@ RUN apt-get update \
 WORKDIR ${WORKER_HOME}
 
 COPY worker/requirements.blackwell.txt ./requirements.txt
-RUN ${TORCH_BASE_PYTHON} -c "import torch; print(torch.__version__); print(torch.version.cuda)" \
-    && ${TORCH_BASE_PYTHON} -m venv --system-site-packages ${WORKER_VENV}
+RUN set -eux; \
+    echo "[python-diagnostics] command -v python"; command -v python || true; \
+    echo "[python-diagnostics] command -v python3"; command -v python3 || true; \
+    if command -v python >/dev/null 2>&1; then echo "[python-diagnostics] python --version"; python --version || true; fi; \
+    if command -v python3 >/dev/null 2>&1; then echo "[python-diagnostics] python3 --version"; python3 --version || true; fi; \
+    if command -v python >/dev/null 2>&1; then \
+      python -c "import importlib.util,sys; print('[python-diagnostics] python sys.executable=',sys.executable); print('[python-diagnostics] python sys.prefix=',sys.prefix); spec=importlib.util.find_spec('torch'); print('[python-diagnostics] python torch_available=', spec is not None); import torch; print('[python-diagnostics] python torch.__version__=', torch.__version__); print('[python-diagnostics] python torch.version.cuda=', torch.version.cuda)" || true; \
+    fi; \
+    if command -v python3 >/dev/null 2>&1; then \
+      python3 -c "import importlib.util,sys; print('[python-diagnostics] python3 sys.executable=',sys.executable); print('[python-diagnostics] python3 sys.prefix=',sys.prefix); spec=importlib.util.find_spec('torch'); print('[python-diagnostics] python3 torch_available=', spec is not None); import torch; print('[python-diagnostics] python3 torch.__version__=', torch.__version__); print('[python-diagnostics] python3 torch.version.cuda=', torch.version.cuda)" || true; \
+    fi; \
+    BASE_PY=""; \
+    for candidate in python3 python; do \
+      if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "import torch" >/dev/null 2>&1; then \
+        BASE_PY="$candidate"; \
+        break; \
+      fi; \
+    done; \
+    if [ -z "$BASE_PY" ]; then \
+      echo "No base Python interpreter with preinstalled torch found in this image; cannot keep Blackwell strategy without reinstalling torch." >&2; \
+      exit 1; \
+    fi; \
+    echo "[python-diagnostics] selected_base_python=$BASE_PY"; \
+    "$BASE_PY" -c "import sys,torch; print('[python-diagnostics] selected sys.executable=', sys.executable); print('[python-diagnostics] selected sys.prefix=', sys.prefix); print('[python-diagnostics] selected torch.__version__=', torch.__version__); print('[python-diagnostics] selected torch.version.cuda=', torch.version.cuda)"; \
+    "$BASE_PY" -m venv --system-site-packages ${WORKER_VENV}; \
+    ${WORKER_VENV}/bin/python -c "import sys,torch; print('[python-diagnostics] venv sys.executable=', sys.executable); print('[python-diagnostics] venv sys.prefix=', sys.prefix); print('[python-diagnostics] venv torch.__version__=', torch.__version__); print('[python-diagnostics] venv torch.version.cuda=', torch.version.cuda)"
 
-ENV PATH=${WORKER_VENV}/bin:/opt/conda/bin:${PATH}
+ENV PATH=${WORKER_VENV}/bin:${PATH}
 
 RUN python -m pip install --upgrade pip \
     # Install pinned runtime deps except torch/torchvision/realesrgan/basicsr first.
