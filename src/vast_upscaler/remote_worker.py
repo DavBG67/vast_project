@@ -159,13 +159,14 @@ def execute_remote_worker(
         local_report_path=request.local_report_path,
         timeout_seconds=request.download_timeout_seconds,
     )
-    frames_processed = _validate_report(report_payload=report_payload, expected_output_path=paths.remote_output_path)
 
     if process_result.returncode != 0:
+        details = _report_failure_details(report_payload)
         raise RemoteWorkerProcessError(
             f"Remote worker returned non-zero exit code {process_result.returncode}. "
-            f"stderr: {(process_result.stderr or '').strip()}"
+            f"{details} stderr: {(process_result.stderr or '').strip()}"
         )
+    frames_processed = _validate_report(report_payload=report_payload, expected_output_path=paths.remote_output_path)
 
     if progress_callback is not None:
         progress_callback({"kind": "transfer", "stage": "download", "status": "started"})
@@ -332,7 +333,9 @@ def _download_and_parse_report(
 def _validate_report(*, report_payload: dict, expected_output_path: str) -> int:
     status = str(report_payload.get("status") or "").lower()
     if status != "completed":
-        raise RemoteWorkerReportError(f"Worker report status is not completed: {status or 'missing'}")
+        raise RemoteWorkerReportError(
+            f"Worker report status is not completed: {status or 'missing'}. {_report_failure_details(report_payload)}"
+        )
 
     frames_processed = report_payload.get("frames_processed")
     if not isinstance(frames_processed, int) or frames_processed <= 0:
@@ -348,6 +351,19 @@ def _validate_report(*, report_payload: dict, expected_output_path: str) -> int:
         )
 
     return frames_processed
+
+
+def _report_failure_details(report_payload: dict) -> str:
+    notes = report_payload.get("notes")
+    if isinstance(notes, list):
+        text_notes = [str(item).strip() for item in notes if str(item).strip()]
+        if text_notes:
+            preview = "; ".join(text_notes[:3])
+            return f"Report notes: {preview}."
+    message = report_payload.get("message")
+    if isinstance(message, str) and message.strip():
+        return f"Report message: {message.strip()}."
+    return "No detailed worker failure note available."
 
 
 def _download_output_video(

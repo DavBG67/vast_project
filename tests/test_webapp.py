@@ -57,7 +57,8 @@ def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
     body = cfg.json()
     assert body["target_width"] == 1280
     assert "vast_api_key" not in body
-    assert body["worker_image_latest_known"]
+    assert "worker_image_latest_known" in body
+    assert body["worker_image_latest_known"] != "ghcr.io/acme/worker:test"
 
 
 def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
@@ -97,7 +98,7 @@ def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
             "input_path": str(source),
             "output_path": str(output),
             "report_path": str(report),
-            "worker_image": "ghcr.io/acme/worker:test",
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-4ef981595f50",
         },
     )
     assert start.status_code == 200
@@ -116,6 +117,63 @@ def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
     done = _wait_for_status(client, job_id, {"completed"})
     assert done["result"]["cleanup_verified"] is True
     assert done["result"]["estimated_total_usd"] == 0.42
+
+
+def test_web_prompt_cannot_be_answered_twice_and_replay_is_safe(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+    output = tmp_path / "output.mp4"
+    report = tmp_path / "report.json"
+
+    def _auto_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        approved = callbacks.confirm_paid("Paid operation confirmation required")
+        if not approved:
+            raise OrchestrationError("Cancelled before paid operation.")
+        return WorkflowExecutionResult(
+            mode="automatic",
+            session_id="sess-test",
+            state="COMPLETED",
+            output_path=str(output),
+            report_path=str(report),
+            duration_seconds=1.0,
+            estimated_total_usd=0.2,
+            instance_id=10,
+            instance_state="DESTROYED",
+            cleanup_verified=True,
+            cleanup_warning=None,
+        )
+
+    app = create_app(config_path=config_path, auto_runner=_auto_runner)
+    client = TestClient(app)
+    started = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "input_path": str(source),
+            "output_path": str(output),
+            "report_path": str(report),
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-4ef981595f50",
+        },
+    )
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    pending = _wait_for_status(client, job_id, {"running"})
+    prompt_id = pending["pending_prompt"]["prompt_id"]
+
+    first_answer = client.post(f"/api/jobs/{job_id}/prompts/{prompt_id}", json={"approved": True})
+    assert first_answer.status_code == 200
+    done = _wait_for_status(client, job_id, {"completed"})
+    assert done["pending_prompt"] is None
+
+    duplicate = client.post(f"/api/jobs/{job_id}/prompts/{prompt_id}", json={"approved": True})
+    assert duplicate.status_code == 409
+
+    replay = client.get(f"/api/jobs/{job_id}/events?last_event_id=0")
+    assert replay.status_code == 200
+    assert "prompt" in replay.text
+    snapshot_after_replay = client.get(f"/api/jobs/{job_id}").json()
+    assert snapshot_after_replay["pending_prompt"] is None
 
 
 def test_web_rejects_parallel_jobs(tmp_path: Path) -> None:
@@ -153,3 +211,79 @@ def test_web_rejects_parallel_jobs(tmp_path: Path) -> None:
     assert cancel.status_code == 200
     finished = _wait_for_status(client, first.json()["job_id"], {"cancelled", "completed", "failed"})
     assert finished["status"] in {"cancelled", "completed"}
+
+
+def test_web_rejects_placeholder_worker_image_for_automatic_mode(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "input_path": str(source),
+            "worker_image": "ghcr.io/acme/worker:test",
+        },
+    )
+    assert response.status_code == 400
+    assert "placeholder worker image" in response.json()["detail"]
+
+
+def test_manual_mode_keeps_instance_on_failure(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, _callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        raise OrchestrationError("Worker report status is not completed: failed. Report notes: missing model.")
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    terminal = _wait_for_status(client, job_id, {"failed"})
+    assert terminal["status"] == "failed"
+    assert "missing model" in terminal["error"]
+
+    events_payload = client.get(f"/api/jobs/{job_id}/events?last_event_id=0").text
+    assert "manual-instance-preserved" in events_payload
+
+
+def test_manual_mode_keeps_instance_on_cancellation(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        for _ in range(50):
+            callbacks.raise_if_cancelled()
+            time.sleep(0.02)
+        return WorkflowExecutionResult(
+            mode="manual",
+            session_id=None,
+            state="COMPLETED",
+            output_path=None,
+            report_path=None,
+            duration_seconds=1.0,
+            estimated_total_usd=None,
+            instance_id=123,
+            instance_state="running",
+            cleanup_verified=False,
+            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
+        )
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    cancel = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel.status_code == 200
+    terminal = _wait_for_status(client, job_id, {"cancelled", "completed"})
+    assert terminal["status"] in {"cancelled", "completed"}
+    events_payload = client.get(f"/api/jobs/{job_id}/events?last_event_id=0").text
+    assert "manual-instance-preserved" in events_payload or terminal["status"] == "completed"

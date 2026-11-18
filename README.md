@@ -201,7 +201,9 @@ V1 behavior:
 - One active processing task at a time.
 - Automatic mode: keeps existing paid confirmation, provisioning, processing, and verified cleanup flow.
 - Manual mode: uses an existing instance id, never auto-creates and never auto-destroys; billing continues until manual destroy.
+- A prompt is single-use: each SSH/paid confirmation prompt id can be answered only once, and resolved prompts are not re-opened after SSE replay/reconnect.
 - SSH trust checks remain strict/TOFU as in CLI via explicit browser confirmations.
+- Automatic mode rejects placeholder Docker tags (for example `ghcr.io/acme/worker:test`); if no known real tag exists, enter one explicitly.
 - No secrets are exposed to browser payloads.
 - Existing output/report files are never overwritten.
 

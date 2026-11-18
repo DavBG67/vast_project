@@ -38,8 +38,14 @@ RunMode = Literal["automatic", "manual"]
 SortBy = Literal["price", "reliability", "performance"]
 SshBootstrapMode = Literal["tofu", "strict"]
 
-_DEFAULT_WORKER_IMAGE = "ghcr.io/davbg67/vast-video-upscaler-worker:latest"
+_DEFAULT_WORKER_IMAGE = ""
 _WORKER_IMAGE_HISTORY_PATH = Path.home() / ".vast_upscaler" / "web_worker_images.json"
+_WORKER_IMAGE_PLACEHOLDERS = {
+    "ghcr.io/acme/worker:test",
+    "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>",
+    "<image>",
+    "example/image:tag",
+}
 
 
 class WebWorkflowCancelled(RuntimeError):
@@ -108,6 +114,7 @@ class _Job:
         self.thread: threading.Thread | None = None
         self.cancel_requested = False
         self.pending_prompt: dict[str, Any] | None = None
+        self.answered_prompt_ids: set[str] = set()
 
     def is_active(self) -> bool:
         return self.status in {"pending", "running"}
@@ -149,7 +156,8 @@ class WebTaskManager:
             "target_height": settings.video.target_height,
             "gpu_models": settings.vast.gpu_models,
             "worker_image_latest_known": latest_worker_image,
-            "worker_image_source": "history-or-default",
+            "worker_image_source": "history" if latest_worker_image else "none",
+            "worker_image_required": latest_worker_image == "",
             "ssh_bootstrap_mode": "tofu",
         }
 
@@ -177,6 +185,21 @@ class WebTaskManager:
                 "state": "pending",
                 "mode": request.mode,
                 "message": "Task created. Waiting for worker thread startup.",
+            },
+        )
+        job.append_event(
+            "configuration",
+            {
+                "mode": request.mode,
+                "input_path": request.input_path,
+                "output_path": str(_resolve_output_path(request=request)),
+                "report_path": str(_resolve_report_path(request=request, output_path=_resolve_output_path(request=request))),
+                "target_width": request.target_width,
+                "target_height": request.target_height,
+                "gpu_model": request.gpu_model,
+                "worker_image_requested": (request.worker_image or "").strip() or None,
+                "offer_id": request.offer_id,
+                "instance_id": request.instance_id,
             },
         )
         thread = threading.Thread(target=self._run_job, args=(job,), daemon=True)
@@ -211,10 +234,15 @@ class WebTaskManager:
         job = self.get_job(job_id)
         with job.condition:
             pending = job.pending_prompt
-            if pending is None or pending["id"] != prompt_id:
+            if prompt_id in job.answered_prompt_ids:
+                raise HTTPException(status_code=409, detail="Prompt already resolved.")
+            if pending is None:
                 raise HTTPException(status_code=404, detail="Prompt not found.")
+            if pending["id"] != prompt_id:
+                raise HTTPException(status_code=409, detail="Another prompt is currently pending.")
             pending["response"] = {"approved": reply.approved, "fingerprint": (reply.fingerprint or "").strip()}
             pending["event"].set()
+            job.answered_prompt_ids.add(prompt_id)
             job.pending_prompt = None
             job.condition.notify_all()
         job.append_event("prompt-answer", {"prompt_id": prompt_id, "approved": reply.approved})
@@ -306,10 +334,20 @@ class WebTaskManager:
             job.status = "cancelled"
             job.error = "Cancelled by operator."
             job.append_event("error", {"message": job.error})
+            if job.request.mode == "manual":
+                job.append_event(
+                    "status",
+                    {"state": "manual-instance-preserved", "message": "Manual mode never destroys the existing instance automatically."},
+                )
         except Exception as exc:  # noqa: BLE001
             job.status = "failed"
             job.error = str(exc)
             job.append_event("error", {"message": str(exc)})
+            if job.request.mode == "manual":
+                job.append_event(
+                    "status",
+                    {"state": "manual-instance-preserved", "message": "Manual mode never destroys the existing instance automatically."},
+                )
         finally:
             with self._lock:
                 if self._current_job is not None and self._current_job.job_id == job.job_id:
@@ -420,6 +458,15 @@ class WebTaskManager:
             raise HTTPException(status_code=400, detail=f"Output directory does not exist: {output_path.parent}")
         if not report_path.parent.exists():
             raise HTTPException(status_code=400, detail=f"Report directory does not exist: {report_path.parent}")
+        if request.mode == "automatic":
+            image = (request.worker_image or _load_latest_known_worker_image()).strip()
+            if not image:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Automatic mode requires an explicit worker image tag (no placeholder/default available).",
+                )
+            if image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
+                raise HTTPException(status_code=400, detail=f"Refusing placeholder worker image tag: {image}")
 
 
 def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
@@ -433,6 +480,18 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
     worker_image = (request.worker_image or _load_latest_known_worker_image()).strip()
     if not worker_image:
         raise OrchestrationError("Worker image tag is required.")
+    if worker_image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
+        raise OrchestrationError(f"Refusing placeholder worker image tag: {worker_image}")
+    callbacks.report_provisioning_status(
+        {
+            "phase": "worker-image",
+            "instance_id": "n/a",
+            "gpu": request.gpu_model or "n/a",
+            "host": "n/a",
+            "status": "selected",
+            "status_message": f"Worker image: {worker_image}",
+        }
+    )
 
     read_client = _build_read_client(effective_settings)
     write_client = _build_write_client(effective_settings)
@@ -497,6 +556,16 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
     transport = OpenSshTransport()
     write_client = _build_write_client(settings)
     started = time.perf_counter()
+    callbacks.report_provisioning_status(
+        {
+            "phase": "worker-image",
+            "instance_id": str(request.instance_id or "n/a"),
+            "gpu": "unknown",
+            "host": "unknown",
+            "status": "manual-instance",
+            "status_message": "Manual mode uses the image already present on the selected instance.",
+        }
+    )
     try:
         instance = write_client.get_instance(request.instance_id)
         status = (instance.actual_status or "").lower()
@@ -614,14 +683,18 @@ def _load_latest_known_worker_image() -> str:
     if not isinstance(payload, dict):
         return _DEFAULT_WORKER_IMAGE
     value = payload.get("latest")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized and normalized.lower() not in _WORKER_IMAGE_PLACEHOLDERS:
+            return normalized
     return _DEFAULT_WORKER_IMAGE
 
 
 def _store_latest_worker_image(value: str) -> None:
     image = value.strip()
     if not image:
+        return
+    if image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
         return
     _WORKER_IMAGE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     _WORKER_IMAGE_HISTORY_PATH.write_text(json.dumps({"latest": image}, indent=2), encoding="utf-8")
@@ -713,7 +786,7 @@ _INDEX_HTML = """
       <label>GPU model
         <select id="gpu_model"></select>
       </label>
-      <label>Worker image tag <input id="worker_image" required /></label>
+      <label>Worker image tag <input id="worker_image" /></label>
       <label>Sort offers by
         <select id="sort_by">
           <option value="price">price</option>
@@ -743,6 +816,8 @@ _INDEX_HTML = """
     let currentJobId = null;
     let lastEventId = 0;
     let es = null;
+    let promptDialogOpen = false;
+    const handledPromptIds = new Set();
 
     function appendEvent(msg) {
       const box = document.getElementById("events");
@@ -756,6 +831,9 @@ _INDEX_HTML = """
       document.getElementById("target_width").value = cfg.target_width;
       document.getElementById("target_height").value = cfg.target_height;
       document.getElementById("worker_image").value = cfg.worker_image_latest_known;
+      if (cfg.worker_image_required) {
+        appendEvent("No reliable worker image default is known. Enter an explicit real tag before automatic mode.");
+      }
       const gpu = document.getElementById("gpu_model");
       gpu.innerHTML = "";
       for (const model of cfg.gpu_models) {
@@ -768,6 +846,9 @@ _INDEX_HTML = """
     }
 
     async function answerPrompt(jobId, prompt) {
+      if (handledPromptIds.has(prompt.prompt_id)) return;
+      handledPromptIds.add(prompt.prompt_id);
+      promptDialogOpen = true;
       if (prompt.kind === "verified_fingerprint") {
         const fp = window.prompt(prompt.message + "\\n\\nEnter independently verified SHA256 fingerprint:");
         await fetch(`/api/jobs/${jobId}/prompts/${prompt.prompt_id}`, {
@@ -775,6 +856,7 @@ _INDEX_HTML = """
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ fingerprint: fp || "" }),
         });
+        promptDialogOpen = false;
         return;
       }
       const approved = window.confirm(prompt.message);
@@ -783,6 +865,17 @@ _INDEX_HTML = """
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({ approved }),
       });
+      promptDialogOpen = false;
+    }
+
+    async function maybeHandlePrompt(jobId, prompt) {
+      if (promptDialogOpen) return;
+      const snapshotResp = await fetch(`/api/jobs/${jobId}`);
+      if (!snapshotResp.ok) return;
+      const snapshot = await snapshotResp.json();
+      const pending = snapshot.pending_prompt;
+      if (!pending || pending.prompt_id !== prompt.prompt_id) return;
+      await answerPrompt(jobId, prompt);
     }
 
     function watchEvents(jobId) {
@@ -793,7 +886,7 @@ _INDEX_HTML = """
         lastEventId = data.id;
         appendEvent(`[${data.type}] ${JSON.stringify(data.payload)}`);
         if (data.type === "prompt") {
-          await answerPrompt(jobId, data.payload);
+          await maybeHandlePrompt(jobId, data.payload);
         }
         if (data.type === "result" || data.type === "error") {
           document.getElementById("status").textContent = data.type === "result" ? "completed" : "failed";
@@ -829,6 +922,8 @@ _INDEX_HTML = """
       }
       currentJobId = data.job_id;
       lastEventId = 0;
+      handledPromptIds.clear();
+      promptDialogOpen = false;
       document.getElementById("status").textContent = "running";
       appendEvent("Job started: " + currentJobId);
       watchEvents(currentJobId);

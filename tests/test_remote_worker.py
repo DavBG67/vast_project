@@ -172,8 +172,9 @@ def test_execute_remote_worker_non_zero_exit(tmp_path: Path, monkeypatch: pytest
     )
     monkeypatch.setattr("vast_upscaler.remote_worker.run_ffprobe", lambda *_a, **_k: {"streams": []})
 
-    with pytest.raises(RemoteWorkerProcessError):
+    with pytest.raises(RemoteWorkerProcessError) as exc:
         execute_remote_worker(transport=transport, connection=conn, request=request)
+    assert "runtime failed" in str(exc.value)
 
 
 def test_execute_remote_worker_report_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,12 +205,15 @@ def test_execute_remote_worker_report_failed_status(tmp_path: Path, monkeypatch:
     conn = _conn(tmp_path)
     request = _request(tmp_path)
     transport = FakeTransport()
-    transport.report_payload = json.dumps({"status": "failed", "frames_processed": 0, "output": "x"}).encode("utf-8")
+    transport.report_payload = json.dumps(
+        {"status": "failed", "frames_processed": 0, "output": "x", "notes": ["model weights missing"]}
+    ).encode("utf-8")
 
     monkeypatch.setattr("vast_upscaler.remote_worker.inspect_video", lambda *_a, **_k: None)
 
-    with pytest.raises(RemoteWorkerReportError):
+    with pytest.raises(RemoteWorkerReportError) as exc:
         execute_remote_worker(transport=transport, connection=conn, request=request)
+    assert "model weights missing" in str(exc.value)
 
 
 def test_execute_remote_worker_output_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
