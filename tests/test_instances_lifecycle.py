@@ -143,9 +143,16 @@ def test_reconcile_after_ambiguous_create(tmp_path) -> None:
 def test_wait_ready_success() -> None:
     client = StubWriteClient()
     client.summaries = [_running_summary()]
+    seen_statuses = []
 
-    summary = wait_until_instance_ready(client=client, instance_id=123456, options=WaitOptions(timeout_seconds=0.1))
+    summary = wait_until_instance_ready(
+        client=client,
+        instance_id=123456,
+        options=WaitOptions(timeout_seconds=0.1),
+        on_status=lambda value: seen_statuses.append(value.actual_status),
+    )
     assert summary.actual_status == "running"
+    assert seen_statuses == ["running"]
 
 
 

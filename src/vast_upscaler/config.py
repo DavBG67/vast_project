@@ -46,8 +46,44 @@ class ConfigError(RuntimeError):
     pass
 
 
+_SUPPORTED_DOTENV_KEYS = {"VAST_API_KEY", "VAST_SSH_PRIVATE_KEY"}
+
+
+def _load_local_dotenv(base_dir: Path) -> None:
+    dotenv_path = base_dir / ".env"
+    if not dotenv_path.exists():
+        return
+
+    try:
+        lines = dotenv_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ConfigError(f"Unable to read local .env file: {dotenv_path}") from exc
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            raise ConfigError(f"Invalid .env line format in {dotenv_path}")
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in _SUPPORTED_DOTENV_KEYS:
+            continue
+
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+
+        if os.getenv(key) is None:
+            os.environ[key] = value
+
+
 def load_config(config_path: Path | None = None) -> Settings:
     path = config_path or Path("config.yaml")
+    _load_local_dotenv(path.parent)
     if not path.exists():
         return Settings()
 

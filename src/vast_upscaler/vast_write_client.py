@@ -66,6 +66,13 @@ class CreateInstanceRequest:
     env: str | None = None
 
 
+SSH_CREATE_TEMPLATE = {
+    "runtype": "ssh_direct",
+    "target_state": "running",
+    "cancel_unavail": True,
+}
+
+
 @dataclass(frozen=True)
 class InstanceSummary:
     instance_id: int
@@ -76,6 +83,9 @@ class InstanceSummary:
     image_runtype: str | None
     ssh_host: str | None
     ssh_port: int | None
+    gpu_name: str | None = None
+    machine_id: str | None = None
+    status_message: str | None = None
 
 
 class VastWriteClient:
@@ -115,21 +125,7 @@ class VastWriteClient:
         self.close()
 
     def create_instance(self, req: CreateInstanceRequest) -> int:
-        body: dict[str, Any] = {
-            "runtype": req.runtype,
-            "target_state": req.target_state,
-            "cancel_unavail": req.cancel_unavail,
-        }
-        if req.template_hash_id:
-            body["template_hash_id"] = req.template_hash_id
-        if req.image:
-            body["image"] = req.image
-        if req.disk_gb is not None:
-            body["disk"] = req.disk_gb
-        if req.label:
-            body["label"] = req.label
-        if req.env:
-            body["env"] = req.env
+        body = self._build_create_payload(req)
 
         payload = self._request_json(
             "PUT",
@@ -164,6 +160,9 @@ class VastWriteClient:
             image_runtype=_as_optional_str(raw.get("image_runtype")),
             ssh_host=_as_optional_str(raw.get("ssh_host")),
             ssh_port=_as_optional_int(raw.get("ssh_port")),
+            gpu_name=_as_optional_str(raw.get("gpu_name")),
+            machine_id=_as_optional_str(raw.get("machine_id")),
+            status_message=_status_message(raw),
         )
 
     def list_instances(self, *, limit: int = 25, select_filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -193,6 +192,47 @@ class VastWriteClient:
         payload = self._request_json("DELETE", f"/api/v0/instances/{instance_id}/", retryable=True)
         success = payload.get("success")
         return bool(success is True)
+
+    def compare_create_payload_with_ssh_template(self, req: CreateInstanceRequest) -> dict[str, str]:
+        body = self._build_create_payload(req)
+        mismatches: dict[str, str] = {}
+
+        for key, expected in SSH_CREATE_TEMPLATE.items():
+            actual = body.get(key)
+            if actual != expected:
+                mismatches[key] = f"expected={expected!r}, actual={actual!r}"
+
+        image_value = body.get("image")
+        if not isinstance(image_value, str) or image_value.strip() == "":
+            mismatches["image"] = "docker image tag is required"
+
+        disk_value = body.get("disk")
+        if not isinstance(disk_value, (int, float)) or float(disk_value) <= 0:
+            mismatches["disk"] = "positive disk size is required"
+
+        if not isinstance(body.get("label"), str) or not str(body.get("label")).strip():
+            mismatches["label"] = "session label is required"
+
+        return mismatches
+
+    @staticmethod
+    def _build_create_payload(req: CreateInstanceRequest) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "runtype": req.runtype,
+            "target_state": req.target_state,
+            "cancel_unavail": req.cancel_unavail,
+        }
+        if req.template_hash_id:
+            body["template_hash_id"] = req.template_hash_id
+        if req.image:
+            body["image"] = req.image
+        if req.disk_gb is not None:
+            body["disk"] = req.disk_gb
+        if req.label:
+            body["label"] = req.label
+        if req.env:
+            body["env"] = req.env
+        return body
 
     def _request_json(
         self,
@@ -278,3 +318,11 @@ def _as_optional_str(value: Any) -> str | None:
 
 def _as_optional_int(value: Any) -> int | None:
     return value if isinstance(value, int) else None
+
+
+def _status_message(raw: dict[str, Any]) -> str | None:
+    for key in ("status_msg", "status_message", "msg"):
+        value = _as_optional_str(raw.get(key))
+        if value is not None:
+            return value
+    return None

@@ -126,3 +126,44 @@ def test_non_create_timeout_raises_timeout_error() -> None:
 
     with pytest.raises(VastWriteTimeoutError):
         client.get_instance(321)
+
+
+def test_compare_payload_with_template_no_mismatch() -> None:
+    fake = FakeHttpClient(responses=[_response(200, {"success": True, "new_contract": 789})])
+    client = VastWriteClient(api_key="key", http_client=fake)
+
+    req = CreateInstanceRequest(
+        ask_id=123,
+        image="ghcr.io/x/y:tag",
+        disk_gb=50,
+        label="sess-1",
+        runtype="ssh_direct",
+        target_state="running",
+        cancel_unavail=True,
+    )
+    mismatches = client.compare_create_payload_with_ssh_template(req)
+
+    assert mismatches == {}
+
+
+def test_compare_payload_with_template_detects_drift() -> None:
+    fake = FakeHttpClient(responses=[_response(200, {"success": True, "new_contract": 789})])
+    client = VastWriteClient(api_key="key", http_client=fake)
+
+    req = CreateInstanceRequest(
+        ask_id=123,
+        image="",
+        disk_gb=0,
+        label="",
+        runtype="jupyter",
+        target_state="stopped",
+        cancel_unavail=False,
+    )
+    mismatches = client.compare_create_payload_with_ssh_template(req)
+
+    assert "runtype" in mismatches
+    assert "target_state" in mismatches
+    assert "cancel_unavail" in mismatches
+    assert "image" in mismatches
+    assert "disk" in mismatches
+    assert "label" in mismatches

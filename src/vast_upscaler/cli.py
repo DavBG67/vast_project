@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import platform
 import shutil
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -61,6 +62,18 @@ KEEP_INSTANCE_OPTION = typer.Option(False, "--keep-instance")
 KNOWN_HOSTS_OPTION = typer.Option(Path.home() / ".ssh" / "known_hosts", "--known-hosts")
 SKIP_CONFIRM_OPTION = typer.Option(False, "--yes", help="Skip confirmation prompt.")
 SESSION_ID_OPTION = typer.Option(None, "--session-id")
+OFFER_ID_OPTION = typer.Option(None, "--offer-id", help="Select an explicit Vast offer id.")
+PROVISIONING_TIMEOUT_OPTION = typer.Option(
+    600.0,
+    "--provisioning-timeout-seconds",
+    min=30.0,
+    help="Timeout for instance provisioning/readiness wait.",
+)
+SSH_BOOTSTRAP_MODE_OPTION = typer.Option(
+    "tofu",
+    "--ssh-bootstrap-mode",
+    help="SSH host trust bootstrap mode: tofu (default) or strict.",
+)
 
 app.add_typer(session_app, name="session")
 
@@ -285,6 +298,9 @@ def upscale(
     known_hosts: Path = KNOWN_HOSTS_OPTION,
     sort_by: Literal["price", "reliability", "performance"] = SORT_BY_OPTION,
     fps_processing: float | None = FPS_PROCESSING_OPTION,
+    offer_id: int | None = OFFER_ID_OPTION,
+    provisioning_timeout_seconds: float = PROVISIONING_TIMEOUT_OPTION,
+    ssh_bootstrap_mode: Literal["tofu", "strict"] = SSH_BOOTSTRAP_MODE_OPTION,
 ) -> None:
     settings = _load_settings_or_exit(config)
     store = SessionStore()
@@ -304,6 +320,7 @@ def upscale(
 
     try:
         lock_cm = SessionExecutionLock() if not dry_run else _NoopLock()
+        strict_fingerprint_provider = _prompt_independent_fingerprint if ssh_bootstrap_mode == "strict" else None
         with lock_cm:
             summary = run_upscale_workflow(
                 settings=settings,
@@ -320,13 +337,18 @@ def upscale(
                     known_hosts_path=known_hosts,
                     processing_fps=fps_processing,
                     sort_by=sort_by,
+                    offer_id=offer_id,
+                    max_wait_ready_seconds=provisioning_timeout_seconds,
+                    ssh_bootstrap_mode=ssh_bootstrap_mode,
                 ),
                 session_store=store,
                 read_client=read_client,
                 write_client=write_client,
                 transport=transport,
                 confirm_paid=lambda msg: typer.confirm(msg, default=False),
-                confirm_ssh_trust=lambda msg: typer.confirm(msg, default=False),
+                confirm_ssh_trust=_confirm_ssh_trust,
+                request_verified_fingerprint=strict_fingerprint_provider,
+                report_provisioning_status=_build_provisioning_reporter(),
             )
     except (OrchestrationError, VastApiError, VastWriteApiError, VideoProbeError) as exc:
         console.print(f"Upscale failed: {exc}")
@@ -346,9 +368,13 @@ def upscale(
 @app.command()
 def instances(config: Path = CONFIG_OPTION) -> None:
     settings = _load_settings_or_exit(config)
-    client = _build_write_client(settings=settings)
+    client = None
     try:
+        client = _build_write_client(settings=settings)
         rows = list_active_instances(client=client)
+    except OrchestrationError as exc:
+        console.print(f"Failed to list instances: {exc}")
+        raise typer.Exit(code=1) from exc
     except VastWriteApiError as exc:
         console.print(f"Failed to list instances: {exc}")
         raise typer.Exit(code=1) from exc
@@ -356,7 +382,8 @@ def instances(config: Path = CONFIG_OPTION) -> None:
         console.print(f"Failed to list instances: {exc}")
         raise typer.Exit(code=1) from exc
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
     table = Table(title="Active Vast.ai Instances")
     table.add_column("ID", justify="right")
@@ -422,7 +449,7 @@ def session_resume(
                 ssh_private_key_path=Path(settings.secrets.ssh_private_key_path)
                 if settings.secrets.ssh_private_key_path
                 else None,
-                confirm_ssh_trust=lambda msg: typer.confirm(msg, default=False),
+                confirm_ssh_trust=_confirm_ssh_trust,
             )
     except (OrchestrationError, VastWriteApiError) as exc:
         console.print(f"Resume failed: {exc}")
@@ -626,3 +653,46 @@ class _NoopLock:
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
         return
+
+
+def _build_provisioning_reporter() -> Any:
+    started_at = datetime.now(UTC)
+
+    def _report(payload: dict[str, str]) -> None:
+        elapsed_seconds = int((datetime.now(UTC) - started_at).total_seconds())
+        elapsed = f"{elapsed_seconds}s"
+        phase = payload.get("phase", "update")
+        status_line = (
+            f"[cyan]Provisioning {phase}[/cyan] "
+            f"instance={payload.get('instance_id', 'unknown')} "
+            f"gpu={payload.get('gpu', 'unknown')} "
+            f"host={payload.get('host', 'unknown')} "
+            f"status={payload.get('status', 'unknown')} "
+            f"elapsed={elapsed}"
+        )
+        message = payload.get("status_message")
+        if message and message != "n/a":
+            status_line += f" message={message}"
+        console.print(status_line)
+
+    return _report
+
+
+def _confirm_ssh_trust(message: str) -> bool:
+    if not sys.stdin.isatty():
+        console.print("SSH trust bootstrap requires interactive confirmation; refusing in non-interactive mode.")
+        return False
+    return typer.confirm(message, default=False)
+
+
+def _prompt_independent_fingerprint(message: str) -> str | None:
+    if not sys.stdin.isatty():
+        console.print("Strict SSH bootstrap requires interactive fingerprint input; refusing in non-interactive mode.")
+        return None
+    console.print(message)
+    value = typer.prompt(
+        "Paste independently verified SHA256 fingerprint (leave empty to abort)",
+        default="",
+        show_default=False,
+    )
+    return value.strip() or None

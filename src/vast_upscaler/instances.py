@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from vast_upscaler.session_store import SessionRecord, SessionStore
@@ -76,12 +77,20 @@ def reconcile_ambiguous_create(
     return instance_id
 
 
-def wait_until_instance_ready(*, client: VastWriteClient, instance_id: int, options: WaitOptions | None = None) -> InstanceSummary:
+def wait_until_instance_ready(
+    *,
+    client: VastWriteClient,
+    instance_id: int,
+    options: WaitOptions | None = None,
+    on_status: Callable[[InstanceSummary], None] | None = None,
+) -> InstanceSummary:
     opts = options or WaitOptions()
     deadline = time.perf_counter() + opts.timeout_seconds
 
     while True:
         summary = client.get_instance(instance_id)
+        if on_status is not None:
+            on_status(summary)
         status = (summary.actual_status or "").lower()
         if status == "running":
             return summary

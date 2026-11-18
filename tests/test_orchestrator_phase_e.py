@@ -1,34 +1,61 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 from pathlib import Path
 
 import pytest
 
+import vast_upscaler.orchestrator as orchestrator_module
 from vast_upscaler.config import Settings
+from vast_upscaler.instances import InstanceLifecycleError
 from vast_upscaler.orchestrator import (
     CleanupItemResult,
     OrchestrationError,
     OrchestrationOptions,
     SessionExecutionLock,
     SessionLockError,
+    SshTrustValidationError,
     cleanup_sessions,
     ensure_store_readable,
     resume_session,
     run_upscale_workflow,
 )
 from vast_upscaler.session_store import SessionRecord, SessionStore
-from vast_upscaler.transfer import SshConnectionError
+from vast_upscaler.transfer import KnownHostKey, SshConnectionError
 from vast_upscaler.vast_write_client import InstanceSummary, VastCreateAmbiguousError
 from vast_upscaler.video import VideoInfo
 
 
-class FakeReadClient:
-    def __init__(self) -> None:
-        self.calls = 0
+def _fingerprint(key_data: str) -> str:
+    digest = hashlib.sha256(base64.b64decode(key_data.encode("ascii"), validate=True)).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
-    def search_offers(self, _query):
-        self.calls += 1
-        return [
+
+@pytest.fixture(autouse=True)
+def _stub_ssh_trust(monkeypatch: pytest.MonkeyPatch) -> None:
+    key_data = "QUFBQQ=="
+    fp = _fingerprint(key_data)
+
+    def _fake_fetch(**kwargs):
+        host = kwargs["host"]
+        port = kwargs["port"]
+        return KnownHostKey(
+            marker=f"[{host}]:{port}",
+            key_type="ssh-ed25519",
+            key_data=key_data,
+            sha256_fingerprint=fp,
+            source_line=f"[{host}]:{port} ssh-ed25519 {key_data}",
+        )
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.fetch_ssh_ed25519_host_key", _fake_fetch)
+    monkeypatch.setattr("vast_upscaler.orchestrator.validate_local_ssh_prerequisites", lambda **_k: None)
+
+
+class FakeReadClient:
+    def __init__(self, offers: list[dict] | None = None) -> None:
+        self.calls = 0
+        self.offers = offers or [
             {
                 "id": 31129,
                 "gpu_name": "RTX 3090",
@@ -42,6 +69,10 @@ class FakeReadClient:
             }
         ]
 
+    def search_offers(self, _query):
+        self.calls += 1
+        return list(self.offers)
+
 
 class FakeWriteClient:
     def __init__(self) -> None:
@@ -50,6 +81,8 @@ class FakeWriteClient:
         self.create_raises = None
         self.destroy_ok = True
         self.list_instances_rows = []
+        self.statuses = ["running"]
+        self.get_calls = 0
 
     def create_instance(self, req):
         if self.create_raises is not None:
@@ -58,11 +91,13 @@ class FakeWriteClient:
         return 123
 
     def get_instance(self, instance_id: int):
+        status = self.statuses[min(self.get_calls, len(self.statuses) - 1)]
+        self.get_calls += 1
         return InstanceSummary(
             instance_id=instance_id,
-            actual_status="running",
+            actual_status=status,
             intended_status="running",
-            cur_state="running",
+            cur_state="running" if status == "running" else "starting",
             label="sess",
             image_runtype="ssh_direct",
             ssh_host="1.2.3.4",
@@ -76,6 +111,10 @@ class FakeWriteClient:
     def list_instances(self, *, limit=25, select_filters=None):
         _ = (limit, select_filters)
         return list(self.list_instances_rows)
+
+    def compare_create_payload_with_ssh_template(self, req):
+        _ = req
+        return {}
 
 
 class FakeTransport:
@@ -122,7 +161,7 @@ def _options(tmp_path: Path) -> OrchestrationOptions:
     input_path = tmp_path / "in video.mp4"
     input_path.write_bytes(b"x")
     known_hosts = tmp_path / "known_hosts"
-    known_hosts.write_text("[1.2.3.4]:2200 ssh-ed25519 AAAA\n", encoding="utf-8")
+    known_hosts.write_text("[1.2.3.4]:2200 ssh-ed25519 QUFBQQ==\n", encoding="utf-8")
     return OrchestrationOptions(
         input_path=input_path,
         output_path=tmp_path / "out" / "result.mp4",
@@ -176,6 +215,47 @@ def test_nominal_full_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     assert write.destroyed == [123]
 
 
+def test_provisioning_progress_reports_updates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    read = FakeReadClient()
+    write = FakeWriteClient()
+    write.statuses = ["loading", "running"]
+    write.list_instances_rows = []
+    transport = FakeTransport()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=30.0, frame_rate_fps=30.0),
+    )
+
+    class _WorkerResult:
+        local_output_path = options.output_path
+        local_report_path = options.report_path
+        frames_processed = 900
+        video_info = VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=30.0)
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.execute_remote_worker", lambda **_k: _WorkerResult())
+
+    progress_events: list[dict[str, str]] = []
+    run_upscale_workflow(
+        settings=settings,
+        options=options,
+        session_store=store,
+        read_client=read,
+        write_client=write,
+        transport=transport,
+        confirm_paid=lambda _m: True,
+        confirm_ssh_trust=lambda _m: True,
+        report_provisioning_status=lambda payload: progress_events.append(payload),
+    )
+
+    statuses = [item["status"] for item in progress_events if item["phase"] in {"first", "update"}]
+    assert "loading" in statuses
+    assert "running" in statuses
+
+
 def test_cancel_before_rental(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     options = _options(tmp_path)
@@ -198,6 +278,36 @@ def test_cancel_before_rental(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
             confirm_paid=lambda _m: False,
             confirm_ssh_trust=lambda _m: True,
         )
+    assert write.created == []
+
+
+def test_ssh_prerequisite_check_runs_before_paid_creation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.validate_local_ssh_prerequisites",
+        lambda **_k: (_ for _ in ()).throw(OrchestrationError("local ssh precheck failed")),
+    )
+
+    with pytest.raises(OrchestrationError):
+        run_upscale_workflow(
+            settings=settings,
+            options=options,
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
     assert write.created == []
 
 
@@ -370,6 +480,71 @@ def test_destroy_verification_failure_warns(monkeypatch: pytest.MonkeyPatch, tmp
     assert summary.cleanup_warning is not None
 
 
+def test_provisioning_timeout_triggers_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+    write.statuses = ["loading", "loading", "loading"]
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.time.sleep", lambda _s: None)
+
+    values = iter([0.0, 0.2, 0.4, 10.5, 10.6])
+    monkeypatch.setattr("vast_upscaler.instances.time.perf_counter", lambda: next(values))
+
+    with pytest.raises(InstanceLifecycleError):
+        run_upscale_workflow(
+            settings=settings,
+            options=OrchestrationOptions(**{**options.__dict__, "max_wait_ready_seconds": 10.0, "poll_interval_seconds": 0.0}),
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+    assert write.destroyed == [123]
+
+
+def test_provisioning_timeout_cleanup_failure_marks_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+    write.statuses = ["loading", "loading"]
+    write.destroy_ok = False
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.time.sleep", lambda _s: None)
+
+    values = iter([0.0, 0.2, 10.5])
+    monkeypatch.setattr("vast_upscaler.instances.time.perf_counter", lambda: next(values))
+
+    with pytest.raises(InstanceLifecycleError):
+        run_upscale_workflow(
+            settings=settings,
+            options=OrchestrationOptions(**{**options.__dict__, "max_wait_ready_seconds": 10.0, "poll_interval_seconds": 0.0}),
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
+    saved = store.current()
+    assert saved is not None
+    assert saved.state == "CLEANUP_REQUIRED"
+    assert saved.cleanup_error == "Destroy call returned unsuccessful response"
+
+
 def test_local_interrupt_preserved(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     options = _options(tmp_path)
@@ -395,6 +570,122 @@ def test_local_interrupt_preserved(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
             confirm_paid=lambda _m: True,
             confirm_ssh_trust=lambda _m: True,
         )
+
+
+def test_explicit_offer_id_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = OrchestrationOptions(**{**_options(tmp_path).__dict__, "dry_run": True, "offer_id": 40002})
+    store = SessionStore(path=tmp_path / "sessions.json")
+    read = FakeReadClient(
+        offers=[
+            {
+                "id": 40001,
+                "gpu_name": "RTX 3090",
+                "dph_total": 0.21,
+                "reliability": 0.999,
+                "disk_space": 120,
+                "num_gpus": 1,
+                "direct_port_count": 1,
+                "verified": True,
+                "search": {"totalHour": 0.21, "gpuCostPerHour": 0.2, "diskHour": 0.01},
+            },
+            {
+                "id": 40002,
+                "gpu_name": "RTX 3090",
+                "dph_total": 0.25,
+                "reliability": 0.999,
+                "disk_space": 120,
+                "num_gpus": 1,
+                "direct_port_count": 1,
+                "verified": True,
+                "search": {"totalHour": 0.25, "gpuCostPerHour": 0.23, "diskHour": 0.02},
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+
+    summary = run_upscale_workflow(
+        settings=settings,
+        options=options,
+        session_store=store,
+        read_client=read,
+        write_client=FakeWriteClient(),
+        transport=FakeTransport(),
+        confirm_paid=lambda _m: True,
+        confirm_ssh_trust=lambda _m: True,
+    )
+    assert summary.offer_id == 40002
+
+
+def test_explicit_offer_id_not_found_no_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = OrchestrationOptions(**{**_options(tmp_path).__dict__, "offer_id": 99999})
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+
+    with pytest.raises(OrchestrationError):
+        run_upscale_workflow(
+            settings=settings,
+            options=options,
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
+    assert write.created == []
+
+
+def test_explicit_offer_id_incompatible_no_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = OrchestrationOptions(**{**_options(tmp_path).__dict__, "offer_id": 77777})
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+    read = FakeReadClient(
+        offers=[
+            {
+                "id": 77777,
+                "gpu_name": "RTX 3090",
+                "dph_total": 0.8,
+                "reliability": 0.999,
+                "disk_space": 120,
+                "num_gpus": 1,
+                "direct_port_count": 1,
+                "verified": True,
+                "search": {"totalHour": 0.8, "gpuCostPerHour": 0.79, "diskHour": 0.01},
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+
+    with pytest.raises(OrchestrationError):
+        run_upscale_workflow(
+            settings=settings,
+            options=options,
+            session_store=store,
+            read_client=read,
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
+    assert write.created == []
 
 
 def test_resume_after_crash_recovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -445,3 +736,146 @@ def test_corrupted_session_store_refused(tmp_path: Path) -> None:
     store = SessionStore(path=path)
     with pytest.raises(OrchestrationError):
         ensure_store_readable(store)
+
+
+def test_ssh_bootstrap_unknown_key_non_standard_port_adds_known_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    key = tmp_path / "id"
+    key.write_text("x", encoding="utf-8")
+    kh = tmp_path / "known_hosts"
+    kh.write_text("", encoding="utf-8")
+    instance = InstanceSummary(
+        instance_id=1,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="1.2.3.4",
+        ssh_port=17022,
+    )
+    scanned = KnownHostKey(
+        marker="[1.2.3.4]:17022",
+        key_type="ssh-ed25519",
+        key_data="QUFBQQ==",
+        sha256_fingerprint="SHA256:yzxHzFhR4QCG3SqLr3DB0uV8nY5M5D7G6g0j2A9M7s0",
+        source_line="[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==",
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.fetch_ssh_ed25519_host_key", lambda **_k: scanned)
+
+    conn = orchestrator_module._build_trusted_connection(
+        instance=instance,
+        private_key_path=key,
+        known_hosts_path=kh,
+        confirm_ssh_trust=lambda _m: True,
+        bootstrap_mode="tofu",
+        request_verified_fingerprint=None,
+    )
+    assert conn.port == 17022
+    assert scanned.source_line in kh.read_text(encoding="utf-8")
+
+
+def test_ssh_bootstrap_rejects_unknown_key_when_tofu_not_confirmed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    key = tmp_path / "id"
+    key.write_text("x", encoding="utf-8")
+    kh = tmp_path / "known_hosts"
+    kh.write_text("", encoding="utf-8")
+    instance = InstanceSummary(
+        instance_id=1,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="1.2.3.4",
+        ssh_port=17022,
+    )
+    scanned = KnownHostKey(
+        marker="[1.2.3.4]:17022",
+        key_type="ssh-ed25519",
+        key_data="QUFBQQ==",
+        sha256_fingerprint="SHA256:expected",
+        source_line="[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==",
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.fetch_ssh_ed25519_host_key", lambda **_k: scanned)
+
+    with pytest.raises(SshTrustValidationError):
+        orchestrator_module._build_trusted_connection(
+            instance=instance,
+            private_key_path=key,
+            known_hosts_path=kh,
+            confirm_ssh_trust=lambda _m: False,
+            bootstrap_mode="tofu",
+            request_verified_fingerprint=None,
+        )
+
+
+def test_ssh_bootstrap_rejects_wrong_verified_fingerprint_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    key = tmp_path / "id"
+    key.write_text("x", encoding="utf-8")
+    kh = tmp_path / "known_hosts"
+    kh.write_text("", encoding="utf-8")
+    instance = InstanceSummary(
+        instance_id=1,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="1.2.3.4",
+        ssh_port=17022,
+    )
+    scanned = KnownHostKey(
+        marker="[1.2.3.4]:17022",
+        key_type="ssh-ed25519",
+        key_data="QUFBQQ==",
+        sha256_fingerprint="SHA256:expected",
+        source_line="[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==",
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.fetch_ssh_ed25519_host_key", lambda **_k: scanned)
+
+    with pytest.raises(SshTrustValidationError):
+        orchestrator_module._build_trusted_connection(
+            instance=instance,
+            private_key_path=key,
+            known_hosts_path=kh,
+            confirm_ssh_trust=lambda _m: True,
+            bootstrap_mode="strict",
+            request_verified_fingerprint=lambda _m: "SHA256:other",
+        )
+
+
+def test_ssh_bootstrap_rejects_changed_approved_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    key = tmp_path / "id"
+    key.write_text("x", encoding="utf-8")
+    kh = tmp_path / "known_hosts"
+    kh.write_text("[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==\n", encoding="utf-8")
+    instance = InstanceSummary(
+        instance_id=1,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="1.2.3.4",
+        ssh_port=17022,
+    )
+    scanned = KnownHostKey(
+        marker="[1.2.3.4]:17022",
+        key_type="ssh-ed25519",
+        key_data="QkJCQg==",
+        sha256_fingerprint="SHA256:new",
+        source_line="[1.2.3.4]:17022 ssh-ed25519 QkJCQg==",
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.fetch_ssh_ed25519_host_key", lambda **_k: scanned)
+
+    with pytest.raises(SshTrustValidationError):
+        orchestrator_module._build_trusted_connection(
+            instance=instance,
+            private_key_path=key,
+            known_hosts_path=kh,
+            confirm_ssh_trust=lambda _m: True,
+            bootstrap_mode="tofu",
+            request_verified_fingerprint=lambda _m: scanned.sha256_fingerprint,
+        )

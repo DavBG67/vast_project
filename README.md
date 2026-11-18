@@ -112,6 +112,7 @@ pip install -e ".[dev]"
 3. Set secrets only through environment variables:
 	- `VAST_API_KEY`
 	- `VAST_SSH_PRIVATE_KEY`
+4. The CLI auto-loads a local `.env` file from the project root if present; existing system environment variables keep priority.
 
 Never commit `config.yaml`, `.env`, private keys, or API tokens.
 
@@ -125,10 +126,11 @@ Required runtime parameters for real orchestration:
 Initial SSH trust bootstrap (operator-assisted):
 
 1. Obtain host/port from workflow output.
-2. Run `ssh-keyscan -p <port> <host>`.
-3. Verify fingerprint out-of-band.
-4. Add validated key to known_hosts.
-5. Confirm CLI prompt.
+2. The CLI runs `ssh-keyscan` and shows the ED25519 SHA256 fingerprint.
+3. By default (`--ssh-bootstrap-mode tofu`), accepting this key is Trust On First Use (TOFU): it is not independently verified by Vast.ai API/UI.
+4. Confirm explicitly to append the key to `known_hosts`.
+5. If an approved key exists and a different fingerprint is observed, the workflow is refused.
+6. Optional strict mode (`--ssh-bootstrap-mode strict`) keeps explicit confirmation and also asks for an independently verified fingerprint.
 
 ## Quick start
 
@@ -154,6 +156,8 @@ Phase 4E real run example (requires explicit confirmation):
 ```powershell
 upscaler upscale "D:\Videos\film.mkv" ^
 	--worker-image "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>" ^
+	--offer-id 31129 ^
+	--provisioning-timeout-seconds 600 ^
 	--config "config.yaml" ^
 	--known-hosts "$HOME\.ssh\known_hosts"
 ```
@@ -220,6 +224,9 @@ Phase 4E safeguards:
 - Local timeout is not a billing ceiling guarantee.
 - Cleanup verifies instance disappearance; API success alone is insufficient.
 - Ambiguous creation/processing outcomes are preserved for manual reconciliation.
+- Provisioning progress is printed during readiness wait (instance id, GPU, host, status, elapsed time).
+- `--offer-id` enforces explicit offer selection; no silent fallback to another offer.
+- Provisioning timeout is configurable via `--provisioning-timeout-seconds` (default 600s).
 - Cost estimation is hypothesis-driven and can be partial.
 - No benchmark-derived processing speed is available yet.
 - Worker CI remains CPU-only (no paid GPU validation in CI).

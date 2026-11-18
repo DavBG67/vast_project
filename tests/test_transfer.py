@@ -8,6 +8,7 @@ import pytest
 
 from vast_upscaler.transfer import (
     IntegrityCheckError,
+    KnownHostKey,
     LocalFileExistsError,
     OpenSshTransport,
     RetryPolicy,
@@ -19,9 +20,14 @@ from vast_upscaler.transfer import (
     SshKnownHostsError,
     SshTimeoutError,
     TransferInterruptedError,
+    add_known_host_key,
     build_ssh_connection_info,
     compute_transfer_timeout_seconds,
+    fetch_ssh_ed25519_host_key,
+    known_host_markers,
+    lookup_known_host_key,
     sha256_file,
+    validate_local_ssh_prerequisites,
     verify_local_file,
 )
 from vast_upscaler.vast_write_client import InstanceSummary
@@ -407,3 +413,55 @@ def test_run_remote_command_timeout_raises(tmp_path: Path) -> None:
             retry_policy=RetryPolicy(max_attempts=1),
             idempotent=True,
         )
+
+
+def test_known_host_markers_non_standard_port() -> None:
+    assert known_host_markers("1.2.3.4", 17022) == ["[1.2.3.4]:17022"]
+
+
+def test_lookup_known_host_key_non_standard_port(tmp_path: Path) -> None:
+    kh = tmp_path / "known_hosts"
+    kh.write_text("[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==\n", encoding="utf-8")
+    key = lookup_known_host_key(known_hosts_path=kh, host="1.2.3.4", port=17022)
+    assert key is not None
+    assert key.marker == "[1.2.3.4]:17022"
+    assert key.sha256_fingerprint.startswith("SHA256:")
+
+
+def test_add_known_host_key_appends_entry(tmp_path: Path) -> None:
+    kh = tmp_path / "known_hosts"
+    kh.write_text("", encoding="utf-8")
+    host_key = KnownHostKey(
+        marker="[1.2.3.4]:17022",
+        key_type="ssh-ed25519",
+        key_data="QUFBQQ==",
+        sha256_fingerprint="SHA256:dummy",
+        source_line="[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==",
+    )
+    add_known_host_key(known_hosts_path=kh, host_key=host_key)
+    assert "[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==" in kh.read_text(encoding="utf-8")
+
+
+def test_fetch_ssh_ed25519_host_key_parses_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=["ssh-keyscan"],
+            returncode=0,
+            stdout="[1.2.3.4]:17022 ssh-ed25519 QUFBQQ==\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("vast_upscaler.transfer.subprocess.run", fake_run)
+    scanned = fetch_ssh_ed25519_host_key(host="1.2.3.4", port=17022)
+    assert scanned.marker == "[1.2.3.4]:17022"
+    assert scanned.sha256_fingerprint.startswith("SHA256:")
+
+
+def test_validate_local_ssh_prerequisites_creates_known_hosts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    key = tmp_path / "id"
+    key.write_text("x", encoding="utf-8")
+    kh = tmp_path / "kh" / "known_hosts"
+
+    monkeypatch.setattr("vast_upscaler.transfer.shutil.which", lambda _name: "C:/Windows/System32/OpenSSH/ssh.exe")
+    validate_local_ssh_prerequisites(private_key_path=key, known_hosts_path=kh)
+    assert kh.exists()

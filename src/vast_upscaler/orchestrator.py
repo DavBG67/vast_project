@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 from uuid import uuid4
 
 from vast_upscaler.config import Settings
@@ -37,7 +37,14 @@ from vast_upscaler.session_store import (
     SessionStore,
     SessionStoreCorruptionError,
 )
-from vast_upscaler.transfer import OpenSshTransport, build_ssh_connection_info
+from vast_upscaler.transfer import (
+    OpenSshTransport,
+    add_known_host_key,
+    build_ssh_connection_info,
+    fetch_ssh_ed25519_host_key,
+    lookup_known_host_key,
+    validate_local_ssh_prerequisites,
+)
 from vast_upscaler.vast_client import VastClient
 from vast_upscaler.vast_write_client import (
     CreateInstanceRequest,
@@ -72,11 +79,13 @@ class OrchestrationOptions:
     keep_instance: bool = False
     known_hosts_path: Path = Path.home() / ".ssh" / "known_hosts"
     ssh_private_key_path: Path | None = None
-    max_wait_ready_seconds: float = 900.0
+    max_wait_ready_seconds: float = 600.0
     max_destroy_wait_seconds: float = 60.0
-    poll_interval_seconds: float = 5.0
+    poll_interval_seconds: float = 10.0
     processing_fps: float | None = None
     sort_by: str = "price"
+    offer_id: int | None = None
+    ssh_bootstrap_mode: Literal["tofu", "strict"] = "tofu"
 
 
 @dataclass(frozen=True)
@@ -146,12 +155,25 @@ def run_upscale_workflow(
     transport: OpenSshTransport,
     confirm_paid: Callable[[str], bool],
     confirm_ssh_trust: Callable[[str], bool],
+    request_verified_fingerprint: Callable[[str], str | None] | None = None,
+    report_provisioning_status: Callable[[dict[str, str]], None] | None = None,
 ) -> OrchestrationSummary:
     session = _create_session(options)
     session_store.append(session)
 
     source_video = inspect_video(options.input_path)
     offer = _select_offer(read_client=read_client, settings=settings, options=options)
+    if report_provisioning_status is not None:
+        report_provisioning_status(
+            {
+                "phase": "selected-offer",
+                "instance_id": "n/a",
+                "gpu": offer.gpu_name,
+                "host": "n/a",
+                "status": f"offer_id={offer.offer_id}",
+                "status_message": "Offer selected before paid confirmation",
+            }
+        )
     session.offer_id = str(offer.offer_id)
     session.hourly_price_usd = offer.dph_total
     session.transition_to("OFFER_SELECTED", reason=f"Offer selected: {offer.offer_id}")
@@ -180,6 +202,11 @@ def run_upscale_workflow(
             cleanup_warning=None,
         )
 
+    validate_local_ssh_prerequisites(
+        private_key_path=_resolve_private_key(settings=settings, options=options),
+        known_hosts_path=options.known_hosts_path,
+    )
+
     if not confirm_paid("Paid Vast.ai instance creation is required. Continue?"):
         session.transition_to("CANCELLED", reason="User cancelled before instance creation")
         session_store.save(session)
@@ -197,6 +224,7 @@ def run_upscale_workflow(
         target_state="running",
         cancel_unavail=True,
     )
+    _validate_create_payload(request=request, write_client=write_client)
 
     instance_id = create_instance_with_confirmation(
         confirmed=True,
@@ -212,6 +240,27 @@ def run_upscale_workflow(
     cleanup_verified = False
 
     try:
+        first_status_reported = False
+
+        def _on_instance_status(current: InstanceSummary) -> None:
+            nonlocal first_status_reported
+            if report_provisioning_status is None:
+                return
+
+            host = current.ssh_host or current.machine_id or "unknown"
+            message = current.status_message or "n/a"
+            report_provisioning_status(
+                {
+                    "instance_id": str(current.instance_id),
+                    "gpu": current.gpu_name or offer.gpu_name,
+                    "host": host,
+                    "status": current.actual_status or "unknown",
+                    "status_message": message,
+                    "phase": "first" if not first_status_reported else "update",
+                }
+            )
+            first_status_reported = True
+
         summary = wait_until_instance_ready(
             client=write_client,
             instance_id=instance_id,
@@ -219,6 +268,7 @@ def run_upscale_workflow(
                 timeout_seconds=options.max_wait_ready_seconds,
                 poll_interval_seconds=options.poll_interval_seconds,
             ),
+            on_status=_on_instance_status,
         )
         session.transition_to("INSTANCE_READY", reason="Instance ready for SSH")
         session_store.save(session)
@@ -228,6 +278,8 @@ def run_upscale_workflow(
             private_key_path=_resolve_private_key(settings=settings, options=options),
             known_hosts_path=options.known_hosts_path,
             confirm_ssh_trust=confirm_ssh_trust,
+            bootstrap_mode=options.ssh_bootstrap_mode,
+            request_verified_fingerprint=request_verified_fingerprint,
         )
         transport.check_ssh_ready(connection, timeout_seconds=30.0)
 
@@ -333,6 +385,7 @@ def resume_session(
     known_hosts_path: Path,
     ssh_private_key_path: Path | None,
     confirm_ssh_trust: Callable[[str], bool],
+    request_verified_fingerprint: Callable[[str], str | None] | None = None,
 ) -> ResumeSummary:
     session = store.get(session_id) if session_id else store.current()
     if session is None:
@@ -348,6 +401,8 @@ def resume_session(
             private_key_path=ssh_private_key_path or _resolve_private_key(settings=settings, options=_resume_options()),
             known_hosts_path=known_hosts_path,
             confirm_ssh_trust=confirm_ssh_trust,
+            bootstrap_mode="tofu",
+            request_verified_fingerprint=request_verified_fingerprint,
         )
         transport.check_ssh_ready(connection, timeout_seconds=30.0)
 
@@ -450,13 +505,42 @@ def _select_offer(*, read_client: VastClient, settings: Settings, options: Orche
         disk_gb=settings.vast.disk_gb,
     )
     query = build_offers_query(constraints=constraints, limit=100)
+    normalized = normalize_offers(read_client.search_offers(query))
+    compatible = filter_offers(normalized, constraints)
     offers = rank_offers(
-        filter_offers(normalize_offers(read_client.search_offers(query)), constraints),
+        compatible,
         sort_by=options.sort_by,  # type: ignore[arg-type]
     )
     if not offers:
         raise OrchestrationError("No compatible offers found.")
-    return offers[0]
+    if options.offer_id is None:
+        return offers[0]
+
+    for offer in offers:
+        if offer.offer_id == options.offer_id:
+            return offer
+
+    requested_seen = any(candidate.offer_id == options.offer_id for candidate in normalized)
+    if requested_seen:
+        raise OrchestrationError(
+            f"Requested offer {options.offer_id} is incompatible with configured constraints. "
+            "Refusing silent fallback to another offer."
+        )
+    raise OrchestrationError(
+        f"Requested offer {options.offer_id} was not returned by Vast search. "
+        "Refusing silent fallback to another offer."
+    )
+
+
+def _validate_create_payload(*, request: CreateInstanceRequest, write_client: VastWriteClient) -> None:
+    mismatches = write_client.compare_create_payload_with_ssh_template(request)
+    if mismatches:
+        details = ", ".join(f"{key} ({value})" for key, value in sorted(mismatches.items()))
+        raise OrchestrationError(
+            "Create payload does not match expected SSH template parameters: "
+            + details
+            + "."
+        )
 
 
 def _apply_cost_guardrails(*, session: SessionRecord, settings: Settings, estimate: CostEstimate) -> None:
@@ -487,30 +571,56 @@ def _build_trusted_connection(
     private_key_path: Path,
     known_hosts_path: Path,
     confirm_ssh_trust: Callable[[str], bool],
+    bootstrap_mode: Literal["tofu", "strict"],
+    request_verified_fingerprint: Callable[[str], str | None] | None,
 ):
-    if not known_hosts_path.exists() or not _known_host_contains(known_hosts_path, instance.ssh_host, instance.ssh_port):
+    if not instance.ssh_host or instance.ssh_port is None:
+        raise SshTrustValidationError("Instance SSH host/port unavailable for trust validation.")
+
+    known_key = lookup_known_host_key(
+        known_hosts_path=known_hosts_path,
+        host=instance.ssh_host,
+        port=instance.ssh_port,
+    )
+    scanned = fetch_ssh_ed25519_host_key(host=instance.ssh_host, port=instance.ssh_port)
+
+    if known_key is not None:
+        if known_key.sha256_fingerprint != scanned.sha256_fingerprint:
+            raise SshTrustValidationError(
+                "SSH host key mismatch detected for approved host entry. "
+                "Refusing connection and requiring manual investigation."
+            )
+    else:
         msg = (
-            "SSH trust bootstrap required. Validate host fingerprint out-of-band, add it to known_hosts, "
-            "then confirm to continue."
+            "SSH trust bootstrap required.\n"
+            f"Host: {instance.ssh_host}:{instance.ssh_port}\n"
+            f"Fingerprint (ED25519): {scanned.sha256_fingerprint}\n"
+            "WARNING: This fingerprint is obtained from ssh-keyscan on first contact and is not independently "
+            "verified by Vast.ai API/UI. Accepting it is Trust On First Use (TOFU)."
         )
         if not confirm_ssh_trust(msg):
-            raise SshTrustValidationError("SSH trust not confirmed by operator.")
+            raise SshTrustValidationError("SSH trust bootstrap was not approved by operator.")
+
+        if bootstrap_mode == "strict":
+            if request_verified_fingerprint is None:
+                raise SshTrustValidationError(
+                    "Strict SSH bootstrap requires an independently verified fingerprint provider."
+                )
+            provided = (request_verified_fingerprint(msg) or "").strip()
+            if not provided:
+                raise SshTrustValidationError("No independently verified fingerprint provided by operator.")
+            if provided != scanned.sha256_fingerprint:
+                raise SshTrustValidationError(
+                    "Provided independently verified fingerprint does not match scanned server fingerprint. "
+                    "Refusing trust bootstrap."
+                )
+        add_known_host_key(known_hosts_path=known_hosts_path, host_key=scanned)
 
     return build_ssh_connection_info(
         instance=instance,
         private_key_path=private_key_path,
         known_hosts_path=known_hosts_path,
     )
-
-
-def _known_host_contains(known_hosts_path: Path, host: str | None, port: int | None) -> bool:
-    if host is None:
-        return False
-    text = known_hosts_path.read_text(encoding="utf-8")
-    markers = [host]
-    if port is not None:
-        markers.append(f"[{host}]:{port}")
-    return any(marker in text for marker in markers)
 
 
 def _cleanup_session_instance(

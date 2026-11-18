@@ -85,6 +85,8 @@ def test_upscale_dry_run_cli_with_simulated_deps(monkeypatch, tmp_path: Path) ->
 
     def _fake_run(**kwargs):
         captured["dry_run"] = kwargs["options"].dry_run
+        captured["offer_id"] = kwargs["options"].offer_id
+        captured["max_wait_ready_seconds"] = kwargs["options"].max_wait_ready_seconds
         return _summary()
 
     monkeypatch.setattr("vast_upscaler.cli.run_upscale_workflow", _fake_run)
@@ -99,11 +101,17 @@ def test_upscale_dry_run_cli_with_simulated_deps(monkeypatch, tmp_path: Path) ->
             "--worker-image",
             "ghcr.io/acme/worker:test",
             "--dry-run",
+            "--offer-id",
+            "31129",
+            "--provisioning-timeout-seconds",
+            "650",
         ],
     )
 
     assert result.exit_code == 0
     assert captured["dry_run"] is True
+    assert captured["offer_id"] == 31129
+    assert captured["max_wait_ready_seconds"] == 650
     assert "Upscale Summary (DRY-RUN)" in result.stdout
 
 
@@ -166,3 +174,29 @@ def test_instances_destroy_resume_cleanup_cli_paths(monkeypatch, tmp_path: Path)
     assert "destroyed and disappearance verified" in r2.stdout
     assert "Session sess-1" in r3.stdout
     assert "Session Cleanup" in r4.stdout
+
+
+def test_instances_reports_readable_error_when_api_key_missing(monkeypatch, tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("video:\n  default_profile: balanced\n", encoding="utf-8")
+
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
+    monkeypatch.delenv("VAST_SSH_PRIVATE_KEY", raising=False)
+
+    result = runner.invoke(app, ["instances", "--config", str(cfg)])
+
+    assert result.exit_code == 1
+    assert "Failed to list instances: VAST_API_KEY missing." in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+def test_confirm_ssh_trust_refuses_non_interactive(monkeypatch) -> None:
+    class _FakeStdin:
+        @staticmethod
+        def isatty() -> bool:
+            return False
+
+    monkeypatch.setattr("vast_upscaler.cli.sys.stdin", _FakeStdin())
+    from vast_upscaler.cli import _confirm_ssh_trust
+
+    assert _confirm_ssh_trust("msg") is False

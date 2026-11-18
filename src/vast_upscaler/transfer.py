@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import posixpath
 import shlex
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -80,6 +82,15 @@ class SshConnectionInfo:
     private_key_path: Path
     known_hosts_path: Path
     mode: Literal["direct", "proxy", "unknown"]
+
+
+@dataclass(frozen=True)
+class KnownHostKey:
+    marker: str
+    key_type: str
+    key_data: str
+    sha256_fingerprint: str
+    source_line: str
 
 
 @dataclass(frozen=True)
@@ -399,6 +410,109 @@ def build_ssh_connection_info(
     )
 
 
+def validate_local_ssh_prerequisites(*, private_key_path: Path, known_hosts_path: Path) -> None:
+    for tool in ("ssh", "scp", "ssh-keyscan"):
+        if shutil.which(tool) is None:
+            raise SshBinaryNotFoundError(f"OpenSSH binary not found in PATH: {tool}")
+
+    key_path = Path(private_key_path)
+    if not key_path.exists():
+        raise SshKeyNotFoundError(f"SSH private key not found: {key_path}")
+
+    kh_path = Path(known_hosts_path)
+    kh_path.parent.mkdir(parents=True, exist_ok=True)
+    if not kh_path.exists():
+        kh_path.write_text("", encoding="utf-8")
+
+
+def known_host_markers(host: str, port: int) -> list[str]:
+    markers = [f"[{host}]:{port}"]
+    if port == 22:
+        markers.append(host)
+    return markers
+
+
+def lookup_known_host_key(*, known_hosts_path: Path, host: str, port: int) -> KnownHostKey | None:
+    kh_path = Path(known_hosts_path)
+    if not kh_path.exists():
+        return None
+
+    marker_set = set(known_host_markers(host, port))
+    for line in kh_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 3:
+            continue
+        marker, key_type, key_data = parts[0], parts[1], parts[2]
+        if marker not in marker_set:
+            continue
+        if key_type != "ssh-ed25519":
+            continue
+        return KnownHostKey(
+            marker=marker,
+            key_type=key_type,
+            key_data=key_data,
+            sha256_fingerprint=_fingerprint_from_key_data(key_data),
+            source_line=stripped,
+        )
+    return None
+
+
+def fetch_ssh_ed25519_host_key(*, host: str, port: int, timeout_seconds: float = 15.0) -> KnownHostKey:
+    marker = f"[{host}]:{port}"
+    try:
+        completed = subprocess.run(
+            ["ssh-keyscan", "-p", str(port), "-t", "ed25519", host],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+            shell=False,
+        )
+    except FileNotFoundError as exc:
+        raise SshBinaryNotFoundError("OpenSSH binary not found in PATH: ssh-keyscan") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SshConnectionError(f"ssh-keyscan timed out after {timeout_seconds:.1f}s") from exc
+
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip() and not line.startswith("#")]
+    if completed.returncode != 0 and not lines:
+        stderr = completed.stderr.strip() or "ssh-keyscan failed"
+        raise SshConnectionError(stderr)
+    if not lines:
+        raise SshConnectionError("ssh-keyscan returned no host key")
+
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        key_marker, key_type, key_data = parts[0], parts[1], parts[2]
+        if key_type != "ssh-ed25519":
+            continue
+        normalized_marker = key_marker if key_marker else marker
+        return KnownHostKey(
+            marker=normalized_marker,
+            key_type=key_type,
+            key_data=key_data,
+            sha256_fingerprint=_fingerprint_from_key_data(key_data),
+            source_line=f"{normalized_marker} {key_type} {key_data}",
+        )
+    raise SshConnectionError("ssh-keyscan did not return an ED25519 host key")
+
+
+def add_known_host_key(*, known_hosts_path: Path, host_key: KnownHostKey) -> None:
+    kh_path = Path(known_hosts_path)
+    kh_path.parent.mkdir(parents=True, exist_ok=True)
+    if not kh_path.exists():
+        kh_path.write_text("", encoding="utf-8")
+
+    with kh_path.open("a", encoding="utf-8") as handle:
+        if kh_path.stat().st_size > 0:
+            handle.write("\n")
+        handle.write(host_key.source_line)
+
+
 def compute_transfer_timeout_seconds(
     *,
     expected_size_bytes: int | None,
@@ -449,3 +563,12 @@ def _remote_target(conn: SshConnectionInfo, remote_path: str) -> str:
 
 def _quote_remote_path(path: str) -> str:
     return "'" + path.replace("'", "'\"'\"'") + "'"
+
+
+def _fingerprint_from_key_data(key_data: str) -> str:
+    try:
+        key_bytes = base64.b64decode(key_data.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise SshKnownHostsError("Invalid SSH public key payload in known_hosts/ssh-keyscan output.") from exc
+    digest = hashlib.sha256(key_bytes).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
