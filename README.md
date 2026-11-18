@@ -181,6 +181,7 @@ Produced files and local state:
 - Session store: `%USERPROFILE%\.vast_upscaler\sessions.json`
 - Provisioning history store: `%USERPROFILE%\.vast_upscaler\provisioning_history.json`
 - Workflow lock: `%USERPROFILE%\.vast_upscaler\workflow.lock`
+- After `running`, SSH endpoint reachability is probed with bounded retries before trust bootstrap (strict cap, no infinite retry).
 
 Common errors and actions:
 

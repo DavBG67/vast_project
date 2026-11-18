@@ -15,6 +15,7 @@ from vast_upscaler.orchestrator import (
     OrchestrationOptions,
     SessionExecutionLock,
     SessionLockError,
+    SshEndpointProbeError,
     SshTrustValidationError,
     cleanup_sessions,
     ensure_store_readable,
@@ -53,6 +54,15 @@ def _stub_ssh_trust(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("vast_upscaler.orchestrator.fetch_ssh_ed25519_host_key", _fake_fetch)
     monkeypatch.setattr("vast_upscaler.orchestrator.validate_local_ssh_prerequisites", lambda **_k: None)
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return None
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.socket.create_connection", lambda *_a, **_k: _Conn())
 
 
 class FakeReadClient:
@@ -554,6 +564,272 @@ def test_provisioning_timeout_cleanup_failure_marks_required(monkeypatch: pytest
     assert saved is not None
     assert saved.state == "CLEANUP_REQUIRED"
     assert saved.cleanup_error == "Destroy call returned unsuccessful response"
+
+
+def test_ssh_tcp_probe_immediate_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = InstanceSummary(
+        instance_id=123,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="ssh9.vast.ai",
+        ssh_port=17022,
+        gpu_name="RTX 3090",
+    )
+    tracker = orchestrator_module.ProvisioningAttemptTracker(session_id="sess-1")
+    calls = {"n": 0}
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return None
+
+    def _fake_connect(*_args, **_kwargs):
+        calls["n"] += 1
+        return _Conn()
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.socket.create_connection", _fake_connect)
+    events: list[dict[str, str]] = []
+
+    orchestrator_module._wait_for_ssh_tcp_availability(
+        instance=summary,
+        timeout_seconds=75.0,
+        retry_delay_seconds=5.0,
+        report_provisioning_status=lambda payload: events.append(payload),
+        tracker=tracker,
+    )
+
+    assert calls["n"] == 1
+    assert any(item["status"] == "reachable" for item in events)
+
+
+def test_ssh_tcp_probe_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = InstanceSummary(
+        instance_id=123,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="ssh9.vast.ai",
+        ssh_port=17022,
+        gpu_name="RTX 3090",
+    )
+    tracker = orchestrator_module.ProvisioningAttemptTracker(session_id="sess-1")
+    calls = {"n": 0}
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return None
+
+    def _fake_connect(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("Connection refused")
+        return _Conn()
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.socket.create_connection", _fake_connect)
+    monkeypatch.setattr("vast_upscaler.orchestrator.time.sleep", lambda _s: None)
+
+    now_values = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+    monkeypatch.setattr("vast_upscaler.orchestrator.time.monotonic", lambda: next(now_values))
+    events: list[dict[str, str]] = []
+
+    orchestrator_module._wait_for_ssh_tcp_availability(
+        instance=summary,
+        timeout_seconds=75.0,
+        retry_delay_seconds=5.0,
+        report_provisioning_status=lambda payload: events.append(payload),
+        tracker=tracker,
+    )
+
+    assert calls["n"] == 3
+    assert sum(1 for item in events if item["status"] == "retrying") == 2
+    assert any(item["status"] == "reachable" for item in events)
+
+
+def test_ssh_tcp_probe_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = InstanceSummary(
+        instance_id=123,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="ssh9.vast.ai",
+        ssh_port=17022,
+        gpu_name="RTX 3090",
+    )
+    tracker = orchestrator_module.ProvisioningAttemptTracker(session_id="sess-1")
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.socket.create_connection", lambda *_a, **_k: (_ for _ in ()).throw(OSError("Connection refused")))
+    monkeypatch.setattr("vast_upscaler.orchestrator.time.sleep", lambda _s: None)
+    now_values = iter([0.0, 40.0, 81.0, 82.0])
+    monkeypatch.setattr("vast_upscaler.orchestrator.time.monotonic", lambda: next(now_values))
+
+    with pytest.raises(SshEndpointProbeError):
+        orchestrator_module._wait_for_ssh_tcp_availability(
+            instance=summary,
+            timeout_seconds=75.0,
+            retry_delay_seconds=5.0,
+            report_provisioning_status=lambda _payload: None,
+            tracker=tracker,
+        )
+
+
+def test_ssh_tcp_probe_rejects_missing_or_invalid_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracker = orchestrator_module.ProvisioningAttemptTracker(session_id="sess-1")
+    summary_missing = InstanceSummary(
+        instance_id=123,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="ssh9.vast.ai",
+        ssh_port=None,
+        gpu_name="RTX 3090",
+    )
+    with pytest.raises(SshEndpointProbeError):
+        orchestrator_module._wait_for_ssh_tcp_availability(
+            instance=summary_missing,
+            timeout_seconds=75.0,
+            retry_delay_seconds=5.0,
+            report_provisioning_status=None,
+            tracker=tracker,
+        )
+
+    summary_invalid = InstanceSummary(
+        instance_id=123,
+        actual_status="running",
+        intended_status="running",
+        cur_state="running",
+        label="sess",
+        image_runtype="ssh_direct",
+        ssh_host="ssh9.vast.ai",
+        ssh_port=70000,
+        gpu_name="RTX 3090",
+    )
+    with pytest.raises(SshEndpointProbeError):
+        orchestrator_module._wait_for_ssh_tcp_availability(
+            instance=summary_invalid,
+            timeout_seconds=75.0,
+            retry_delay_seconds=5.0,
+            report_provisioning_status=None,
+            tracker=tracker,
+        )
+
+
+def test_ssh_endpoint_probe_timeout_triggers_cleanup_and_history(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+    write.list_instances_rows = []
+    history_store = _MemoryHistoryStore()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator._wait_for_ssh_tcp_availability",
+        lambda **_k: (_ for _ in ()).throw(SshEndpointProbeError("refused")),
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.ProvisioningHistoryStore", lambda: history_store)
+
+    with pytest.raises(SshEndpointProbeError):
+        run_upscale_workflow(
+            settings=settings,
+            options=options,
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
+    assert write.destroyed == [123]
+    assert len(history_store.attempts) == 1
+    assert history_store.attempts[0].outcome == "SSH_CONNECT_FAIL"
+
+
+def test_interruption_during_ssh_endpoint_wait_is_preserved(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator._wait_for_ssh_tcp_availability",
+        lambda **_k: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(OrchestrationError):
+        run_upscale_workflow(
+            settings=settings,
+            options=options,
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
+    saved = store.current()
+    assert saved is not None
+    assert saved.state in {"PRESERVED_FOR_RECOVERY", "DESTROYED"}
+
+
+def test_ssh_bootstrap_failure_not_masked_by_endpoint_wait(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    unknown_known_hosts = tmp_path / "known_hosts_unknown"
+    unknown_known_hosts.write_text("", encoding="utf-8")
+    options = OrchestrationOptions(**{**options.__dict__, "known_hosts_path": unknown_known_hosts})
+    store = SessionStore(path=tmp_path / "sessions.json")
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    calls = {"n": 0}
+
+    def _probe_ok(**_k):
+        calls["n"] += 1
+
+    monkeypatch.setattr("vast_upscaler.orchestrator._wait_for_ssh_tcp_availability", _probe_ok)
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.execute_remote_worker",
+        lambda **_k: (_ for _ in ()).throw(AssertionError("worker should not run")),
+    )
+
+    with pytest.raises(SshTrustValidationError):
+        run_upscale_workflow(
+            settings=settings,
+            options=OrchestrationOptions(**{**options.__dict__, "ssh_bootstrap_mode": "tofu"}),
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=FakeWriteClient(),
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: False,
+        )
+
+    assert calls["n"] == 1
 
 
 def test_provisioning_history_records_success_and_deduplicates_status_events(

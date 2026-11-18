@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -71,6 +72,10 @@ class SessionLockError(OrchestrationError):
 
 
 class SshTrustValidationError(OrchestrationError):
+    pass
+
+
+class SshEndpointProbeError(SshConnectionError):
     pass
 
 
@@ -297,6 +302,13 @@ def run_upscale_workflow(
         provisioning_succeeded = True
         outcome = "PROVISION_SUCCESS"
         session_store.save(session)
+        _wait_for_ssh_tcp_availability(
+            instance=summary,
+            timeout_seconds=75.0,
+            retry_delay_seconds=5.0,
+            report_provisioning_status=report_provisioning_status,
+            tracker=tracker,
+        )
 
         connection = _build_trusted_connection(
             instance=summary,
@@ -787,6 +799,66 @@ def _persist_provisioning_history(
             }
         )
     return warning
+
+
+def _wait_for_ssh_tcp_availability(
+    *,
+    instance: InstanceSummary,
+    timeout_seconds: float,
+    retry_delay_seconds: float,
+    report_provisioning_status: Callable[[dict[str, str]], None] | None,
+    tracker: ProvisioningAttemptTracker,
+) -> None:
+    host = instance.ssh_host
+    port = instance.ssh_port
+    if not host:
+        raise SshEndpointProbeError("Instance is running but SSH host is missing in Vast API response.")
+    if port is None or port <= 0 or port > 65535:
+        raise SshEndpointProbeError("Instance is running but SSH port is missing or invalid in Vast API response.")
+
+    tracker.record_transition("SSH_ENDPOINT_WAIT_STARTED")
+    deadline = time.monotonic() + timeout_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            with socket.create_connection((host, port), timeout=5.0):
+                tracker.record_transition("SSH_ENDPOINT_REACHABLE")
+                if report_provisioning_status is not None:
+                    report_provisioning_status(
+                        {
+                            "phase": "ssh-probe",
+                            "instance_id": str(instance.instance_id),
+                            "gpu": instance.gpu_name or "unknown",
+                            "host": host,
+                            "status": "reachable",
+                            "status_message": f"SSH TCP endpoint reachable on attempt {attempt}",
+                        }
+                    )
+                return
+        except OSError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SshEndpointProbeError(
+                    f"SSH TCP endpoint did not become reachable within {int(timeout_seconds)}s: {host}:{port}. "
+                    f"Last error: {exc}"
+                ) from exc
+
+            if report_provisioning_status is not None:
+                report_provisioning_status(
+                    {
+                        "phase": "ssh-probe",
+                        "instance_id": str(instance.instance_id),
+                        "gpu": instance.gpu_name or "unknown",
+                        "host": host,
+                        "status": "retrying",
+                        "status_message": (
+                            f"SSH TCP unavailable (attempt {attempt}): {exc}. "
+                            f"Retry in {int(retry_delay_seconds)}s."
+                        ),
+                    }
+                )
+            time.sleep(retry_delay_seconds)
 
 
 def _create_session(options: OrchestrationOptions) -> SessionRecord:
