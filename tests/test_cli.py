@@ -42,8 +42,24 @@ def test_inspect_json_output(monkeypatch, tmp_path: Path) -> None:
     assert '"height": 576' in result.stdout
 
 
-def test_offers_offline_fixture() -> None:
-    result = runner.invoke(app, ["offers", "--fixture", "tests/fixtures/offers.json"])
+def test_offers_offline_fixture(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+vast:
+  gpu_models: [RTX 3090 Ti]
+  max_hourly_price_usd: 0.35
+  min_reliability: 0.99
+  verified_only: true
+  disk_gb: 50
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        ["offers", "--fixture", "tests/fixtures/offers.json", "--config", str(config_path)],
+    )
 
     assert result.exit_code == 0
     assert "offline fixture" in result.stdout
@@ -65,6 +81,19 @@ def test_estimate_offline_fixture(monkeypatch, tmp_path: Path) -> None:
         ),
     )
 
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+vast:
+  gpu_models: [RTX 3090 Ti]
+  max_hourly_price_usd: 0.35
+  min_reliability: 0.99
+  verified_only: true
+  disk_gb: 50
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
     result = runner.invoke(
         app,
         [
@@ -74,6 +103,8 @@ def test_estimate_offline_fixture(monkeypatch, tmp_path: Path) -> None:
             "tests/fixtures/offers.json",
             "--fps-processing",
             "5",
+            "--config",
+            str(config_path),
         ],
     )
 

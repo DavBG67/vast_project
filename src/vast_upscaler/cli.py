@@ -44,6 +44,7 @@ from vast_upscaler.vast_client import (
 )
 from vast_upscaler.vast_write_client import VastWriteApiError, VastWriteClient
 from vast_upscaler.video import VideoProbeError, inspect_video
+from vast_upscaler.webapp import create_app
 
 app = typer.Typer(help="Vast Video Upscaler local orchestrator CLI")
 session_app = typer.Typer(help="Session recovery and cleanup commands")
@@ -75,6 +76,8 @@ SSH_BOOTSTRAP_MODE_OPTION = typer.Option(
     "--ssh-bootstrap-mode",
     help="SSH host trust bootstrap mode: tofu (default) or strict.",
 )
+WEB_HOST_OPTION = typer.Option("127.0.0.1", "--host", help="Bind host for local web UI.")
+WEB_PORT_OPTION = typer.Option(8765, "--port", min=1, max=65535, help="Bind port for local web UI.")
 
 app.add_typer(session_app, name="session")
 
@@ -367,6 +370,23 @@ def upscale(
             write_client.close()
 
     _print_upscale_summary(summary, dry_run=dry_run)
+
+
+@app.command("web")
+def web_ui(
+    config: Path = CONFIG_OPTION,
+    host: str = WEB_HOST_OPTION,
+    port: int = WEB_PORT_OPTION,
+) -> None:
+    if host != "127.0.0.1":
+        raise typer.BadParameter("For security, web UI must bind to 127.0.0.1 only.")
+    try:
+        import uvicorn
+    except ImportError as exc:
+        console.print("Missing dependency: uvicorn. Install web extras first.")
+        raise typer.Exit(code=1) from exc
+    app_instance = create_app(config_path=config)
+    uvicorn.run(app_instance, host=host, port=port)
 
 
 @app.command()

@@ -183,6 +183,28 @@ upscaler status
 upscaler history --limit 20
 ```
 
+## Local web UI (Phase 5A V1)
+
+Install dependencies (including FastAPI/Uvicorn), then start the local web interface:
+
+```powershell
+pip install -e .
+upscaler web --config "config.yaml" --host 127.0.0.1 --port 8765
+```
+
+Open: `http://127.0.0.1:8765`
+
+V1 behavior:
+
+- Local-only bind: `127.0.0.1` (refused otherwise).
+- SSE live stream for provisioning and worker progress events.
+- One active processing task at a time.
+- Automatic mode: keeps existing paid confirmation, provisioning, processing, and verified cleanup flow.
+- Manual mode: uses an existing instance id, never auto-creates and never auto-destroys; billing continues until manual destroy.
+- SSH trust checks remain strict/TOFU as in CLI via explicit browser confirmations.
+- No secrets are exposed to browser payloads.
+- Existing output/report files are never overwritten.
+
 Produced files and local state:
 
 - Output video default: `<input-dir>/<input-stem>-upscaled.<ext>`
