@@ -171,6 +171,7 @@ def run_upscale_workflow(
     confirm_ssh_trust: Callable[[str], bool],
     request_verified_fingerprint: Callable[[str], str | None] | None = None,
     report_provisioning_status: Callable[[dict[str, str]], None] | None = None,
+    report_worker_progress: Callable[[dict[str, object]], None] | None = None,
 ) -> OrchestrationSummary:
     session = _create_session(options)
     session_store.append(session)
@@ -335,6 +336,7 @@ def run_upscale_workflow(
                 target_height=options.target_height,
                 profile=options.profile,
             ),
+            progress_callback=report_worker_progress,
         )
         session.local_output_retrieved = True
         session.transition_to("DOWNLOADING", reason="Remote processing completed")

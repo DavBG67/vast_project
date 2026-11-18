@@ -163,6 +163,15 @@ upscaler upscale "D:\Videos\film.mkv" ^
 	--known-hosts "$HOME\.ssh\known_hosts"
 ```
 
+During `upscaler upscale`, the CLI now streams worker progress when the worker image emits `VAST_PROGRESS_JSON` events:
+
+- Stage transitions (`preparation`, `decoding`, `upscale`, `encoding`, `finalization`)
+- Frame progress (`frames_done/frames_total`) when available
+- Measured processing FPS and ETA when computable
+- Upload/download transfer start and completion markers
+
+If output is redirected, progress is throttled to periodic readable lines instead of terminal in-place refresh.
+
 Other operational commands:
 
 ```powershell

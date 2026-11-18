@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 try:
@@ -39,6 +40,8 @@ class ProcessingStageError(WorkerError):
 
 
 _STOP_REQUESTED = False
+PROGRESS_EVENT_PREFIX = "VAST_PROGRESS_JSON "
+PROGRESS_EVENT_VERSION = 1
 
 
 def _signal_handler(_signum, _frame) -> None:
@@ -58,6 +61,64 @@ class ProcessingReport:
     processing_fps: float
     gpu: str
     notes: list[str]
+
+
+class ProgressEmitter:
+    def __init__(self, *, started_at: float, emit_interval_seconds: float = 1.0, emit_frame_interval: int = 25) -> None:
+        self._started_at = started_at
+        self._emit_interval_seconds = emit_interval_seconds
+        self._emit_frame_interval = emit_frame_interval
+        self._last_emitted_at = 0.0
+        self._last_emitted_frames = -1
+        self._last_stage: str | None = None
+
+    def emit(
+        self,
+        *,
+        stage: str,
+        frames_done: int | None = None,
+        frames_total: int | None = None,
+        force: bool = False,
+    ) -> None:
+        now = time.perf_counter()
+        if not force:
+            enough_time = (now - self._last_emitted_at) >= self._emit_interval_seconds
+            enough_frames = (
+                frames_done is not None
+                and frames_done >= 0
+                and (self._last_emitted_frames < 0 or frames_done - self._last_emitted_frames >= self._emit_frame_interval)
+            )
+            stage_changed = stage != self._last_stage
+            if not (enough_time or enough_frames or stage_changed):
+                return
+
+        elapsed = max(0.0, now - self._started_at)
+        fps = (frames_done / elapsed) if frames_done is not None and elapsed > 0 else None
+        eta: float | None = None
+        if frames_done is not None and frames_total is not None and fps and fps > 0 and frames_total >= frames_done:
+            eta = (frames_total - frames_done) / fps
+
+        payload: dict[str, object] = {
+            "kind": "worker",
+            "event_version": PROGRESS_EVENT_VERSION,
+            "stage": stage,
+            "elapsed_seconds": round(elapsed, 3),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        if frames_done is not None:
+            payload["frames_done"] = max(0, frames_done)
+        if frames_total is not None:
+            payload["frames_total"] = max(0, frames_total)
+        if fps is not None:
+            payload["fps_processing"] = round(fps, 3)
+        if eta is not None:
+            payload["eta_seconds"] = max(0.0, round(eta, 3))
+
+        print(f"{PROGRESS_EVENT_PREFIX}{json.dumps(payload, separators=(',', ':'))}", flush=True)
+        self._last_stage = stage
+        self._last_emitted_at = now
+        if frames_done is not None:
+            self._last_emitted_frames = frames_done
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,11 +145,13 @@ def main() -> int:
     report_path = Path(args.report).resolve() if args.report else output_path.with_suffix(output_path.suffix + ".report.json")
 
     started = time.perf_counter()
+    progress = ProgressEmitter(started_at=started)
     notes: list[str] = []
     frames_processed = 0
     staged_output: Path | None = None
 
     try:
+        progress.emit(stage="preparation", frames_done=0, force=True)
         if not input_path.exists():
             raise WorkerError(f"Input file does not exist: {input_path}")
 
@@ -96,6 +159,7 @@ def main() -> int:
         _ensure_disk_space(output_path.parent, min_free_gb=args.min_free_gb)
 
         source = probe_video(input_path)
+        frames_total = _estimate_total_frames(duration_seconds=source.duration_seconds, fps=source.fps)
         target_width, target_height = compute_target_canvas(
             source_width=source.width,
             source_height=source.height,
@@ -131,8 +195,11 @@ def main() -> int:
                 target_height=target_height,
                 upscaler=upscaler,
                 crf=args.video_crf,
+                progress=progress,
+                frames_total=frames_total,
             )
 
+            progress.emit(stage="finalization", frames_done=frames_processed, frames_total=frames_total, force=True)
             mux_with_source_streams(input_path=input_path, video_only_path=encoded_video, output_path=staged_output)
             validate_output(output_path=staged_output, source_duration=source.duration_seconds, source_fps=source.fps)
 
@@ -155,6 +222,7 @@ def main() -> int:
                 notes=notes,
             )
             write_report(report_path, report)
+            progress.emit(stage="completed", frames_done=frames_processed, frames_total=frames_total, force=True)
 
         print(f"Completed: {output_path}")
         return 0
@@ -212,6 +280,8 @@ def run_streaming_upscale(
     target_height: int,
     upscaler: RealesrganUpscaler,
     crf: int,
+    progress: ProgressEmitter,
+    frames_total: int | None,
 ) -> int:
     import cv2
     import numpy as np
@@ -269,6 +339,7 @@ def run_streaming_upscale(
     encoder = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
+        progress.emit(stage="decoding", frames_done=0, frames_total=frames_total, force=True)
         while True:
             if _STOP_REQUESTED:
                 raise WorkerError("Stop requested by signal")
@@ -289,10 +360,12 @@ def run_streaming_upscale(
             assert encoder.stdin is not None
             encoder.stdin.write(out_rgb.tobytes())
             frames += 1
+            progress.emit(stage="upscale", frames_done=frames, frames_total=frames_total)
 
         assert encoder.stdin is not None
         encoder.stdin.close()
 
+        progress.emit(stage="encoding", frames_done=frames, frames_total=frames_total, force=True)
         decode_code = decoder.wait()
         encode_code = encoder.wait()
 
@@ -493,6 +566,13 @@ def _ensure_disk_space(directory: Path, min_free_gb: float) -> None:
     free_gb = usage.free / (1024**3)
     if free_gb < min_free_gb:
         raise WorkerError(f"Insufficient disk space in {directory}: {free_gb:.2f} GB available, need {min_free_gb:.2f} GB")
+
+
+def _estimate_total_frames(*, duration_seconds: float | None, fps: float) -> int | None:
+    if duration_seconds is None or duration_seconds <= 0 or fps <= 0:
+        return None
+    estimate = round(duration_seconds * fps)
+    return estimate if estimate > 0 else None
 
 
 def _terminate_process(process: subprocess.Popen) -> None:

@@ -6,6 +6,7 @@ import json
 import posixpath
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from vast_upscaler.transfer import (
     TransferError,
 )
 from vast_upscaler.video import VideoInfo, VideoProbeError, inspect_video, run_ffprobe
+
+WORKER_PROGRESS_EVENT_PREFIX = "VAST_PROGRESS_JSON "
+ProgressCallback = Callable[[dict[str, object]], None]
 
 
 class RemoteWorkerError(RuntimeError):
@@ -96,11 +100,14 @@ def execute_remote_worker(
     transport: OpenSshTransport,
     connection: SshConnectionInfo,
     request: RemoteWorkerRequest,
+    progress_callback: ProgressCallback | None = None,
 ) -> RemoteWorkerResult:
     paths = _build_remote_paths(request)
     _prepare_remote_dirs(transport=transport, connection=connection, paths=paths)
 
     try:
+        if progress_callback is not None:
+            progress_callback({"kind": "transfer", "stage": "upload", "status": "started"})
         uploaded_input = transport.upload_file(
             connection,
             local_path=request.local_input_path,
@@ -108,6 +115,8 @@ def execute_remote_worker(
             timeout_seconds=request.upload_timeout_seconds,
             retry_policy=RetryPolicy(max_attempts=1),
         )
+        if progress_callback is not None:
+            progress_callback({"kind": "transfer", "stage": "upload", "status": "completed"})
     except TransferError as exc:
         raise RemoteWorkerTransferError(f"Input upload failed: {exc}") from exc
 
@@ -119,6 +128,13 @@ def execute_remote_worker(
     )
 
     try:
+        def _on_stdout_line(line: str) -> None:
+            event = _parse_worker_progress_event(line)
+            if event is None:
+                return
+            if progress_callback is not None:
+                progress_callback(event)
+
         process_result = transport.run_remote_command(
             connection,
             command=command,
@@ -126,6 +142,7 @@ def execute_remote_worker(
             retry_policy=RetryPolicy(max_attempts=1),
             idempotent=False,
             check=False,
+            stdout_line_callback=_on_stdout_line,
         )
     except (SshTimeoutError, SshConnectionError) as exc:
         _raise_ambiguous_after_probe(
@@ -150,6 +167,8 @@ def execute_remote_worker(
             f"stderr: {(process_result.stderr or '').strip()}"
         )
 
+    if progress_callback is not None:
+        progress_callback({"kind": "transfer", "stage": "download", "status": "started"})
     local_output_path = _download_output_video(
         transport=transport,
         connection=connection,
@@ -157,6 +176,8 @@ def execute_remote_worker(
         local_output_path=request.local_output_path,
         timeout_seconds=request.download_timeout_seconds,
     )
+    if progress_callback is not None:
+        progress_callback({"kind": "transfer", "stage": "download", "status": "completed"})
 
     video_info = _validate_local_output_video(
         output_path=local_output_path,
@@ -182,6 +203,21 @@ def execute_remote_worker(
         local_output_path=local_output_path,
         local_report_path=request.local_report_path,
     )
+
+
+def _parse_worker_progress_event(line: str) -> dict[str, object] | None:
+    if not line.startswith(WORKER_PROGRESS_EVENT_PREFIX):
+        return None
+    payload = line[len(WORKER_PROGRESS_EVENT_PREFIX) :]
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if "kind" not in parsed:
+        parsed["kind"] = "worker"
+    return parsed
 
 
 def recover_remote_results(

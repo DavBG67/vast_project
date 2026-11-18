@@ -39,6 +39,7 @@ class FakeTransport:
         self.fail_output_download = False
         self.upload_calls: list[tuple[Path, str]] = []
         self.command_calls: list[list[str] | str] = []
+        self.stream_lines: list[str] = []
 
     def upload_file(self, _conn, *, local_path, remote_dir, **_kwargs):
         if self.upload_error is not None:
@@ -58,6 +59,10 @@ class FakeTransport:
             return self.probe_result
         if self.process_error is not None:
             raise self.process_error
+        callback = _kwargs.get("stdout_line_callback")
+        if callback is not None:
+            for line in self.stream_lines:
+                callback(line)
         return self.process_result
 
     def download_file(self, _conn, *, remote_path, local_path, **_kwargs):
@@ -315,3 +320,54 @@ def test_execute_remote_worker_interruption_with_unknown_state(tmp_path: Path) -
 
     with pytest.raises(RemoteWorkerAmbiguousStateError):
         execute_remote_worker(transport=transport, connection=conn, request=request)
+
+
+def test_execute_remote_worker_forwards_progress_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _conn(tmp_path)
+    request = _request(tmp_path)
+    transport = FakeTransport()
+    transport.report_payload = _completed_report("/workspace/upscale-sessions/session-D-01/output/result video.mp4")
+    transport.stream_lines = [
+        'VAST_PROGRESS_JSON {"event_version":1,"stage":"upscale","frames_done":25,"frames_total":50}',
+        'VAST_PROGRESS_JSON {"event_version":1,"stage":"upscale","frames_done":50,"frames_total":50}',
+    ]
+
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.inspect_video",
+        lambda *_a, **_k: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=10),
+    )
+    monkeypatch.setattr("vast_upscaler.remote_worker.run_ffprobe", lambda *_a, **_k: {"streams": []})
+
+    events: list[dict[str, object]] = []
+    execute_remote_worker(transport=transport, connection=conn, request=request, progress_callback=events.append)
+    assert events[0] == {"kind": "transfer", "stage": "upload", "status": "started"}
+    assert events[1] == {"kind": "transfer", "stage": "upload", "status": "completed"}
+    assert events[2]["kind"] == "worker"
+    assert events[2]["stage"] == "upscale"
+    assert events[2]["frames_done"] == 25
+    assert events[3]["frames_done"] == 50
+    assert events[-2] == {"kind": "transfer", "stage": "download", "status": "started"}
+    assert events[-1] == {"kind": "transfer", "stage": "download", "status": "completed"}
+
+
+def test_execute_remote_worker_ignores_malformed_progress_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _conn(tmp_path)
+    request = _request(tmp_path)
+    transport = FakeTransport()
+    transport.report_payload = _completed_report("/workspace/upscale-sessions/session-D-01/output/result video.mp4")
+    transport.stream_lines = [
+        "VAST_PROGRESS_JSON not-json",
+        'VAST_PROGRESS_JSON {"event_version":1,"stage":"upscale","frames_done":12}',
+    ]
+
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.inspect_video",
+        lambda *_a, **_k: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=10),
+    )
+    monkeypatch.setattr("vast_upscaler.remote_worker.run_ffprobe", lambda *_a, **_k: {"streams": []})
+
+    events: list[dict[str, object]] = []
+    execute_remote_worker(transport=transport, connection=conn, request=request, progress_callback=events.append)
+    worker_events = [item for item in events if item.get("kind") == "worker"]
+    assert len(worker_events) == 1
+    assert worker_events[0]["frames_done"] == 12

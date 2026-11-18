@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +108,7 @@ class RemoteCommandResult:
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+StdoutLineCallback = Callable[[str], None]
 
 _PREFERRED_KEX_CANDIDATES = [
     "sntrup761x25519-sha512@openssh.com",
@@ -146,6 +148,7 @@ class OpenSshTransport:
         retry_policy: RetryPolicy | None = None,
         idempotent: bool = False,
         check: bool = True,
+        stdout_line_callback: StdoutLineCallback | None = None,
     ) -> RemoteCommandResult:
         policy = retry_policy or RetryPolicy()
         if policy.max_attempts < 1:
@@ -159,7 +162,14 @@ class OpenSshTransport:
         last_exc: Exception | None = None
         for attempt in range(1, policy.max_attempts + 1):
             try:
-                completed = self._exec(args, timeout_seconds=timeout_seconds)
+                if stdout_line_callback is None:
+                    completed = self._exec(args, timeout_seconds=timeout_seconds)
+                else:
+                    completed = self._exec_streaming(
+                        args,
+                        timeout_seconds=timeout_seconds,
+                        stdout_line_callback=stdout_line_callback,
+                    )
             except (SshConnectionError, SshTimeoutError) as exc:
                 last_exc = exc
                 if attempt < policy.max_attempts:
@@ -371,6 +381,62 @@ class OpenSshTransport:
             raise SshBinaryNotFoundError(f"OpenSSH binary not found: {tool}") from exc
         except subprocess.TimeoutExpired as exc:
             raise SshTimeoutError(f"OpenSSH command timed out after {timeout_seconds:.1f}s") from exc
+
+    def _exec_streaming(
+        self,
+        args: list[str],
+        *,
+        timeout_seconds: float,
+        stdout_line_callback: StdoutLineCallback,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+            )
+        except FileNotFoundError as exc:
+            tool = args[0] if args else "ssh/scp"
+            raise SshBinaryNotFoundError(f"OpenSSH binary not found: {tool}") from exc
+
+        stdout_lines: list[str] = []
+        started_at = time.perf_counter()
+        try:
+            assert process.stdout is not None
+            while True:
+                if time.perf_counter() - started_at > timeout_seconds:
+                    process.kill()
+                    raise SshTimeoutError(f"OpenSSH command timed out after {timeout_seconds:.1f}s")
+
+                line = process.stdout.readline()
+                if line:
+                    stdout_lines.append(line)
+                    stdout_line_callback(line.rstrip("\r\n"))
+                    continue
+
+                if process.poll() is not None:
+                    break
+                self._sleep(0.05)
+
+            remaining_stdout = process.stdout.read()
+            if remaining_stdout:
+                stdout_lines.append(remaining_stdout)
+                for item in remaining_stdout.splitlines():
+                    stdout_line_callback(item)
+
+            assert process.stderr is not None
+            stderr = process.stderr.read()
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=process.returncode if process.returncode is not None else 1,
+                stdout="".join(stdout_lines),
+                stderr=stderr,
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
 
     @staticmethod
     def _sleep(seconds: float) -> None:

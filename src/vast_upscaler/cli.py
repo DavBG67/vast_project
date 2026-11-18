@@ -4,6 +4,7 @@ import json
 import platform
 import shutil
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -317,6 +318,7 @@ def upscale(
     read_client = _build_read_client(settings=settings)
     write_client = _build_write_client(settings=settings) if not dry_run else _NoopWriteClient()
     transport = OpenSshTransport()
+    worker_progress_reporter = _WorkerProgressReporter()
 
     try:
         lock_cm = SessionExecutionLock() if not dry_run else _NoopLock()
@@ -349,6 +351,7 @@ def upscale(
                 confirm_ssh_trust=_confirm_ssh_trust,
                 request_verified_fingerprint=strict_fingerprint_provider,
                 report_provisioning_status=_build_provisioning_reporter(),
+                report_worker_progress=worker_progress_reporter,
             )
     except (OrchestrationError, VastApiError, VastWriteApiError, VideoProbeError) as exc:
         console.print(f"Upscale failed: {exc}")
@@ -357,6 +360,7 @@ def upscale(
         console.print(f"Upscale failed: {exc}")
         raise typer.Exit(code=1) from exc
     finally:
+        worker_progress_reporter.close()
         if isinstance(read_client, VastClient):
             read_client.close()
         if isinstance(write_client, VastWriteClient):
@@ -677,6 +681,100 @@ def _build_provisioning_reporter() -> Any:
         console.print(status_line)
 
     return _report
+
+
+class _WorkerProgressReporter:
+    def __init__(self) -> None:
+        self._interactive = sys.stdout.isatty()
+        self._last_line_length = 0
+        self._last_stage: str | None = None
+        self._last_non_interactive_at = 0.0
+
+    def __call__(self, payload: dict[str, object]) -> None:
+        kind = str(payload.get("kind") or "")
+        if kind == "transfer":
+            self._render_transfer(payload)
+            return
+        if kind != "worker":
+            return
+        self._render_worker(payload)
+
+    def close(self) -> None:
+        if self._interactive and self._last_line_length:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_line_length = 0
+
+    def _render_transfer(self, payload: dict[str, object]) -> None:
+        stage = str(payload.get("stage") or "unknown")
+        status = str(payload.get("status") or "unknown")
+        self._print_line(f"[cyan]Transfer {stage}[/cyan] {status}")
+
+    def _render_worker(self, payload: dict[str, object]) -> None:
+        stage = str(payload.get("stage") or "unknown")
+        stage_changed = stage != self._last_stage
+        frames_done = _to_int(payload.get("frames_done"))
+        frames_total = _to_int(payload.get("frames_total"))
+        fps = _to_float(payload.get("fps_processing"))
+        eta = _to_float(payload.get("eta_seconds"))
+
+        if stage_changed:
+            self._print_line(f"[cyan]Worker stage[/cyan] {stage}")
+            self._last_stage = stage
+
+        details = f"Upscale stage={stage}"
+        if frames_done is not None and frames_total is not None and frames_total > 0:
+            percent = max(0.0, min(100.0, (frames_done / frames_total) * 100.0))
+            details = f"Upscale {percent:.1f}% | {frames_done}/{frames_total} frames"
+        elif frames_done is not None:
+            details = f"Upscale {frames_done} frames"
+        if fps is not None:
+            details += f" | {fps:.1f} fps"
+        if eta is not None and eta >= 0:
+            details += f" | ETA {round(eta)}s"
+
+        if self._interactive:
+            self._render_interactive(details)
+            return
+
+        now = time.monotonic()
+        if now - self._last_non_interactive_at >= 5.0 or stage_changed:
+            console.print(details)
+            self._last_non_interactive_at = now
+
+    def _render_interactive(self, line: str) -> None:
+        padded = line
+        if len(padded) < self._last_line_length:
+            padded = padded + (" " * (self._last_line_length - len(padded)))
+        self._last_line_length = len(padded)
+        sys.stdout.write("\r" + padded)
+        sys.stdout.flush()
+
+    def _print_line(self, text: str) -> None:
+        if self._interactive and self._last_line_length:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_line_length = 0
+        console.print(text)
+
+
+def _to_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _to_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _confirm_ssh_trust(message: str) -> bool:

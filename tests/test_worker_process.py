@@ -1,14 +1,19 @@
 import json
+import sys
 from argparse import Namespace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from worker.process import (
+    PROGRESS_EVENT_PREFIX,
     ProcessingReport,
+    ProgressEmitter,
     WorkerError,
     _build_staged_output_path,
+    _estimate_total_frames,
     _fail,
     compute_target_canvas,
     main,
@@ -161,3 +166,28 @@ def test_main_failure_after_processing_preserves_frames_and_cleans_temp(tmp_path
     assert payload["frames_processed"] == 12
     assert payload["processing_fps"] > 0
     assert not staged.exists()
+
+
+def test_progress_emitter_outputs_json_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    emitter = ProgressEmitter(started_at=0.0, emit_interval_seconds=10.0, emit_frame_interval=1000)
+    monkeypatch.setattr("worker.process.time.perf_counter", lambda: 2.0)
+
+    emitter.emit(stage="upscale", frames_done=20, frames_total=100, force=True)
+
+    rendered = out.getvalue().strip()
+    assert rendered.startswith(PROGRESS_EVENT_PREFIX)
+    payload = json.loads(rendered[len(PROGRESS_EVENT_PREFIX) :])
+    assert payload["stage"] == "upscale"
+    assert payload["frames_done"] == 20
+    assert payload["frames_total"] == 100
+    assert payload["fps_processing"] == 10.0
+    assert payload["eta_seconds"] == 8.0
+
+
+def test_estimate_total_frames_returns_none_for_unknown_duration() -> None:
+    assert _estimate_total_frames(duration_seconds=None, fps=24.0) is None
+    assert _estimate_total_frames(duration_seconds=0.0, fps=24.0) is None
+    assert _estimate_total_frames(duration_seconds=10.0, fps=0.0) is None
+    assert _estimate_total_frames(duration_seconds=5.0, fps=24.0) == 120
