@@ -13,6 +13,31 @@ on:
         required: true
         type: boolean
         default: false
+      dockerfile:
+        description: "Dockerfile path to build (for example worker/Dockerfile.blackwell)"
+        required: true
+        type: string
+        default: "worker/Dockerfile"
+      expected_torch_version:
+        description: "Expected public torch version in image"
+        required: true
+        type: string
+        default: "2.4.1"
+      expected_torchvision_version:
+        description: "Expected public torchvision version in image"
+        required: true
+        type: string
+        default: "0.19.1"
+      expected_cuda_version:
+        description: "Expected torch compiled CUDA version in image"
+        required: true
+        type: string
+        default: "12.1"
+      publish_tag:
+        description: "Optional additional GHCR tag (e.g. blackwell-test)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -48,6 +73,10 @@ jobs:
     env:
       IMAGE_NAME: vast-video-upscaler-worker:ci-smoke
       MIN_FREE_GB: "30"
+      DOCKERFILE_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.dockerfile || 'worker/Dockerfile' }}
+      EXPECTED_TORCH_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_torch_version || '2.4.1' }}
+      EXPECTED_TORCHVISION_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_torchvision_version || '0.19.1' }}
+      EXPECTED_CUDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_cuda_version || '12.1' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,7 +123,7 @@ jobs:
       - name: Build worker image (no push)
         run: |
           set -euo pipefail
-          docker build --file worker/Dockerfile --tag "$IMAGE_NAME" .
+          docker build --file "$DOCKERFILE_PATH" --tag "$IMAGE_NAME" .
 
       - name: Disk diagnostics (after build)
         run: |
@@ -137,7 +166,7 @@ jobs:
 
       - name: Verify pinned torch/cuda compatibility
         run: |
-          docker run --rm --entrypoint python $IMAGE_NAME -c "import importlib.util, torch, torchvision; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; assert Version(torch.__version__).release == (2, 4, 1), f'unexpected torch public version: {torch.__version__}'; assert Version(torchvision.__version__).release == (0, 19, 1), f'unexpected torchvision public version: {torchvision.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'"
+          docker run --rm --entrypoint python $IMAGE_NAME -c "import importlib.util, torch, torchvision; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; assert Version(torch.__version__).release == Version('${EXPECTED_TORCH_VERSION}').release, f'unexpected torch public version: {torch.__version__}'; assert Version(torchvision.__version__).release == Version('${EXPECTED_TORCHVISION_VERSION}').release, f'unexpected torchvision public version: {torchvision.__version__}'; assert str(torch.version.cuda) == '${EXPECTED_CUDA_VERSION}', f'unexpected compiled cuda version: {torch.version.cuda}'"
 
       - name: Verify model file integrity in image
         run: |
@@ -165,6 +194,7 @@ jobs:
             echo "- Ruff: passed";
             echo "- Pytest: passed";
             echo "- Docker build (linux/amd64): passed";
+            echo "- Dockerfile: ${DOCKERFILE_PATH}";
             echo "- Runner disk guardrail: passed (>= $MIN_FREE_GB GB before build)";
             echo "- Entrypoint --help: passed";
             echo "- FFmpeg/ffprobe: passed";
@@ -209,13 +239,17 @@ jobs:
           OWNER_LC="${OWNER_LC,,}"
           IMAGE="ghcr.io/${OWNER_LC}/vast-video-upscaler-worker"
           TAGS="${IMAGE}:dev-sha-${GITHUB_SHA::12}"
+          EXTRA_TAG="${{ inputs.publish_tag }}"
+          if [ -n "${EXTRA_TAG}" ]; then
+            TAGS="${TAGS},${IMAGE}:${EXTRA_TAG}"
+          fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: worker/Dockerfile
+          file: ${{ inputs.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.prep.outputs.tags }}

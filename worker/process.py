@@ -5,6 +5,7 @@ import json
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -151,6 +152,7 @@ def main() -> int:
     staged_output: Path | None = None
 
     try:
+        _emit_cuda_diagnostics()
         progress.emit(stage="preparation", frames_done=0, force=True)
         if not input_path.exists():
             raise WorkerError(f"Input file does not exist: {input_path}")
@@ -566,6 +568,62 @@ def _ensure_disk_space(directory: Path, min_free_gb: float) -> None:
     free_gb = usage.free / (1024**3)
     if free_gb < min_free_gb:
         raise WorkerError(f"Insufficient disk space in {directory}: {free_gb:.2f} GB available, need {min_free_gb:.2f} GB")
+
+
+def _emit_cuda_diagnostics() -> None:
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001
+        print(f"[cuda-diagnostics] unavailable: unable to import torch ({exc})", file=sys.stderr, flush=True)
+        return
+
+    torch_version = str(getattr(torch, "__version__", "unknown"))
+    compiled_cuda = str(getattr(torch.version, "cuda", None))
+    cuda_available = bool(torch.cuda.is_available())
+
+    gpu_name = "unavailable"
+    capability_text = "n/a"
+    if cuda_available:
+        try:
+            gpu_name = str(torch.cuda.get_device_name(0))
+        except Exception:  # noqa: BLE001
+            gpu_name = "unknown"
+        try:
+            capability = torch.cuda.get_device_capability(0)
+            capability_text = f"{capability[0]}.{capability[1]}"
+        except Exception:  # noqa: BLE001
+            capability_text = "unknown"
+
+    arch_list_raw: list[str] | None = None
+    try:
+        candidate = torch.cuda.get_arch_list()
+        if isinstance(candidate, list):
+            arch_list_raw = [str(item) for item in candidate]
+    except Exception:  # noqa: BLE001
+        arch_list_raw = None
+
+    arch_text = ",".join(arch_list_raw) if arch_list_raw else "unavailable"
+    print(
+        (
+            f"[cuda-diagnostics] torch={torch_version} compiled_cuda={compiled_cuda} "
+            f"cuda_available={cuda_available} gpu={gpu_name} capability={capability_text} arch_list={arch_text}"
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+    if cuda_available and arch_list_raw is not None:
+        try:
+            major, minor = torch.cuda.get_device_capability(0)
+            required_sm = f"sm_{major}{minor}"
+            required_compute = f"compute_{major}{minor}"
+        except Exception:  # noqa: BLE001
+            return
+        if required_sm not in arch_list_raw and required_compute not in arch_list_raw:
+            raise WorkerError(
+                "CUDA runtime appears incompatible with detected GPU architecture. "
+                f"GPU capability={major}.{minor}, required arch token {required_sm} not present in torch arch list {arch_list_raw}."
+            )
 
 
 def _estimate_total_frames(*, duration_seconds: float | None, fps: float) -> int | None:

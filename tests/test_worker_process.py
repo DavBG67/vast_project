@@ -13,6 +13,7 @@ from worker.process import (
     ProgressEmitter,
     WorkerError,
     _build_staged_output_path,
+    _emit_cuda_diagnostics,
     _estimate_total_frames,
     _fail,
     compute_target_canvas,
@@ -191,3 +192,75 @@ def test_estimate_total_frames_returns_none_for_unknown_duration() -> None:
     assert _estimate_total_frames(duration_seconds=0.0, fps=24.0) is None
     assert _estimate_total_frames(duration_seconds=10.0, fps=0.0) is None
     assert _estimate_total_frames(duration_seconds=5.0, fps=24.0) == 120
+
+
+def test_emit_cuda_diagnostics_logs_expected_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    stderr = StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    class _Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def get_device_name(_index: int) -> str:
+            return "NVIDIA RTX 5090"
+
+        @staticmethod
+        def get_device_capability(_index: int) -> tuple[int, int]:
+            return (12, 0)
+
+        @staticmethod
+        def get_arch_list() -> list[str]:
+            return ["sm_86", "sm_89", "sm_120"]
+
+    class _Torch:
+        __version__ = "2.14.1+cu130"
+        cuda = _Cuda()
+        version = SimpleNamespace(cuda="13.0")
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+
+    _emit_cuda_diagnostics()
+
+    logged = stderr.getvalue()
+    assert "torch=2.14.1+cu130" in logged
+    assert "compiled_cuda=13.0" in logged
+    assert "gpu=NVIDIA RTX 5090" in logged
+    assert "capability=12.0" in logged
+    assert "sm_120" in logged
+
+
+def test_emit_cuda_diagnostics_rejects_unsupported_arch(monkeypatch: pytest.MonkeyPatch) -> None:
+    stderr = StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    class _Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def get_device_name(_index: int) -> str:
+            return "NVIDIA RTX 5090"
+
+        @staticmethod
+        def get_device_capability(_index: int) -> tuple[int, int]:
+            return (12, 0)
+
+        @staticmethod
+        def get_arch_list() -> list[str]:
+            return ["sm_86", "sm_89"]
+
+    class _Torch:
+        __version__ = "2.14.1+cu130"
+        cuda = _Cuda()
+        version = SimpleNamespace(cuda="13.0")
+
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+
+    with pytest.raises(WorkerError) as exc:
+        _emit_cuda_diagnostics()
+    assert "incompatible" in str(exc.value).lower()
+    assert "sm_120" in str(exc.value)

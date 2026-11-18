@@ -1,0 +1,63 @@
+FROM pytorch/pytorch:2.14.1-cuda13.0-cudnn9-runtime
+
+ARG REALESRGAN_X4PLUS_URL=https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+ARG REALESRGAN_X4PLUS_SHA256=4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1
+ARG EXPECTED_TORCH_VERSION=2.14.1
+ARG EXPECTED_TORCHVISION_VERSION=0.29.1
+ARG EXPECTED_CUDA_VERSION=13.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    WORKER_HOME=/app/worker \
+    MODELS_DIR=/opt/models
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR ${WORKER_HOME}
+
+COPY worker/requirements.blackwell.txt ./requirements.txt
+RUN pip install --upgrade pip \
+    # Install pinned runtime deps except torch/torchvision/realesrgan/basicsr first.
+    # Torch/CUDA comes from the base image; avoiding resolver touches prevents heavyweight redownloads.
+    && grep -v -E '^(realesrgan|basicsr|torch|torchvision)==' requirements.txt > requirements.core.txt \
+    && pip install --prefer-binary -r requirements.core.txt \
+    # Ensure runtime torch version and compiled CUDA version expected by this image.
+    && python -c "import importlib.util, torch; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; expected=Version('${EXPECTED_TORCH_VERSION}').release; assert Version(torch.__version__).release == expected, f'unexpected torch public version: {torch.__version__}'; assert str(torch.version.cuda) == '${EXPECTED_CUDA_VERSION}', f'unexpected compiled cuda version: {torch.version.cuda}'" \
+    && pip install --no-deps torchvision==${EXPECTED_TORCHVISION_VERSION} \
+    # Install BasicSR runtime deps explicitly (excluding torch/torchvision managed above).
+    && pip install --prefer-binary addict future lmdb Pillow requests scikit-image scipy tb-nightly tqdm yapf \
+    # Install basicsr without build isolation and without dependency resolution.
+    && pip install --no-build-isolation --no-deps basicsr==1.4.2 \
+    # Patch BasicSR import for torchvision>=0.19 where functional_tensor module path is removed.
+    && python -c "import importlib.util; from pathlib import Path; spec = importlib.util.find_spec('basicsr'); assert spec is not None and spec.submodule_search_locations, 'basicsr package path not found'; base = Path(next(iter(spec.submodule_search_locations))); p = base / 'data' / 'degradations.py'; old = 'from torchvision.transforms.functional_tensor import rgb_to_grayscale'; new = 'from torchvision.transforms.functional import rgb_to_grayscale'; s = p.read_text(encoding='utf-8'); assert old in s, f'expected BasicSR patch target not found in {p}'; p.write_text(s.replace(old, new), encoding='utf-8')" \
+    # Fail fast if runtime imports still cannot load the patched BasicSR path.
+    && python -c "import basicsr; import basicsr.data.degradations; from basicsr.data.degradations import rgb_to_grayscale; print('basicsr_patch_ok')" \
+    # Install realesrgan without dependency resolution to avoid re-triggering basicsr install.
+    && pip install --no-deps realesrgan==0.3.0 \
+    # Verify effective import chain used by runtime.
+    && python -c "from basicsr.data.degradations import rgb_to_grayscale; from basicsr.archs.rrdbnet_arch import RRDBNet; from realesrgan import RealESRGANer; print('runtime_import_chain_ok')" \
+    && rm -rf /root/.cache/pip /tmp/pip-* \
+    && rm -f requirements.core.txt
+
+RUN mkdir -p ${MODELS_DIR} \
+    && curl -L -o ${MODELS_DIR}/RealESRGAN_x4plus.pth \
+            ${REALESRGAN_X4PLUS_URL} \
+        && echo "${REALESRGAN_X4PLUS_SHA256}  ${MODELS_DIR}/RealESRGAN_x4plus.pth" | sha256sum -c -
+
+COPY worker/ ${WORKER_HOME}/
+RUN chmod +x ${WORKER_HOME}/entrypoint.sh
+
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /workspace/input /workspace/output /workspace/tmp \
+    && chown -R appuser:appuser /workspace ${WORKER_HOME} ${MODELS_DIR}
+
+USER appuser
+
+VOLUME ["/workspace/input", "/workspace/output"]
+
+ENTRYPOINT ["/app/worker/entrypoint.sh"]
