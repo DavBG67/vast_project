@@ -466,6 +466,38 @@ def test_download_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
         )
 
 
+def test_upload_transfer_failure_triggers_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from vast_upscaler.remote_worker import RemoteWorkerTransferError
+
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.execute_remote_worker",
+        lambda **_k: (_ for _ in ()).throw(RemoteWorkerTransferError("scp failed")),
+    )
+
+    with pytest.raises(RemoteWorkerTransferError):
+        run_upscale_workflow(
+            settings=settings,
+            options=options,
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
+    assert write.destroyed == [123]
+
+
 def test_destroy_verification_failure_warns(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     options = _options(tmp_path)

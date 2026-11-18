@@ -7,6 +7,7 @@ import pytest
 
 from vast_upscaler.remote_worker import (
     RemoteWorkerAmbiguousStateError,
+    RemoteWorkerError,
     RemoteWorkerOutputError,
     RemoteWorkerProcessError,
     RemoteWorkerReportError,
@@ -31,6 +32,7 @@ class FakeTransport:
         self.probe_error: Exception | None = None
         self.process_result = RemoteCommandResult(returncode=0, stdout="worker ok\n", stderr="")
         self.probe_result = RemoteCommandResult(returncode=0, stdout="REPORT_PRESENT=1\nOUTPUT_PRESENT=1\n", stderr="")
+        self.prepare_error: Exception | None = None
         self.report_payload: bytes = b"{}"
         self.output_payload: bytes = b"video-bytes"
         self.fail_report_download = False
@@ -46,7 +48,9 @@ class FakeTransport:
 
     def run_remote_command(self, _conn, *, command, **_kwargs):
         self.command_calls.append(command)
-        if isinstance(command, list) and command[:2] == ["mkdir", "-p"]:
+        if isinstance(command, str) and command.startswith("mkdir -p "):
+            if self.prepare_error is not None:
+                raise self.prepare_error
             return RemoteCommandResult(returncode=0, stdout="", stderr="")
         if isinstance(command, str):
             if self.probe_error is not None:
@@ -139,6 +143,11 @@ def test_execute_remote_worker_nominal(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert result.output_frame_count == 42
     assert transport.upload_calls
     assert str(request.local_input_path) == str(transport.upload_calls[0][0])
+    prepare_cmd = next(c for c in transport.command_calls if isinstance(c, str) and c.startswith("mkdir -p "))
+    assert "/workspace/upscale-sessions/session-D-01/input" in prepare_cmd
+    assert "/workspace/upscale-sessions/session-D-01/output" in prepare_cmd
+    assert "/workspace/upscale-sessions/session-D-01/logs" in prepare_cmd
+    assert transport.upload_calls[0][1] == "/workspace/upscale-sessions/session-D-01/input"
     worker_cmd = next(c for c in transport.command_calls if isinstance(c, list) and c[:2] == ["python", "/app/worker/process.py"])
     assert "--target-width" in worker_cmd
     assert "--target-height" in worker_cmd
@@ -249,6 +258,41 @@ def test_execute_remote_worker_upload_transfer_failure(tmp_path: Path) -> None:
 
     with pytest.raises(RemoteWorkerTransferError):
         execute_remote_worker(transport=transport, connection=conn, request=request)
+
+
+def test_execute_remote_worker_prepare_dirs_failure(tmp_path: Path) -> None:
+    conn = _conn(tmp_path)
+    request = _request(tmp_path)
+    transport = FakeTransport()
+    transport.prepare_error = SshConnectionError("permission denied")
+
+    with pytest.raises(RemoteWorkerError) as exc:
+        execute_remote_worker(transport=transport, connection=conn, request=request)
+    assert "Failed to prepare remote directories" in str(exc.value)
+
+
+def test_execute_remote_worker_prepare_dirs_command_quotes_special_chars(tmp_path: Path) -> None:
+    conn = _conn(tmp_path)
+    source = tmp_path / "in.mp4"
+    source.write_bytes(b"src")
+    request = RemoteWorkerRequest(
+        session_id="sess odd [x]/v1",
+        local_input_path=source,
+        local_output_path=tmp_path / "out" / "clip [done].mp4",
+        local_report_path=tmp_path / "out" / "report.json",
+        target_width=1920,
+        target_height=1080,
+    )
+    transport = FakeTransport()
+    transport.report_payload = _completed_report("/workspace/upscale-sessions/sess-odd-x-v1/output/clip [done].mp4")
+
+    with pytest.raises(RemoteWorkerOutputError):
+        execute_remote_worker(transport=transport, connection=conn, request=request)
+
+    prepare_cmd = next(c for c in transport.command_calls if isinstance(c, str) and c.startswith("mkdir -p "))
+    assert "/workspace/upscale-sessions/sess-odd-x-v1/input" in prepare_cmd
+    assert "/workspace/upscale-sessions/sess-odd-x-v1/output" in prepare_cmd
+    assert "/workspace/upscale-sessions/sess-odd-x-v1/logs" in prepare_cmd
 
 
 def test_execute_remote_worker_timeout_ambiguous_state(tmp_path: Path) -> None:

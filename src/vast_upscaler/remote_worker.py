@@ -69,7 +69,7 @@ class RemoteExecutionPaths:
     root_dir: str
     input_dir: str
     output_dir: str
-    artifacts_dir: str
+    logs_dir: str
     remote_input_path: str
     remote_output_path: str
     remote_report_path: str
@@ -239,13 +239,17 @@ def _prepare_remote_dirs(
     connection: SshConnectionInfo,
     paths: RemoteExecutionPaths,
 ) -> None:
-    command = [
-        "mkdir",
-        "-p",
-        paths.input_dir,
-        paths.output_dir,
-        paths.artifacts_dir,
-    ]
+    quoted_root = shlex.quote(paths.root_dir)
+    quoted_input = shlex.quote(paths.input_dir)
+    quoted_output = shlex.quote(paths.output_dir)
+    quoted_logs = shlex.quote(paths.logs_dir)
+    command = (
+        f"mkdir -p {quoted_input} {quoted_output} {quoted_logs} && "
+        f"test -d {quoted_root} -a -w {quoted_root} && "
+        f"test -d {quoted_input} -a -w {quoted_input} && "
+        f"test -d {quoted_output} -a -w {quoted_output} && "
+        f"test -d {quoted_logs} -a -w {quoted_logs}"
+    )
     try:
         transport.run_remote_command(
             connection,
@@ -444,7 +448,7 @@ def _build_remote_paths(request: RemoteWorkerRequest) -> RemoteExecutionPaths:
     root = posixpath.join(request.remote_root_base.rstrip("/"), session_key)
     input_dir = posixpath.join(root, "input")
     output_dir = posixpath.join(root, "output")
-    artifacts_dir = posixpath.join(root, "artifacts")
+    logs_dir = posixpath.join(root, "logs")
 
     input_name = request.local_input_path.name
     output_name = request.local_output_path.name
@@ -455,10 +459,10 @@ def _build_remote_paths(request: RemoteWorkerRequest) -> RemoteExecutionPaths:
         root_dir=root,
         input_dir=input_dir,
         output_dir=output_dir,
-        artifacts_dir=artifacts_dir,
+        logs_dir=logs_dir,
         remote_input_path=posixpath.join(input_dir, input_name),
         remote_output_path=posixpath.join(output_dir, output_name),
-        remote_report_path=posixpath.join(artifacts_dir, "report.json"),
+        remote_report_path=posixpath.join(logs_dir, "report.json"),
     )
 
 

@@ -278,6 +278,32 @@ def test_upload_windows_path_with_spaces(tmp_path: Path) -> None:
     assert calls
     assert calls[0][0] == "scp"
     assert str(local) in calls[0]
+    assert "root@1.2.3.4:/remote data/my file [v1].txt" in calls[0]
+    assert "root@1.2.3.4:'/remote data/my file [v1].txt'" not in calls[0]
+
+
+def test_download_passes_unquoted_remote_path_for_sftp_mode(tmp_path: Path) -> None:
+    conn = _conn(tmp_path)
+    dst = tmp_path / "downloaded.bin"
+    captured = {}
+
+    def fake_runner(args, **kwargs):
+        captured["args"] = args
+        if args[0] == "scp":
+            Path(args[-1]).write_bytes(b"payload")
+        return _cp(returncode=0)
+
+    transport = OpenSshTransport(runner=fake_runner)
+    result = transport.download_file(
+        conn,
+        remote_path="/workspace/upscale-sessions/sess-1/input/RS 240p.mp4",
+        local_path=dst,
+        timeout_seconds=5,
+    )
+    assert result == dst
+    assert dst.exists()
+    assert "root@1.2.3.4:/workspace/upscale-sessions/sess-1/input/RS 240p.mp4" in captured["args"]
+    assert "root@1.2.3.4:'/workspace/upscale-sessions/sess-1/input/RS 240p.mp4'" not in captured["args"]
 
 
 def test_upload_retry_non_idempotent_transfer_refused(tmp_path: Path) -> None:

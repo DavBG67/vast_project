@@ -618,11 +618,7 @@ def verify_local_file(
 
 
 def _remote_target(conn: SshConnectionInfo, remote_path: str) -> str:
-    return f"{conn.username}@{conn.host}:{_quote_remote_path(remote_path)}"
-
-
-def _quote_remote_path(path: str) -> str:
-    return "'" + path.replace("'", "'\"'\"'") + "'"
+    return f"{conn.username}@{conn.host}:{remote_path}"
 
 
 def _fingerprint_from_key_data(key_data: str) -> str:
