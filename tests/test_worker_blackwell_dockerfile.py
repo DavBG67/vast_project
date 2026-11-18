@@ -13,6 +13,16 @@ def test_blackwell_dockerfile_uses_newer_cuda_stack() -> None:
     assert "requirements.blackwell.txt" in content
 
 
+def test_blackwell_dockerfile_uses_venv_for_pep668_compatibility() -> None:
+    content = DOCKERFILE_PATH.read_text(encoding="utf-8")
+    assert "TORCH_BASE_PYTHON=/opt/conda/bin/python" in content
+    assert "-m venv --system-site-packages ${WORKER_VENV}" in content
+    assert "ENV PATH=${WORKER_VENV}/bin:/opt/conda/bin:${PATH}" in content
+    assert "python -m pip install --upgrade pip" in content
+    assert "--break-system-packages" not in content
+    assert "\nRUN pip install --upgrade pip" not in content
+
+
 def test_blackwell_dockerfile_keeps_basicsr_patch_logic() -> None:
     content = DOCKERFILE_PATH.read_text(encoding="utf-8")
     assert "functional_tensor" in content

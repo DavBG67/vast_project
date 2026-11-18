@@ -32,6 +32,12 @@ From these references, this phase uses:
 3. CI workflow prepared for alternate Dockerfile/version checks and optional experimental tag:
    - [docker-worker.yml](../.github/workflows/docker-worker.yml)
 
+## PEP 668 compatibility (GitHub Actions build)
+
+- Base image Python can be externally managed (PEP 668), making global `pip install --upgrade pip` fail.
+- `Dockerfile.blackwell` now creates a dedicated venv with `--system-site-packages` from `/opt/conda/bin/python` so preinstalled torch/CUDA remain available without reinstalling torch.
+- All install commands run through the same environment (`python -m pip` with `PATH` preferring `${WORKER_VENV}/bin`).
+
 ## Compatibility table (prepared, not hardware-validated)
 
 | Component | Stable stack | Blackwell experimental stack |
