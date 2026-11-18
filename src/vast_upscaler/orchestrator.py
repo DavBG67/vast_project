@@ -13,6 +13,7 @@ from uuid import uuid4
 from vast_upscaler.config import Settings
 from vast_upscaler.cost import CostEstimate, estimate_cost
 from vast_upscaler.instances import (
+    InstanceLifecycleError,
     WaitOptions,
     create_instance_with_confirmation,
     wait_until_instance_ready,
@@ -24,6 +25,12 @@ from vast_upscaler.offers import (
     filter_offers,
     normalize_offers,
     rank_offers,
+)
+from vast_upscaler.provisioning_history import (
+    ProvisioningAttemptTracker,
+    ProvisioningHistoryCorruptionError,
+    ProvisioningHistoryStore,
+    ProvisioningOutcome,
 )
 from vast_upscaler.remote_worker import (
     RemoteWorkerAmbiguousStateError,
@@ -39,6 +46,7 @@ from vast_upscaler.session_store import (
 )
 from vast_upscaler.transfer import (
     OpenSshTransport,
+    SshConnectionError,
     add_known_host_key,
     build_ssh_connection_info,
     fetch_ssh_ed25519_host_key,
@@ -100,6 +108,7 @@ class OrchestrationSummary:
     instance_id: int | None
     cleanup_verified: bool
     cleanup_warning: str | None
+    metrics_warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,9 +169,14 @@ def run_upscale_workflow(
 ) -> OrchestrationSummary:
     session = _create_session(options)
     session_store.append(session)
+    tracker = ProvisioningAttemptTracker(session_id=session.session_id)
+    history_store = ProvisioningHistoryStore()
+    metrics_warning: str | None = None
 
     source_video = inspect_video(options.input_path)
     offer = _select_offer(read_client=read_client, settings=settings, options=options)
+    tracker.set_offer(offer_id=offer.offer_id, gpu_name=offer.gpu_name, hourly_price_usd=offer.dph_total)
+    tracker.record_transition("OFFER_SELECTED")
     if report_provisioning_status is not None:
         report_provisioning_status(
             {
@@ -200,6 +214,7 @@ def run_upscale_workflow(
             instance_id=None,
             cleanup_verified=False,
             cleanup_warning=None,
+            metrics_warning=metrics_warning,
         )
 
     validate_local_ssh_prerequisites(
@@ -213,6 +228,7 @@ def run_upscale_workflow(
         raise OrchestrationError("Cancelled before paid operation.")
 
     session.transition_to("CONFIRMED", reason="User confirmed paid operation")
+    tracker.record_transition("CONFIRMED")
     session_store.save(session)
 
     request = CreateInstanceRequest(
@@ -225,6 +241,7 @@ def run_upscale_workflow(
         cancel_unavail=True,
     )
     _validate_create_payload(request=request, write_client=write_client)
+    tracker.mark_instance_requested()
 
     instance_id = create_instance_with_confirmation(
         confirmed=True,
@@ -233,9 +250,13 @@ def run_upscale_workflow(
         req=request,
         store=session_store,
     )
+    tracker.mark_instance_created(instance_id)
 
     worker_result: RemoteWorkerResult | None = None
     primary_error: Exception | None = None
+    outcome: ProvisioningOutcome = "WORKER_FAIL"
+    provisioning_succeeded = False
+    processing_succeeded = False
     cleanup_warning: str | None = None
     cleanup_verified = False
 
@@ -244,6 +265,7 @@ def run_upscale_workflow(
 
         def _on_instance_status(current: InstanceSummary) -> None:
             nonlocal first_status_reported
+            tracker.observe_instance_status(current)
             if report_provisioning_status is None:
                 return
 
@@ -271,6 +293,9 @@ def run_upscale_workflow(
             on_status=_on_instance_status,
         )
         session.transition_to("INSTANCE_READY", reason="Instance ready for SSH")
+        tracker.mark_instance_ready(summary)
+        provisioning_succeeded = True
+        outcome = "PROVISION_SUCCESS"
         session_store.save(session)
 
         connection = _build_trusted_connection(
@@ -303,9 +328,11 @@ def run_upscale_workflow(
         session.transition_to("DOWNLOADING", reason="Remote processing completed")
         session.transition_to("VERIFYING", reason="Local validation completed")
         session.transition_to("COMPLETED", reason="Workflow completed")
+        processing_succeeded = True
         session_store.save(session)
     except RemoteWorkerAmbiguousStateError as exc:
         primary_error = exc
+        outcome = "WORKER_FAIL"
         session.recovery_required = True
         session.recoverable_output_expected = True
         session.transition_to("PRESERVED_FOR_RECOVERY", reason=str(exc))
@@ -313,6 +340,7 @@ def run_upscale_workflow(
         session_store.save(session)
     except KeyboardInterrupt as exc:
         primary_error = OrchestrationError("Local interruption received. Session preserved for manual recovery.")
+        outcome = "LOCAL_INTERRUPT"
         session.recovery_required = True
         session.recoverable_output_expected = True
         session.transition_to("PRESERVED_FOR_RECOVERY", reason="Local interruption")
@@ -320,6 +348,20 @@ def run_upscale_workflow(
         session_store.save(session)
     except Exception as exc:  # noqa: BLE001
         primary_error = exc
+        if provisioning_succeeded:
+            if isinstance(exc, SshTrustValidationError):
+                outcome = "SSH_BOOTSTRAP_FAIL"
+            elif isinstance(exc, SshConnectionError):
+                outcome = "SSH_CONNECT_FAIL"
+            else:
+                outcome = "WORKER_FAIL"
+        elif isinstance(exc, InstanceLifecycleError):
+            if str(exc) == "Timed out waiting for instance readiness.":
+                outcome = "PROVISION_TIMEOUT"
+            else:
+                outcome = "WORKER_FAIL"
+        else:
+            outcome = "WORKER_FAIL"
         session.transition_to("FAILED", reason=str(exc))
         session.error = str(exc)
         session_store.save(session)
@@ -337,7 +379,24 @@ def run_upscale_workflow(
         if cleanup_warning:
             session.notes.append(f"Cleanup warning after primary failure: {cleanup_warning}")
             session_store.save(session)
+        metrics_warning = _persist_provisioning_history(
+            history_store=history_store,
+            tracker=tracker,
+            outcome=outcome,
+            provisioning_succeeded=provisioning_succeeded,
+            processing_succeeded=processing_succeeded,
+            report_provisioning_status=report_provisioning_status,
+        )
         raise primary_error
+
+    metrics_warning = _persist_provisioning_history(
+        history_store=history_store,
+        tracker=tracker,
+        outcome=outcome,
+        provisioning_succeeded=provisioning_succeeded,
+        processing_succeeded=processing_succeeded,
+        report_provisioning_status=report_provisioning_status,
+    )
 
     return OrchestrationSummary(
         session_id=session.session_id,
@@ -350,6 +409,7 @@ def run_upscale_workflow(
         instance_id=instance_id,
         cleanup_verified=cleanup_verified,
         cleanup_warning=cleanup_warning,
+        metrics_warning=metrics_warning,
     )
 
 
@@ -687,6 +747,46 @@ def _instance_matches(row: dict, instance_id: int) -> bool:
         return int(rid) == int(instance_id)
     except (TypeError, ValueError):
         return False
+
+
+def _persist_provisioning_history(
+    *,
+    history_store: ProvisioningHistoryStore,
+    tracker: ProvisioningAttemptTracker,
+    outcome: ProvisioningOutcome,
+    provisioning_succeeded: bool,
+    processing_succeeded: bool,
+    report_provisioning_status: Callable[[dict[str, str]], None] | None,
+) -> str | None:
+    attempt = tracker.to_attempt(
+        outcome=outcome,
+        provisioning_succeeded=provisioning_succeeded,
+        processing_succeeded=processing_succeeded,
+    )
+    try:
+        history_store.append_attempt(attempt)
+    except ProvisioningHistoryCorruptionError as exc:
+        warning = (
+            "Warning: provisioning metrics were not saved because the history file is corrupted. "
+            f"{exc}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        warning = f"Warning: provisioning metrics were not saved ({exc})."
+    else:
+        return None
+
+    if report_provisioning_status is not None:
+        report_provisioning_status(
+            {
+                "phase": "metrics-warning",
+                "instance_id": str(attempt.instance_id) if attempt.instance_id is not None else "n/a",
+                "gpu": attempt.gpu_name or "unknown",
+                "host": attempt.host_id or "unknown",
+                "status": "warning",
+                "status_message": warning,
+            }
+        )
+    return warning
 
 
 def _create_session(options: OrchestrationOptions) -> SessionRecord:

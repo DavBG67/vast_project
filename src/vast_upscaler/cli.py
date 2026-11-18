@@ -633,6 +633,7 @@ def _print_upscale_summary(summary, *, dry_run: bool) -> None:
     table.add_row("Max known hourly", _fmt_money(summary.estimate.rental_total_hourly_usd))
     table.add_row("Cleanup verified", str(summary.cleanup_verified))
     table.add_row("Cleanup warning", summary.cleanup_warning or "-")
+    table.add_row("Metrics warning", summary.metrics_warning or "-")
     if summary.worker_result is not None:
         table.add_row("Output", str(summary.worker_result.local_output_path))
         table.add_row("Report", str(summary.worker_result.local_report_path))

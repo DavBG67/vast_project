@@ -21,6 +21,9 @@ from vast_upscaler.orchestrator import (
     resume_session,
     run_upscale_workflow,
 )
+from vast_upscaler.provisioning_history import (
+    ProvisioningHistoryCorruptionError,
+)
 from vast_upscaler.session_store import SessionRecord, SessionStore
 from vast_upscaler.transfer import KnownHostKey, SshConnectionError
 from vast_upscaler.vast_write_client import InstanceSummary, VastCreateAmbiguousError
@@ -127,6 +130,14 @@ class FakeTransport:
         self.ssh_ready_calls += 1
         if self.ssh_ready_error is not None:
             raise self.ssh_ready_error
+
+
+class _MemoryHistoryStore:
+    def __init__(self) -> None:
+        self.attempts = []
+
+    def append_attempt(self, attempt) -> None:
+        self.attempts.append(attempt)
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -543,6 +554,135 @@ def test_provisioning_timeout_cleanup_failure_marks_required(monkeypatch: pytest
     assert saved is not None
     assert saved.state == "CLEANUP_REQUIRED"
     assert saved.cleanup_error == "Destroy call returned unsuccessful response"
+
+
+def test_provisioning_history_records_success_and_deduplicates_status_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+    write.statuses = ["loading", "loading", "running"]
+    write.list_instances_rows = []
+    history_store = _MemoryHistoryStore()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.ProvisioningHistoryStore", lambda: history_store)
+
+    class _WorkerResult:
+        local_output_path = options.output_path
+        local_report_path = options.report_path
+        frames_processed = 100
+        video_info = VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0)
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.execute_remote_worker", lambda **_k: _WorkerResult())
+
+    summary = run_upscale_workflow(
+        settings=settings,
+        options=options,
+        session_store=store,
+        read_client=FakeReadClient(),
+        write_client=write,
+        transport=FakeTransport(),
+        confirm_paid=lambda _m: True,
+        confirm_ssh_trust=lambda _m: True,
+    )
+
+    assert summary.metrics_warning is None
+    assert len(history_store.attempts) == 1
+    attempt = history_store.attempts[0]
+    assert attempt.outcome == "PROVISION_SUCCESS"
+    assert attempt.provisioning_succeeded is True
+    assert attempt.processing_succeeded is True
+    status_events = [e for e in attempt.events if e.kind == "status"]
+    assert len(status_events) == 2
+    assert status_events[0].details["status"] == "loading"
+    assert status_events[1].details["status"] == "running"
+
+
+def test_provisioning_history_records_timeout_outcome(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+    write.statuses = ["loading", "loading", "loading"]
+    history_store = _MemoryHistoryStore()
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.time.sleep", lambda _s: None)
+    monkeypatch.setattr("vast_upscaler.orchestrator.ProvisioningHistoryStore", lambda: history_store)
+
+    values = iter([0.0, 0.2, 0.4, 10.5, 10.6])
+    monkeypatch.setattr("vast_upscaler.instances.time.perf_counter", lambda: next(values))
+
+    with pytest.raises(InstanceLifecycleError):
+        run_upscale_workflow(
+            settings=settings,
+            options=OrchestrationOptions(**{**options.__dict__, "max_wait_ready_seconds": 10.0, "poll_interval_seconds": 0.0}),
+            session_store=store,
+            read_client=FakeReadClient(),
+            write_client=write,
+            transport=FakeTransport(),
+            confirm_paid=lambda _m: True,
+            confirm_ssh_trust=lambda _m: True,
+        )
+
+    assert len(history_store.attempts) == 1
+    attempt = history_store.attempts[0]
+    assert attempt.outcome == "PROVISION_TIMEOUT"
+    assert attempt.provisioning_succeeded is False
+    assert attempt.processing_succeeded is False
+
+
+def test_provisioning_history_write_warning_does_not_fail_workflow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    options = _options(tmp_path)
+    store = SessionStore(path=tmp_path / "sessions.json")
+    write = FakeWriteClient()
+    write.list_instances_rows = []
+
+    class _BrokenHistoryStore:
+        def append_attempt(self, _attempt) -> None:
+            raise ProvisioningHistoryCorruptionError("broken file")
+
+    monkeypatch.setattr(
+        "vast_upscaler.orchestrator.inspect_video",
+        lambda _p: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0, frame_rate_fps=24.0),
+    )
+    monkeypatch.setattr("vast_upscaler.orchestrator.ProvisioningHistoryStore", lambda: _BrokenHistoryStore())
+
+    class _WorkerResult:
+        local_output_path = options.output_path
+        local_report_path = options.report_path
+        frames_processed = 100
+        video_info = VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=5.0)
+
+    monkeypatch.setattr("vast_upscaler.orchestrator.execute_remote_worker", lambda **_k: _WorkerResult())
+    warnings: list[dict[str, str]] = []
+
+    summary = run_upscale_workflow(
+        settings=settings,
+        options=options,
+        session_store=store,
+        read_client=FakeReadClient(),
+        write_client=write,
+        transport=FakeTransport(),
+        confirm_paid=lambda _m: True,
+        confirm_ssh_trust=lambda _m: True,
+        report_provisioning_status=lambda payload: warnings.append(payload),
+    )
+
+    assert summary.state == "DESTROYED"
+    assert summary.metrics_warning is not None
+    assert "corrupted" in summary.metrics_warning
+    assert any(item["phase"] == "metrics-warning" for item in warnings)
 
 
 def test_local_interrupt_preserved(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -179,11 +179,13 @@ Produced files and local state:
 - Output video default: `<input-dir>/<input-stem>-upscaled.<ext>`
 - Output report default: `<output-video>.report.json`
 - Session store: `%USERPROFILE%\.vast_upscaler\sessions.json`
+- Provisioning history store: `%USERPROFILE%\.vast_upscaler\provisioning_history.json`
 - Workflow lock: `%USERPROFILE%\.vast_upscaler\workflow.lock`
 
 Common errors and actions:
 
 - `Session store is corrupted`: stop paid runs and reconcile active instances in Vast console first.
+- `Warning: provisioning metrics were not saved ...`: workflow result is preserved, but local provisioning history needs manual repair.
 - `SSH trust bootstrap required`: validate fingerprint manually, update known_hosts, then retry.
 - `Destroy requested but disappearance not verified`: run `upscaler instances`, then `upscaler destroy <id> --yes`, then `upscaler session cleanup`.
 - `Cancelled before paid operation`: rerun and confirm only if estimate/risk is acceptable.
