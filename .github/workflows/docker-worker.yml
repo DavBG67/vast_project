@@ -74,9 +74,9 @@ jobs:
       IMAGE_NAME: vast-video-upscaler-worker:ci-smoke
       MIN_FREE_GB: "30"
       DOCKERFILE_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.dockerfile || 'worker/Dockerfile' }}
-      EXPECTED_TORCH_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_torch_version || '2.4.1' }}
-      EXPECTED_TORCHVISION_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_torchvision_version || '0.19.1' }}
-      EXPECTED_CUDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_cuda_version || '12.1' }}
+      EXPECTED_TORCH_VERSION: ${{ github.event_name == 'workflow_dispatch' && (inputs.dockerfile == 'worker/Dockerfile.blackwell' && inputs.expected_torch_version == '2.4.1' && '2.14.1' || inputs.expected_torch_version) || '2.4.1' }}
+      EXPECTED_TORCHVISION_VERSION: ${{ github.event_name == 'workflow_dispatch' && (inputs.dockerfile == 'worker/Dockerfile.blackwell' && inputs.expected_torchvision_version == '0.19.1' && '0.29.1' || inputs.expected_torchvision_version) || '0.19.1' }}
+      EXPECTED_CUDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && (inputs.dockerfile == 'worker/Dockerfile.blackwell' && inputs.expected_cuda_version == '12.1' && '13.0' || inputs.expected_cuda_version) || '12.1' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -166,7 +166,7 @@ jobs:
 
       - name: Verify pinned torch/cuda compatibility
         run: |
-          docker run --rm --entrypoint python $IMAGE_NAME -c "import importlib.util, torch, torchvision; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; assert Version(torch.__version__).release == Version('${EXPECTED_TORCH_VERSION}').release, f'unexpected torch public version: {torch.__version__}'; assert Version(torchvision.__version__).release == Version('${EXPECTED_TORCHVISION_VERSION}').release, f'unexpected torchvision public version: {torchvision.__version__}'; assert str(torch.version.cuda) == '${EXPECTED_CUDA_VERSION}', f'unexpected compiled cuda version: {torch.version.cuda}'"
+          docker run --rm --entrypoint python $IMAGE_NAME -c "import importlib.util, torch, torchvision; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; expected_torch_release = Version('${EXPECTED_TORCH_VERSION}').release; detected_torch_release = Version(torch.__version__).release; expected_torchvision_release = Version('${EXPECTED_TORCHVISION_VERSION}').release; detected_torchvision_release = Version(torchvision.__version__).release; expected_cuda = '${EXPECTED_CUDA_VERSION}'; detected_cuda = str(torch.version.cuda); print(f'[compat] torch expected={expected_torch_release} detected={detected_torch_release} ({torch.__version__})'); print(f'[compat] torchvision expected={expected_torchvision_release} detected={detected_torchvision_release} ({torchvision.__version__})'); print(f'[compat] cuda expected={expected_cuda} detected={detected_cuda}'); assert detected_torch_release == expected_torch_release, f'unexpected torch public version: expected {expected_torch_release}, detected {detected_torch_release} ({torch.__version__})'; assert detected_torchvision_release == expected_torchvision_release, f'unexpected torchvision public version: expected {expected_torchvision_release}, detected {detected_torchvision_release} ({torchvision.__version__})'; assert detected_cuda == expected_cuda, f'unexpected compiled cuda version: expected {expected_cuda}, detected {detected_cuda}'"
 
       - name: Verify model file integrity in image
         run: |

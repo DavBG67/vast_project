@@ -82,6 +82,7 @@ Workflow [docker-worker.yml](../.github/workflows/docker-worker.yml) now support
 - `publish_tag` (optional extra tag, e.g. `blackwell-test`)
 
 Default behavior remains stable path-compatible.
+When `dockerfile=worker/Dockerfile.blackwell` is selected and the dispatch defaults are left unchanged, expected versions are automatically aligned to the Blackwell stack (`2.14.1 / 0.29.1 / 13.0`) for the compatibility assertion step.
 
 ### Example manual workflow dispatch for experimental image (procedure only)
 
