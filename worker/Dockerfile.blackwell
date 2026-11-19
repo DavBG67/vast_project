@@ -15,9 +15,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MODELS_DIR=/opt/models \
     WORKER_VENV=/opt/worker-venv
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl python3.12-venv \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+      sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu#https://\1.ubuntu.com/ubuntu#g' /etc/apt/sources.list.d/ubuntu.sources; \
+      sed -i -E 's#http://ports\.ubuntu\.com/ubuntu-ports#https://ports.ubuntu.com/ubuntu-ports#g' /etc/apt/sources.list.d/ubuntu.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu#https://\1.ubuntu.com/ubuntu#g' /etc/apt/sources.list; \
+      sed -i -E 's#http://ports\.ubuntu\.com/ubuntu-ports#https://ports.ubuntu.com/ubuntu-ports#g' /etc/apt/sources.list; \
+    fi; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' > /etc/apt/apt.conf.d/80-network-resilience; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl python3.12-venv; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR ${WORKER_HOME}
 
