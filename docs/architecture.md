@@ -114,3 +114,85 @@ Implemented lifecycle model includes:
 2. Add optional preprocessing-plan layer (deinterlace/noise/crop decisions) from analysis facts only.
 3. Introduce execution planner selecting local vs remote operations while preserving balanced defaults.
 4. Add explicit final encoding policy object (codec, CRF/preset, mux policy) and compatibility tests.
+
+## Visual diagnostics (local, optional, non-destructive)
+
+- Module: [source_analysis.py](../src/vast_upscaler/source_analysis.py)
+- Trigger:
+  - CLI: `upscaler analyze-source <video> --visual-diagnostics`
+  - API: `POST /api/video/analyze` with `include_visual_diagnostics=true`
+- Existing default contracts are preserved:
+  - `upscaler analyze-source <video>` (without option) keeps metadata-only output.
+  - `POST /api/video/analyze` without `include_visual_diagnostics` keeps metadata-only output.
+
+### Report structure
+
+- Top-level fields: ffprobe-derived metadata (certain when present).
+- Optional `analysis_report`:
+  - `version`: report schema version (`1.0`)
+  - `metadata_certainty`: explains certainty boundary for metadata
+  - `heuristics_certainty`: explains certainty boundary for diagnostics
+  - `visual_diagnostics`:
+    - `sampling_points_seconds`
+    - `options` (sample count, duration, max analyzed duration, ffmpeg threads, timeout, min samples)
+    - `cropdetect` section (recommended crop + confidence + inconsistencies)
+    - `idet` section (progressive/interlaced/mixed/indeterminate + confidence)
+    - `noise_artifacts` section (heuristic indicators and conservative confidence)
+    - `partial` flag when any diagnostic section partially fails
+
+### Reliability limits
+
+- `cropdetect`: can be perturbed by very dark scenes, fades, subtitles, and variable aspect-ratio content.
+- `idet`: classification confidence drops when sampled segments are too short or inconsistent.
+- `noise_artifacts`: first version is intentionally conservative and can return `unknown`.
+- Any filter failure returns partial diagnostics rather than hard-failing metadata analysis.
+
+### Examples
+
+CLI metadata only:
+
+```bash
+upscaler analyze-source /path/to/video.mp4
+```
+
+CLI with visual diagnostics:
+
+```bash
+upscaler analyze-source /path/to/video.mp4 \
+  --visual-diagnostics \
+  --sample-count 5 \
+  --sample-duration-seconds 1.5 \
+  --max-analyzed-duration-seconds 180 \
+  --ffmpeg-threads 1 \
+  --ffmpeg-timeout-seconds 30 \
+  --min-samples-required 3
+```
+
+API metadata only:
+
+```http
+POST /api/video/analyze
+Content-Type: application/json
+
+{"input_path":"C:/videos/input.mp4"}
+```
+
+API with visual diagnostics:
+
+```http
+POST /api/video/analyze
+Content-Type: application/json
+
+{
+  "input_path":"C:/videos/input.mp4",
+  "include_visual_diagnostics": true,
+  "diagnostic_options": {
+    "sample_count": 5,
+    "sample_duration_seconds": 1.5,
+    "max_analyzed_duration_seconds": 180.0,
+    "ffmpeg_threads": 1,
+    "ffmpeg_timeout_seconds": 30.0,
+    "min_samples_required": 3
+  }
+}
+```

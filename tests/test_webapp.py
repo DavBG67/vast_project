@@ -95,6 +95,30 @@ def test_web_video_analyze_endpoint(tmp_path: Path, monkeypatch) -> None:
     assert body["interlace"]["confidence"] == "uncertain"
 
 
+def test_web_video_analyze_endpoint_with_visual_diagnostics(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"x")
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+
+    monkeypatch.setattr(
+        "vast_upscaler.webapp.analyze_source_video_report",
+        lambda **_kwargs: {
+            "file_path": str(video_path),
+            "analysis_report": {"version": "1.0", "visual_diagnostics": {"partial": False}},
+        },
+    )
+
+    response = client.post(
+        "/api/video/analyze",
+        json={"input_path": str(video_path), "include_visual_diagnostics": True},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["analysis_report"]["version"] == "1.0"
+
+
 def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"

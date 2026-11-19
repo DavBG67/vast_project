@@ -35,7 +35,12 @@ from vast_upscaler.orchestrator import (
     run_upscale_workflow,
 )
 from vast_upscaler.session_store import SessionStore
-from vast_upscaler.source_analysis import SourceAnalysisError, analyze_source_video
+from vast_upscaler.source_analysis import (
+    SourceAnalysisError,
+    VisualDiagnosticsOptions,
+    analyze_source_video,
+    analyze_source_video_report,
+)
 from vast_upscaler.transfer import OpenSshTransport
 from vast_upscaler.vast_client import (
     VastApiError,
@@ -141,15 +146,45 @@ def inspect(video_path: Path, json_output: bool = typer.Option(False, "--json"))
 
 
 @app.command("analyze-source")
-def analyze_source(video_path: Path) -> None:
+def analyze_source(
+    video_path: Path,
+    visual_diagnostics: bool = typer.Option(
+        False,
+        "--visual-diagnostics",
+        help="Enable optional local heuristic diagnostics (cropdetect/idet/signalstats).",
+    ),
+    sample_count: int = typer.Option(5, "--sample-count", min=1, max=20),
+    sample_duration_seconds: float = typer.Option(1.5, "--sample-duration-seconds", min=0.1, max=30.0),
+    max_analyzed_duration_seconds: float = typer.Option(180.0, "--max-analyzed-duration-seconds", min=1.0, max=3600.0),
+    ffmpeg_threads: int = typer.Option(1, "--ffmpeg-threads", min=1, max=16),
+    ffmpeg_timeout_seconds: float = typer.Option(30.0, "--ffmpeg-timeout-seconds", min=1.0, max=600.0),
+    min_samples_required: int = typer.Option(3, "--min-samples-required", min=1, max=20),
+) -> None:
     """Analyze source video metadata for profile/preprocessing decisions (local only)."""
     try:
-        analysis = analyze_source_video(video_path)
+        if not visual_diagnostics:
+            analysis = analyze_source_video(video_path)
+            typer.echo(json.dumps(analysis.model_dump(mode="json"), indent=2, sort_keys=True))
+            return
+
+        options = VisualDiagnosticsOptions(
+            sample_count=sample_count,
+            sample_duration_seconds=sample_duration_seconds,
+            max_analyzed_duration_seconds=max_analyzed_duration_seconds,
+            ffmpeg_threads=ffmpeg_threads,
+            ffmpeg_timeout_seconds=ffmpeg_timeout_seconds,
+            min_samples_required=min_samples_required,
+        )
+        report = analyze_source_video_report(
+            video_path=video_path,
+            include_visual_diagnostics=True,
+            diagnostics_options=options,
+        )
     except SourceAnalysisError as exc:
         typer.echo(f"Source analysis failed: {exc}")
         raise typer.Exit(code=1)
 
-    typer.echo(json.dumps(analysis.model_dump(mode="json"), indent=2, sort_keys=True))
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
 
 @app.command()

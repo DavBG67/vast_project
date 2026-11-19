@@ -30,7 +30,12 @@ from vast_upscaler.remote_worker import (
     execute_remote_worker,
 )
 from vast_upscaler.session_store import SessionStore
-from vast_upscaler.source_analysis import SourceAnalysisError, analyze_source_video
+from vast_upscaler.source_analysis import (
+    SourceAnalysisError,
+    VisualDiagnosticsOptions,
+    analyze_source_video,
+    analyze_source_video_report,
+)
 from vast_upscaler.transfer import OpenSshTransport
 from vast_upscaler.vast_client import VastClient, VastClientConfig
 from vast_upscaler.vast_write_client import VastWriteClient
@@ -76,6 +81,8 @@ class PromptReplyRequest(BaseModel):
 
 class SourceAnalysisRequest(BaseModel):
     input_path: str
+    include_visual_diagnostics: bool = False
+    diagnostic_options: VisualDiagnosticsOptions | None = None
 
 
 @dataclass(frozen=True)
@@ -730,10 +737,16 @@ def create_app(
     @app.post("/api/video/analyze")
     def api_video_analyze(request: SourceAnalysisRequest) -> dict[str, Any]:
         try:
-            analysis = analyze_source_video(Path(request.input_path))
+            if not request.include_visual_diagnostics:
+                analysis = analyze_source_video(Path(request.input_path))
+                return analysis.model_dump(mode="json")
+            return analyze_source_video_report(
+                video_path=Path(request.input_path),
+                include_visual_diagnostics=True,
+                diagnostics_options=request.diagnostic_options,
+            )
         except SourceAnalysisError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return analysis.model_dump(mode="json")
 
     @app.get("/api/instances")
     def api_instances() -> dict[str, Any]:

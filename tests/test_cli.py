@@ -72,6 +72,22 @@ def test_analyze_source_json_output(monkeypatch, tmp_path: Path) -> None:
     assert '"confidence": "certain"' in result.stdout
 
 
+def test_analyze_source_visual_diagnostics_option(monkeypatch, tmp_path: Path) -> None:
+    video_path = tmp_path / "video.mkv"
+    video_path.write_bytes(b"x")
+
+    monkeypatch.setattr(
+        "vast_upscaler.cli.analyze_source_video_report",
+        lambda **_kwargs: {"file_path": str(video_path), "analysis_report": {"version": "1.0"}},
+    )
+
+    result = runner.invoke(app, ["analyze-source", str(video_path), "--visual-diagnostics"])
+
+    assert result.exit_code == 0
+    assert '"analysis_report"' in result.stdout
+    assert '"version": "1.0"' in result.stdout
+
+
 def test_offers_offline_fixture(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
