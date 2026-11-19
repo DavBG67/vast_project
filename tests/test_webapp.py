@@ -119,6 +119,89 @@ def test_web_video_analyze_endpoint_with_visual_diagnostics(tmp_path: Path, monk
     assert body["analysis_report"]["version"] == "1.0"
 
 
+def test_web_preprocessing_plan_from_analysis_payload_without_reanalysis(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+
+    def _should_not_run(**_kwargs):
+        raise AssertionError("analyze_source_video_report must not be called when analysis_payload is provided")
+
+    monkeypatch.setattr("vast_upscaler.webapp.analyze_source_video_report", _should_not_run)
+
+    response = client.post(
+        "/api/video/preprocessing-plan",
+        json={
+            "analysis_payload": {
+                "file_path": "sample.mp4",
+                "width": 1280,
+                "height": 720,
+                "frame_rate_fps": 25.0,
+                "duration_seconds": 10.0,
+                "video_codec": "h264",
+                "interlace": {"field_order": "progressive", "interlaced": False, "confidence": "certain", "note": "meta"},
+            },
+            "user_choices": {"crop_mode": "preserve"},
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["version"] == "1.0"
+    assert payload["operations"][0]["operation_id"] == "crop"
+
+
+def test_web_preprocessing_plan_accepts_user_custom_crop(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post(
+        "/api/video/preprocessing-plan",
+        json={
+            "analysis_payload": {
+                "file_path": "sample.mp4",
+                "width": 1280,
+                "height": 720,
+                "frame_rate_fps": 25.0,
+                "duration_seconds": 10.0,
+                "video_codec": "h264",
+                "interlace": {"field_order": "progressive", "interlaced": False, "confidence": "certain", "note": "meta"},
+            },
+            "user_choices": {
+                "crop_mode": "custom_crop",
+                "custom_crop_margins": {"top": 10, "bottom": 10, "left": 20, "right": 20},
+            },
+        },
+    )
+    assert response.status_code == 200
+    crop = next(item for item in response.json()["operations"] if item["operation_id"] == "crop")
+    assert crop["enabled"] is True
+
+
+def test_web_preprocessing_plan_rejects_invalid_custom_crop(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post(
+        "/api/video/preprocessing-plan",
+        json={
+            "analysis_payload": {
+                "file_path": "sample.mp4",
+                "width": 640,
+                "height": 360,
+                "frame_rate_fps": 25.0,
+                "duration_seconds": 10.0,
+                "video_codec": "h264",
+                "interlace": {"field_order": "progressive", "interlaced": False, "confidence": "certain", "note": "meta"},
+            },
+            "user_choices": {
+                "crop_mode": "custom_crop",
+                "custom_crop_margins": {"top": 0, "bottom": 0, "left": 350, "right": 350},
+            },
+        },
+    )
+    assert response.status_code == 400
+
+
 def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"

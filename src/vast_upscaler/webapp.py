@@ -24,6 +24,12 @@ from vast_upscaler.orchestrator import (
     _wait_for_ssh_tcp_availability,
     run_upscale_workflow,
 )
+from vast_upscaler.preprocessing_planner import (
+    PlannerUserChoices,
+    PreprocessingPlannerError,
+    build_preprocessing_plan,
+    load_analysis_payload_from_file,
+)
 from vast_upscaler.provisioning_history import ProvisioningAttemptTracker
 from vast_upscaler.remote_worker import (
     RemoteWorkerRequest,
@@ -83,6 +89,15 @@ class SourceAnalysisRequest(BaseModel):
     input_path: str
     include_visual_diagnostics: bool = False
     diagnostic_options: VisualDiagnosticsOptions | None = None
+
+
+class PreprocessingPlanRequest(BaseModel):
+    input_path: str | None = None
+    analysis_payload: dict[str, Any] | None = None
+    analysis_report_path: str | None = None
+    include_visual_diagnostics: bool = False
+    diagnostic_options: VisualDiagnosticsOptions | None = None
+    user_choices: PlannerUserChoices | None = None
 
 
 @dataclass(frozen=True)
@@ -747,6 +762,36 @@ def create_app(
             )
         except SourceAnalysisError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/video/preprocessing-plan")
+    def api_preprocessing_plan(request: PreprocessingPlanRequest) -> dict[str, Any]:
+        source_count = sum(
+            value is not None and value != ""
+            for value in (request.input_path, request.analysis_payload, request.analysis_report_path)
+        )
+        if source_count != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide exactly one source: input_path, analysis_payload, or analysis_report_path.",
+            )
+        try:
+            if request.analysis_payload is not None:
+                analysis_payload = request.analysis_payload
+            elif request.analysis_report_path is not None:
+                analysis_payload = load_analysis_payload_from_file(Path(request.analysis_report_path))
+            else:
+                analysis_payload = analyze_source_video_report(
+                    video_path=Path(request.input_path or ""),
+                    include_visual_diagnostics=request.include_visual_diagnostics,
+                    diagnostics_options=request.diagnostic_options,
+                )
+            plan = build_preprocessing_plan(
+                analysis_payload=analysis_payload,
+                user_choices=request.user_choices or PlannerUserChoices(),
+            )
+        except (SourceAnalysisError, PreprocessingPlannerError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return plan.model_dump(mode="json")
 
     @app.get("/api/instances")
     def api_instances() -> dict[str, Any]:

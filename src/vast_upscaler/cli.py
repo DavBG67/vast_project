@@ -34,6 +34,12 @@ from vast_upscaler.orchestrator import (
     resume_session,
     run_upscale_workflow,
 )
+from vast_upscaler.preprocessing_planner import (
+    PlannerUserChoices,
+    PreprocessingPlannerError,
+    build_preprocessing_plan,
+    load_analysis_payload_from_file,
+)
 from vast_upscaler.session_store import SessionStore
 from vast_upscaler.source_analysis import (
     SourceAnalysisError,
@@ -84,6 +90,25 @@ SSH_BOOTSTRAP_MODE_OPTION = typer.Option(
 )
 WEB_HOST_OPTION = typer.Option("127.0.0.1", "--host", help="Bind host for local web UI.")
 WEB_PORT_OPTION = typer.Option(8765, "--port", min=1, max=65535, help="Bind port for local web UI.")
+PLAN_VIDEO_PATH_ARGUMENT = typer.Argument(None)
+PLAN_ANALYSIS_REPORT_OPTION = typer.Option(
+    None,
+    "--analysis-report",
+    help="Existing analysis JSON report path.",
+)
+PLAN_VISUAL_DIAGNOSTICS_OPTION = typer.Option(
+    False,
+    "--visual-diagnostics",
+    help="When video_path is used, include local visual diagnostics before planning.",
+)
+PLAN_CROP_MODE_OPTION = typer.Option("preserve", "--crop-mode")
+PLAN_CROP_TOP_OPTION = typer.Option(0, "--crop-top", min=0)
+PLAN_CROP_BOTTOM_OPTION = typer.Option(0, "--crop-bottom", min=0)
+PLAN_CROP_LEFT_OPTION = typer.Option(0, "--crop-left", min=0)
+PLAN_CROP_RIGHT_OPTION = typer.Option(0, "--crop-right", min=0)
+PLAN_DEINTERLACE_MODE_OPTION = typer.Option("preserve", "--deinterlace-mode")
+PLAN_DENOISE_MODE_OPTION = typer.Option("preserve", "--denoise-mode")
+PLAN_DEBLOCK_MODE_OPTION = typer.Option("preserve", "--deblock-mode")
 
 app.add_typer(session_app, name="session")
 
@@ -185,6 +210,57 @@ def analyze_source(
         raise typer.Exit(code=1)
 
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
+
+
+@app.command("plan-preprocessing")
+def plan_preprocessing(
+    video_path: Path | None = PLAN_VIDEO_PATH_ARGUMENT,
+    analysis_report: Path | None = PLAN_ANALYSIS_REPORT_OPTION,
+    visual_diagnostics: bool = PLAN_VISUAL_DIAGNOSTICS_OPTION,
+    crop_mode: Literal["preserve", "auto_crop", "custom_crop"] = PLAN_CROP_MODE_OPTION,
+    crop_top: int = PLAN_CROP_TOP_OPTION,
+    crop_bottom: int = PLAN_CROP_BOTTOM_OPTION,
+    crop_left: int = PLAN_CROP_LEFT_OPTION,
+    crop_right: int = PLAN_CROP_RIGHT_OPTION,
+    deinterlace_mode: Literal["preserve", "enable", "disable"] = PLAN_DEINTERLACE_MODE_OPTION,
+    denoise_mode: Literal["preserve", "enable", "disable"] = PLAN_DENOISE_MODE_OPTION,
+    deblock_mode: Literal["preserve", "enable", "disable"] = PLAN_DEBLOCK_MODE_OPTION,
+) -> None:
+    """Generate a local preprocessing plan (recommendations + user choices), without executing preprocessing."""
+    if video_path is None and analysis_report is None:
+        raise typer.BadParameter("Provide either <video_path> or --analysis-report.")
+    if video_path is not None and analysis_report is not None:
+        raise typer.BadParameter("Use either <video_path> or --analysis-report, not both.")
+
+    try:
+        if analysis_report is not None:
+            analysis_payload = load_analysis_payload_from_file(analysis_report)
+        else:
+            analysis_payload = analyze_source_video_report(
+                video_path=video_path,
+                include_visual_diagnostics=visual_diagnostics,
+            )
+
+        choices = PlannerUserChoices(
+            crop_mode=crop_mode,
+            custom_crop_margins={
+                "top": crop_top,
+                "bottom": crop_bottom,
+                "left": crop_left,
+                "right": crop_right,
+            }
+            if crop_mode == "custom_crop"
+            else None,
+            deinterlace_mode=deinterlace_mode,
+            denoise_mode=denoise_mode,
+            deblock_mode=deblock_mode,
+        )
+        plan = build_preprocessing_plan(analysis_payload=analysis_payload, user_choices=choices)
+    except (SourceAnalysisError, PreprocessingPlannerError) as exc:
+        typer.echo(f"Preprocessing plan failed: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(json.dumps(plan.model_dump(mode="json"), indent=2, sort_keys=True))
 
 
 @app.command()

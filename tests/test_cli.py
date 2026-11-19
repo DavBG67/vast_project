@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -86,6 +87,35 @@ def test_analyze_source_visual_diagnostics_option(monkeypatch, tmp_path: Path) -
     assert result.exit_code == 0
     assert '"analysis_report"' in result.stdout
     assert '"version": "1.0"' in result.stdout
+
+
+def test_plan_preprocessing_from_existing_analysis_report_does_not_reanalyze(monkeypatch, tmp_path: Path) -> None:
+    report_path = tmp_path / "analysis.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "file_path": "sample.mp4",
+                "width": 1280,
+                "height": 720,
+                "frame_rate_fps": 25.0,
+                "duration_seconds": 10.0,
+                "video_codec": "h264",
+                "interlace": {"field_order": "progressive", "interlaced": False, "confidence": "certain", "note": "meta"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _should_not_run(**_kwargs):
+        raise AssertionError("analyze_source_video_report must not be called when --analysis-report is provided")
+
+    monkeypatch.setattr("vast_upscaler.cli.analyze_source_video_report", _should_not_run)
+
+    result = runner.invoke(app, ["plan-preprocessing", "--analysis-report", str(report_path)])
+
+    assert result.exit_code == 0
+    assert '"version": "1.0"' in result.stdout
+    assert '"operations"' in result.stdout
 
 
 def test_offers_offline_fixture(tmp_path: Path) -> None:
