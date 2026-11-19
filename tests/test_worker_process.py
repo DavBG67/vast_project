@@ -12,6 +12,7 @@ from worker.process import (
     ProcessingReport,
     ProgressEmitter,
     WorkerError,
+    _build_decode_command,
     _build_staged_output_path,
     _emit_cuda_diagnostics,
     _estimate_total_frames,
@@ -32,6 +33,18 @@ def test_compute_target_canvas() -> None:
 def test_compute_target_canvas_invalid() -> None:
     with pytest.raises(WorkerError):
         compute_target_canvas(0, 576, 1920, 1080)
+
+
+def test_build_decode_command_without_crop_filter() -> None:
+    cmd = _build_decode_command(input_path=Path("/tmp/in.mp4"), decode_filter=None)
+    assert "-vf" not in cmd
+    assert cmd[-1] == "-"
+
+
+def test_build_decode_command_with_crop_filter() -> None:
+    cmd = _build_decode_command(input_path=Path("/tmp/in.mp4"), decode_filter="crop=628:408:6:36")
+    vf_index = cmd.index("-vf")
+    assert cmd[vf_index + 1] == "crop=628:408:6:36"
 
 
 def test_write_report(tmp_path: Path) -> None:
@@ -117,6 +130,7 @@ def test_main_failure_after_processing_preserves_frames_and_cleans_temp(tmp_path
         video_crf=20,
         models_dir=str(tmp_path),
         min_free_gb=0.0,
+        preprocessing_plan=None,
     )
     monkeypatch.setattr("worker.process.parse_args", lambda: args)
     monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
@@ -167,6 +181,259 @@ def test_main_failure_after_processing_preserves_frames_and_cleans_temp(tmp_path
     assert payload["frames_processed"] == 12
     assert payload["processing_fps"] > 0
     assert not staged.exists()
+
+
+def test_main_with_valid_preprocessing_contract_only_validates(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "input.mp4"
+    output_path = tmp_path / "output.mp4"
+    report_path = tmp_path / "report.json"
+    plan_path = tmp_path / "plan.json"
+    input_path.write_bytes(b"x")
+    plan_path.write_text(
+        json.dumps(
+            {
+                "version": "1.0",
+                "operations": [{"id": "crop", "params": {"x": 6, "y": 36, "width": 628, "height": 408}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = Namespace(
+        input=str(input_path),
+        output=str(output_path),
+        report=str(report_path),
+        target_width=1280,
+        target_height=720,
+        profile="balanced",
+        video_crf=20,
+        models_dir=str(tmp_path),
+        min_free_gb=0.0,
+        preprocessing_plan=str(plan_path),
+    )
+    monkeypatch.setattr("worker.process.parse_args", lambda: args)
+    monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "worker.process.probe_video",
+        lambda _path: SimpleNamespace(width=640, height=480, fps=24.0, duration_seconds=5.0),
+    )
+    monkeypatch.setattr("worker.process.compute_target_canvas", lambda **_k: (1280, 720))
+    monkeypatch.setattr(
+        "worker.process.select_model",
+        lambda **_k: SimpleNamespace(
+            name="realesrgan",
+            weights_path=tmp_path / "weights.pth",
+            model_name="RealESRGAN_x4plus",
+            model_scale=4,
+            tile=256,
+            tile_pad=10,
+            pre_pad=0,
+        ),
+    )
+
+    class DummyUpscaler:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+        @staticmethod
+        def detect_gpu_name() -> str:
+            return "NVIDIA GeForce RTX 3060"
+
+    monkeypatch.setattr("worker.process.RealesrganUpscaler", DummyUpscaler)
+    captured_run_args = {}
+
+    def _capture_run_streaming(**kwargs):
+        captured_run_args.update(kwargs)
+        return 12
+
+    monkeypatch.setattr("worker.process.run_streaming_upscale", _capture_run_streaming)
+    monkeypatch.setattr("worker.process.mux_with_source_streams", lambda **_k: output_path.with_name("output.tmp.mp4").write_bytes(b"ok"))
+    monkeypatch.setattr("worker.process.validate_output", lambda **_k: None)
+
+    exit_code = main()
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert payload["status"] == "completed"
+    assert captured_run_args["source_width"] == 628
+    assert captured_run_args["source_height"] == 408
+    assert captured_run_args["target_width"] == 1280
+    assert captured_run_args["target_height"] == 720
+    assert captured_run_args["decode_filter"] == "crop=628:408:6:36"
+    assert payload["preprocessing_plan"]["present"] is True
+    assert payload["preprocessing_plan"]["validated"] is True
+    assert payload["preprocessing_plan"]["requested_operations"] == ["crop"]
+    assert payload["preprocessing_plan"]["applied_operations"] == ["crop"]
+    assert payload["preprocessing_plan"]["source_dimensions"] == {"width": 640, "height": 480}
+    assert payload["preprocessing_plan"]["effective_dimensions"] == {"width": 628, "height": 408}
+    assert payload["preprocessing_plan"]["decode_filter"] == "crop=628:408:6:36"
+
+
+def test_main_with_empty_preprocessing_contract_keeps_historical_dimensions(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "input.mp4"
+    output_path = tmp_path / "output.mp4"
+    report_path = tmp_path / "report.json"
+    plan_path = tmp_path / "plan.json"
+    input_path.write_bytes(b"x")
+    plan_path.write_text(json.dumps({"version": "1.0", "operations": []}), encoding="utf-8")
+
+    args = Namespace(
+        input=str(input_path),
+        output=str(output_path),
+        report=str(report_path),
+        target_width=1280,
+        target_height=720,
+        profile="balanced",
+        video_crf=20,
+        models_dir=str(tmp_path),
+        min_free_gb=0.0,
+        preprocessing_plan=str(plan_path),
+    )
+    monkeypatch.setattr("worker.process.parse_args", lambda: args)
+    monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "worker.process.probe_video",
+        lambda _path: SimpleNamespace(width=640, height=480, fps=24.0, duration_seconds=5.0),
+    )
+    monkeypatch.setattr("worker.process.compute_target_canvas", lambda **_k: (1280, 720))
+    monkeypatch.setattr(
+        "worker.process.select_model",
+        lambda **_k: SimpleNamespace(
+            name="realesrgan",
+            weights_path=tmp_path / "weights.pth",
+            model_name="RealESRGAN_x4plus",
+            model_scale=4,
+            tile=256,
+            tile_pad=10,
+            pre_pad=0,
+        ),
+    )
+
+    class DummyUpscaler:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+        @staticmethod
+        def detect_gpu_name() -> str:
+            return "NVIDIA GeForce RTX 3060"
+
+    monkeypatch.setattr("worker.process.RealesrganUpscaler", DummyUpscaler)
+    captured_run_args = {}
+
+    def _capture_run_streaming(**kwargs):
+        captured_run_args.update(kwargs)
+        return 12
+
+    monkeypatch.setattr("worker.process.run_streaming_upscale", _capture_run_streaming)
+    monkeypatch.setattr("worker.process.mux_with_source_streams", lambda **_k: output_path.with_name("output.tmp.mp4").write_bytes(b"ok"))
+    monkeypatch.setattr("worker.process.validate_output", lambda **_k: None)
+
+    exit_code = main()
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert captured_run_args["source_width"] == 640
+    assert captured_run_args["source_height"] == 480
+    assert captured_run_args["decode_filter"] is None
+    assert payload["preprocessing_plan"]["requested_operations"] == []
+    assert payload["preprocessing_plan"]["applied_operations"] == []
+
+
+def test_main_with_invalid_preprocessing_contract_fails_before_streaming(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "input.mp4"
+    output_path = tmp_path / "output.mp4"
+    report_path = tmp_path / "report.json"
+    plan_path = tmp_path / "plan.json"
+    input_path.write_bytes(b"x")
+    plan_path.write_text(json.dumps({"version": "9.9", "operations": []}), encoding="utf-8")
+
+    args = Namespace(
+        input=str(input_path),
+        output=str(output_path),
+        report=str(report_path),
+        target_width=1280,
+        target_height=720,
+        profile="balanced",
+        video_crf=20,
+        models_dir=str(tmp_path),
+        min_free_gb=0.0,
+        preprocessing_plan=str(plan_path),
+    )
+    monkeypatch.setattr("worker.process.parse_args", lambda: args)
+    monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "worker.process.probe_video",
+        lambda _path: SimpleNamespace(width=640, height=360, fps=24.0, duration_seconds=5.0),
+    )
+    monkeypatch.setattr(
+        "worker.process.run_streaming_upscale",
+        lambda **_k: (_ for _ in ()).throw(AssertionError("run_streaming_upscale must not be called")),
+    )
+
+    exit_code = main()
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert payload["status"] == "failed"
+    assert "Unsupported preprocessing plan contract version" in payload["notes"][0]
+
+
+def test_main_with_deinterlace_requested_fails_before_streaming(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "input.mp4"
+    output_path = tmp_path / "output.mp4"
+    report_path = tmp_path / "report.json"
+    plan_path = tmp_path / "plan.json"
+    input_path.write_bytes(b"x")
+    plan_path.write_text(
+        json.dumps(
+            {
+                "version": "1.0",
+                "operations": [
+                    {
+                        "id": "deinterlace",
+                        "params": {"algorithm": "bwdif", "mode": "send_frame", "parity": "auto", "deint": "all"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = Namespace(
+        input=str(input_path),
+        output=str(output_path),
+        report=str(report_path),
+        target_width=1280,
+        target_height=720,
+        profile="balanced",
+        video_crf=20,
+        models_dir=str(tmp_path),
+        min_free_gb=0.0,
+        preprocessing_plan=str(plan_path),
+    )
+    monkeypatch.setattr("worker.process.parse_args", lambda: args)
+    monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "worker.process.probe_video",
+        lambda _path: SimpleNamespace(width=640, height=480, fps=24.0, duration_seconds=5.0),
+    )
+    monkeypatch.setattr(
+        "worker.process.run_streaming_upscale",
+        lambda **_k: (_ for _ in ()).throw(AssertionError("run_streaming_upscale must not be called")),
+    )
+
+    exit_code = main()
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert payload["status"] == "failed"
+    assert "Deinterlace operation is not supported in this phase" in payload["notes"][0]
 
 
 def test_progress_emitter_outputs_json_event(monkeypatch: pytest.MonkeyPatch) -> None:

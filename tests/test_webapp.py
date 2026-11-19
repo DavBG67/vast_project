@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +13,8 @@ from vast_upscaler.webapp import (
     RunCallbacks,
     StartJobRequest,
     WorkflowExecutionResult,
+    _default_auto_runner,
+    _default_manual_runner,
     create_app,
 )
 
@@ -510,3 +513,148 @@ def test_manual_mode_keeps_instance_on_cancellation(tmp_path: Path) -> None:
     assert terminal["status"] in {"cancelled", "completed"}
     events_payload = client.get(f"/api/jobs/{job_id}/events?last_event_id=0").text
     assert "manual-instance-preserved" in events_payload or terminal["status"] == "completed"
+
+
+def test_web_auto_and_manual_use_identical_preprocessing_contract(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+    output = tmp_path / "output.mp4"
+    report = tmp_path / "report.json"
+    plan = tmp_path / "plan.json"
+    plan.write_text(
+        """
+{
+  "version": "1.0",
+  "source_summary": {
+    "file_path": "input.mp4",
+    "width": 640,
+    "height": 360,
+    "frame_rate_fps": 24.0,
+    "duration_seconds": 5.0,
+    "video_codec": "h264",
+    "interlace_metadata": {},
+    "diagnostics_available": false
+  },
+  "recommendations": [],
+  "user_choices": {
+    "crop_mode": "custom_crop",
+    "custom_crop_margins": {"top": 0, "bottom": 0, "left": 0, "right": 0},
+    "deinterlace_mode": "preserve",
+    "denoise_mode": "preserve",
+    "deblock_mode": "preserve"
+  },
+  "operations": [
+    {
+      "operation_id": "crop",
+      "kind": "crop",
+      "enabled": true,
+      "recommended": false,
+      "confidence": "high",
+      "parameters": {
+        "mode": "custom_crop",
+        "crop_rect": {"x": 0, "y": 0, "width": 640, "height": 360},
+        "preserve_aspect_ratio": true,
+        "allow_stretch": false,
+        "fit_policy_after_crop": "letterbox_or_pad"
+      },
+      "justification": "manual",
+      "risk_notes": []
+    }
+  ],
+  "warnings": [],
+  "estimated_impact": {
+    "cpu_cost": "low",
+    "gpu_gain": "unknown",
+    "quality_risk": "low",
+    "note": "n/a"
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    request = StartJobRequest(
+        mode="automatic",
+        input_path=str(source),
+        output_path=str(output),
+        report_path=str(report),
+        worker_image="ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+        preprocessing_plan_path=str(plan),
+        instance_id=123,
+    )
+    settings = _write_config(tmp_path)
+    from vast_upscaler.config import load_config
+
+    loaded_settings = load_config(settings)
+
+    callbacks = RunCallbacks(
+        report_provisioning_status=lambda _payload: None,
+        report_worker_progress=lambda _payload: None,
+        confirm_paid=lambda _message: True,
+        confirm_ssh_trust=lambda _message: True,
+        request_verified_fingerprint=lambda _message: None,
+        raise_if_cancelled=lambda: None,
+    )
+
+    class _FakeClient:
+        def close(self) -> None:
+            return
+
+    class _NoLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return None
+
+    captured_auto: dict = {}
+
+    def _fake_run_workflow(**kwargs):
+        captured_auto["contract"] = kwargs["options"].preprocessing_contract
+        return SimpleNamespace(
+            session_id="sess",
+            state="COMPLETED",
+            worker_result=SimpleNamespace(local_output_path=output, local_report_path=report),
+            estimate=SimpleNamespace(total_estimated_usd=0.1),
+            instance_id=1,
+            cleanup_verified=True,
+            cleanup_warning=None,
+        )
+
+    monkeypatch.setattr("vast_upscaler.webapp._build_read_client", lambda _s: _FakeClient())
+    monkeypatch.setattr("vast_upscaler.webapp._build_write_client", lambda _s: _FakeClient())
+    monkeypatch.setattr("vast_upscaler.webapp.SessionExecutionLock", _NoLock)
+    monkeypatch.setattr("vast_upscaler.webapp.run_upscale_workflow", _fake_run_workflow)
+    _default_auto_runner(request, loaded_settings, callbacks)
+
+    captured_manual: dict = {}
+
+    class _FakeWriteClient(_FakeClient):
+        def get_instance(self, _instance_id: int):
+            return SimpleNamespace(
+                instance_id=123,
+                actual_status="running",
+                gpu_name="RTX 3090",
+                ssh_host="1.2.3.4",
+                machine_id="node",
+            )
+
+    monkeypatch.setattr("vast_upscaler.webapp._build_write_client", lambda _s: _FakeWriteClient())
+    monkeypatch.setattr("vast_upscaler.webapp._wait_for_ssh_tcp_availability", lambda **_kwargs: None)
+    monkeypatch.setattr("vast_upscaler.webapp._build_trusted_connection", lambda **_kwargs: object())
+    monkeypatch.setattr("vast_upscaler.webapp._resolve_private_key", lambda **_kwargs: Path("C:/keys/id_ed25519"))
+    monkeypatch.setattr("vast_upscaler.webapp.OpenSshTransport.check_ssh_ready", lambda *_a, **_k: None)
+
+    def _fake_execute_remote_worker(**kwargs):
+        captured_manual["contract"] = kwargs["request"].preprocessing_contract
+        return SimpleNamespace(local_output_path=output, local_report_path=report)
+
+    monkeypatch.setattr("vast_upscaler.webapp.execute_remote_worker", _fake_execute_remote_worker)
+    manual_request = request.model_copy(update={"mode": "manual"})
+    _default_manual_runner(manual_request, loaded_settings, callbacks)
+
+    assert captured_auto["contract"] == captured_manual["contract"]
+    assert captured_auto["contract"] == {
+        "version": "1.0",
+        "operations": [{"id": "crop", "params": {"x": 0, "y": 0, "width": 640, "height": 360}}],
+    }

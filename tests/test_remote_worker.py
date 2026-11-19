@@ -157,6 +157,44 @@ def test_execute_remote_worker_nominal(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "--target-width" in worker_cmd
     assert "--target-height" in worker_cmd
     assert "--profile" in worker_cmd
+    assert "--preprocessing-plan" not in worker_cmd
+
+
+def test_execute_remote_worker_uploads_preprocessing_contract_and_passes_argument(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    conn = _conn(tmp_path)
+    request = _request(tmp_path)
+    request = RemoteWorkerRequest(
+        **{
+            **request.__dict__,
+            "preprocessing_contract": {"version": "1.0", "operations": [{"id": "crop", "params": {"x": 0, "y": 0, "width": 640, "height": 480}}]},
+        }
+    )
+    transport = FakeTransport()
+
+    remote_output = "/workspace/upscale-sessions/session-D-01/output/result video.mp4"
+    transport.report_payload = _completed_report(remote_output)
+
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.inspect_video",
+        lambda *_a, **_k: VideoInfo(
+            file_path=str(request.local_output_path),
+            width=1920,
+            height=1080,
+            duration_seconds=12.0,
+        ),
+    )
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.run_ffprobe",
+        lambda *_a, **_k: {"streams": [{"codec_type": "video", "nb_frames": "42"}]},
+    )
+
+    execute_remote_worker(transport=transport, connection=conn, request=request)
+
+    assert len(transport.upload_calls) == 2
+    worker_cmd = next(c for c in transport.command_calls if isinstance(c, list) and c[:2] == ["python", "/app/worker/process.py"])
+    assert "--preprocessing-plan" in worker_cmd
 
 
 def test_execute_remote_worker_non_zero_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -175,6 +213,28 @@ def test_execute_remote_worker_non_zero_exit(tmp_path: Path, monkeypatch: pytest
     with pytest.raises(RemoteWorkerProcessError) as exc:
         execute_remote_worker(transport=transport, connection=conn, request=request)
     assert "runtime failed" in str(exc.value)
+
+
+def test_execute_remote_worker_rejects_legacy_worker_without_contract_support(tmp_path: Path) -> None:
+    conn = _conn(tmp_path)
+    request = _request(tmp_path)
+    request = RemoteWorkerRequest(
+        **{
+            **request.__dict__,
+            "preprocessing_contract": {"version": "1.0", "operations": []},
+        }
+    )
+    transport = FakeTransport()
+    transport.process_result = RemoteCommandResult(
+        returncode=2,
+        stdout="",
+        stderr="error: unrecognized arguments: --preprocessing-plan /workspace/upscale-sessions/x/preprocessing-plan.json",
+    )
+    transport.fail_report_download = True
+
+    with pytest.raises(RemoteWorkerProcessError) as exc:
+        execute_remote_worker(transport=transport, connection=conn, request=request)
+    assert "does not support preprocessing plan contracts" in str(exc.value)
 
 
 def test_execute_remote_worker_report_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

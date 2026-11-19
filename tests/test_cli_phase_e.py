@@ -115,6 +115,98 @@ def test_upscale_dry_run_cli_with_simulated_deps(monkeypatch, tmp_path: Path) ->
     assert "Upscale Summary (DRY-RUN)" in result.stdout
 
 
+def test_upscale_cli_transports_preprocessing_contract(monkeypatch, tmp_path: Path) -> None:
+    cfg = _config_file(tmp_path)
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    plan = tmp_path / "plan.json"
+    plan.write_text(
+        """
+{
+  "version": "1.0",
+  "source_summary": {
+    "file_path": "clip.mp4",
+    "width": 640,
+    "height": 360,
+    "frame_rate_fps": 24.0,
+    "duration_seconds": 5.0,
+    "video_codec": "h264",
+    "interlace_metadata": {},
+    "diagnostics_available": false
+  },
+  "recommendations": [],
+  "user_choices": {
+    "crop_mode": "custom_crop",
+    "custom_crop_margins": {"top": 0, "bottom": 0, "left": 0, "right": 0},
+    "deinterlace_mode": "preserve",
+    "denoise_mode": "preserve",
+    "deblock_mode": "preserve"
+  },
+  "operations": [
+    {
+      "operation_id": "crop",
+      "kind": "crop",
+      "enabled": true,
+      "recommended": false,
+      "confidence": "high",
+      "parameters": {
+        "mode": "custom_crop",
+        "crop_rect": {"x": 0, "y": 0, "width": 640, "height": 360},
+        "preserve_aspect_ratio": true,
+        "allow_stretch": false,
+        "fit_policy_after_crop": "letterbox_or_pad"
+      },
+      "justification": "manual",
+      "risk_notes": []
+    }
+  ],
+  "warnings": [],
+  "estimated_impact": {
+    "cpu_cost": "low",
+    "gpu_gain": "unknown",
+    "quality_risk": "low",
+    "note": "n/a"
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("vast_upscaler.cli._build_read_client", lambda settings: _FakeReadClient())
+    monkeypatch.setattr("vast_upscaler.cli._build_write_client", lambda settings: _FakeWriteClient())
+    monkeypatch.setattr("vast_upscaler.cli.SessionExecutionLock", _NoLock)
+    monkeypatch.setattr("vast_upscaler.cli.ensure_store_readable", lambda store: None)
+
+    captured = {}
+
+    def _fake_run(**kwargs):
+        captured["preprocessing_contract"] = kwargs["options"].preprocessing_contract
+        return _summary()
+
+    monkeypatch.setattr("vast_upscaler.cli.run_upscale_workflow", _fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "upscale",
+            str(src),
+            "--config",
+            str(cfg),
+            "--worker-image",
+            "ghcr.io/acme/worker:test-real",
+            "--dry-run",
+            "--preprocessing-plan",
+            str(plan),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["preprocessing_contract"] == {
+        "version": "1.0",
+        "operations": [{"id": "crop", "params": {"x": 0, "y": 0, "width": 640, "height": 360}}],
+    }
+
+
 def test_upscale_cli_handles_critical_failure(monkeypatch, tmp_path: Path) -> None:
     cfg = _config_file(tmp_path)
     src = tmp_path / "clip.mp4"

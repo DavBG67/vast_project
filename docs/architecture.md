@@ -197,6 +197,64 @@ Content-Type: application/json
 }
 ```
 
+## Remote preprocessing contract transport and validation (Phase 5B)
+
+- Scope in this phase:
+  - transport, parsing, and strict validation only;
+  - no video filter execution (`crop`, `bwdif`, `denoise`, `deblock` stay unapplied).
+- New local conversion module: [preprocessing_contract.py](../src/vast_upscaler/preprocessing_contract.py)
+  - converts full planner output to a minimal remote contract;
+  - keeps only explicitly enabled operations;
+  - rejects unknown operations, duplicates, invalid parameters, and unsupported versions.
+- Contract shape (`version=1.0`):
+  - `version` (mandatory)
+  - `operations[]` with only execution-ready operations:
+    - `crop` params: `x,y,width,height`
+    - `deinterlace` params: `algorithm=bwdif, mode=send_frame, parity=auto, deint=all`
+- CLI and Web:
+  - CLI `upscale` accepts `--preprocessing-plan <plan.json>` and transports validated contract.
+  - Web start-job accepts `preprocessing_plan_path` and uses the same conversion rules.
+- Remote transport:
+  - contract is uploaded as a small JSON file and passed via `--preprocessing-plan <remote-path>`.
+  - no large JSON shell injection.
+- Worker behavior:
+  - without plan: unchanged historical flow;
+  - with valid plan: plan is parsed/validated and reported, but no operation is applied;
+  - with invalid plan: explicit error before frame processing.
+- Reporting:
+  - worker report may include optional `preprocessing_plan` summary:
+    - `present`, `received`, `validated`, `version`,
+    - `requested_operations`,
+    - `applied_operations` (always empty in this phase).
+
+## Remote crop execution before Real-ESRGAN (Phase 5C)
+
+- Scope in this phase:
+  - only `crop` execution is enabled remotely;
+  - `deinterlace` requests are explicitly rejected;
+  - `denoise` and `deblock` remain unsupported.
+- Effective worker order:
+  - Decoding (FFmpeg)
+  - Optional `crop` in decode filtergraph (when explicitly requested in contract)
+  - Real-ESRGAN inference
+  - Letterbox/fit to target canvas
+  - Encoding
+  - Mux (audio/subtitles/metadata)
+- Safety and compatibility:
+  - no plan / empty plan / crop absent => historical decode command and behavior;
+  - no shell injection (`subprocess` argument arrays only);
+  - crop params are validated against source bounds and yuv420-compatible even coordinates/dimensions.
+- Reporting enrichments for contract-based runs:
+  - source dimensions before preprocessing
+  - effective dimensions after preprocessing
+  - contract version
+  - requested vs applied operations
+  - decode filter string actually used
+
+### Performance note
+
+Reducing source pixels with crop usually lowers the number of pixels processed by Real-ESRGAN, but end-to-end GPU time is not guaranteed to drop proportionally because runtime also depends on tiling behavior, memory pressure, frame content, and encode/mux overhead.
+
 ## Intelligent preprocessing planner (recommendation only)
 
 - Module: [preprocessing_planner.py](../src/vast_upscaler/preprocessing_planner.py)

@@ -6,9 +6,11 @@ import json
 import posixpath
 import re
 import shlex
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from vast_upscaler.transfer import (
     OpenSshTransport,
@@ -66,6 +68,7 @@ class RemoteWorkerRequest:
     process_timeout_seconds: float = 14_400.0
     download_timeout_seconds: float = 1800.0
     ffprobe_bin: str = "ffprobe"
+    preprocessing_contract: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,7 @@ class RemoteExecutionPaths:
     remote_input_path: str
     remote_output_path: str
     remote_report_path: str
+    remote_preprocessing_plan_path: str
 
 
 @dataclass(frozen=True)
@@ -120,10 +124,24 @@ def execute_remote_worker(
     except TransferError as exc:
         raise RemoteWorkerTransferError(f"Input upload failed: {exc}") from exc
 
+    uploaded_preprocessing_plan: str | None = None
+    if request.preprocessing_contract is not None:
+        try:
+            uploaded_preprocessing_plan = _upload_preprocessing_contract(
+                transport=transport,
+                connection=connection,
+                paths=paths,
+                contract_payload=request.preprocessing_contract,
+                timeout_seconds=request.upload_timeout_seconds,
+            )
+        except TransferError as exc:
+            raise RemoteWorkerTransferError(f"Preprocessing contract upload failed: {exc}") from exc
+
     command = _build_worker_command(
         input_path=uploaded_input,
         output_path=paths.remote_output_path,
         report_path=paths.remote_report_path,
+        preprocessing_plan_path=uploaded_preprocessing_plan,
         request=request,
     )
 
@@ -152,13 +170,23 @@ def execute_remote_worker(
             original_error=exc,
         )
 
-    report_payload = _download_and_parse_report(
-        transport=transport,
-        connection=connection,
-        remote_report_path=paths.remote_report_path,
-        local_report_path=request.local_report_path,
-        timeout_seconds=request.download_timeout_seconds,
-    )
+    try:
+        report_payload = _download_and_parse_report(
+            transport=transport,
+            connection=connection,
+            remote_report_path=paths.remote_report_path,
+            local_report_path=request.local_report_path,
+            timeout_seconds=request.download_timeout_seconds,
+        )
+    except RemoteWorkerReportError as exc:
+        if process_result.returncode != 0 and request.preprocessing_contract is not None:
+            stderr = (process_result.stderr or "").strip().lower()
+            if "unrecognized arguments" in stderr and "--preprocessing-plan" in stderr:
+                raise RemoteWorkerProcessError(
+                    "Remote worker image does not support preprocessing plan contracts yet. "
+                    "Use a newer worker image compatible with --preprocessing-plan."
+                ) from exc
+        raise
 
     if process_result.returncode != 0:
         details = _report_failure_details(report_payload)
@@ -469,9 +497,10 @@ def _build_worker_command(
     input_path: str,
     output_path: str,
     report_path: str,
+    preprocessing_plan_path: str | None,
     request: RemoteWorkerRequest,
 ) -> list[str]:
-    return [
+    command = [
         "python",
         "/app/worker/process.py",
         "--input",
@@ -493,6 +522,9 @@ def _build_worker_command(
         "--min-free-gb",
         str(request.min_free_gb),
     ]
+    if preprocessing_plan_path is not None:
+        command.extend(["--preprocessing-plan", preprocessing_plan_path])
+    return command
 
 
 def _build_remote_paths(request: RemoteWorkerRequest) -> RemoteExecutionPaths:
@@ -515,6 +547,7 @@ def _build_remote_paths(request: RemoteWorkerRequest) -> RemoteExecutionPaths:
         remote_input_path=posixpath.join(input_dir, input_name),
         remote_output_path=posixpath.join(output_dir, output_name),
         remote_report_path=posixpath.join(logs_dir, "report.json"),
+        remote_preprocessing_plan_path=posixpath.join(logs_dir, "preprocessing-plan.json"),
     )
 
 
@@ -523,3 +556,31 @@ def _sanitize_session_id(value: str) -> str:
     if not cleaned:
         raise RemoteWorkerError("session_id is empty after sanitization.")
     return cleaned
+
+
+def _upload_preprocessing_contract(
+    *,
+    transport: OpenSshTransport,
+    connection: SshConnectionInfo,
+    paths: RemoteExecutionPaths,
+    contract_payload: dict[str, Any],
+    timeout_seconds: float,
+) -> str:
+    with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="vast-preprocessing-", delete=False, encoding="utf-8") as handle:
+        temp_path = Path(handle.name)
+        json.dump(contract_payload, handle, indent=2)
+
+    try:
+        uploaded = transport.upload_file(
+            connection,
+            local_path=temp_path,
+            remote_dir=paths.logs_dir,
+            timeout_seconds=timeout_seconds,
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return uploaded

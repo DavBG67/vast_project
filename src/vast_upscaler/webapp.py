@@ -30,6 +30,13 @@ from vast_upscaler.orchestrator import (
     _wait_for_ssh_tcp_availability,
     run_upscale_workflow,
 )
+from vast_upscaler.preprocessing_contract import (
+    RemotePreprocessingContractError,
+    RemotePreprocessingContractValidationError,
+    build_remote_preprocessing_contract_from_plan_payload,
+    dump_remote_preprocessing_contract_payload,
+    load_preprocessing_plan_payload,
+)
 from vast_upscaler.preprocessing_planner import (
     PlannerUserChoices,
     PreprocessingPlan,
@@ -84,6 +91,7 @@ class StartJobRequest(BaseModel):
     offer_id: int | None = None
     processing_fps: float | None = Field(default=None, gt=0)
     instance_id: int | None = None
+    preprocessing_plan_path: str | None = None
     ssh_bootstrap_mode: SshBootstrapMode = "tofu"
 
 
@@ -501,6 +509,13 @@ class WebTaskManager:
             raise HTTPException(status_code=400, detail=f"Output directory does not exist: {output_path.parent}")
         if not report_path.parent.exists():
             raise HTTPException(status_code=400, detail=f"Report directory does not exist: {report_path.parent}")
+        if request.preprocessing_plan_path is not None:
+            plan_path = Path(request.preprocessing_plan_path)
+            if not plan_path.exists() or not plan_path.is_file():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Preprocessing plan path must be an existing file: {plan_path}",
+                )
         if request.mode == "automatic":
             image = (request.worker_image or _load_latest_known_worker_image()).strip()
             if not image:
@@ -520,6 +535,7 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
 
     output_path = _resolve_output_path(request=request)
     report_path = _resolve_report_path(request=request, output_path=output_path)
+    preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
     worker_image = (request.worker_image or _load_latest_known_worker_image()).strip()
     if not worker_image:
         raise OrchestrationError("Worker image tag is required.")
@@ -557,6 +573,7 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
                     processing_fps=request.processing_fps,
                     sort_by=request.sort_by,
                     offer_id=request.offer_id,
+                    preprocessing_contract=preprocessing_contract,
                     ssh_bootstrap_mode=request.ssh_bootstrap_mode,
                 ),
                 session_store=store,
@@ -595,6 +612,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
 
     output_path = _resolve_output_path(request=request)
     report_path = _resolve_report_path(request=request, output_path=output_path)
+    preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
 
     transport = OpenSshTransport()
     write_client = _build_write_client(settings)
@@ -667,6 +685,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                 target_width=request.target_width or settings.video.target_width,
                 target_height=request.target_height or settings.video.target_height,
                 profile=settings.video.default_profile,
+                preprocessing_contract=preprocessing_contract,
             ),
             progress_callback=lambda payload: callbacks.report_worker_progress(payload),
         )
@@ -714,6 +733,18 @@ def _resolve_report_path(*, request: StartJobRequest, output_path: Path) -> Path
     if request.report_path:
         return Path(request.report_path)
     return output_path.with_suffix(output_path.suffix + ".report.json")
+
+
+def _resolve_remote_preprocessing_contract(*, request: StartJobRequest) -> dict[str, Any] | None:
+    if request.preprocessing_plan_path is None:
+        return None
+    plan_path = Path(request.preprocessing_plan_path)
+    try:
+        payload = load_preprocessing_plan_payload(plan_path)
+        contract = build_remote_preprocessing_contract_from_plan_payload(payload)
+    except (RemotePreprocessingContractError, RemotePreprocessingContractValidationError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid preprocessing plan for remote transport: {exc}") from exc
+    return dump_remote_preprocessing_contract_payload(contract)
 
 
 def _load_latest_known_worker_image() -> str:
@@ -887,6 +918,7 @@ _INDEX_HTML = """
       <label>Input video path <input id="input_path" required /></label>
       <label>Output path (optional) <input id="output_path" /></label>
       <label>Report path (optional) <input id="report_path" /></label>
+      <label>Preprocessing plan path (optional) <input id="preprocessing_plan_path" /></label>
       <label>Target width <input id="target_width" type="number" min="1" /></label>
       <label>Target height <input id="target_height" type="number" min="1" /></label>
       <label>GPU model
@@ -1007,6 +1039,7 @@ _INDEX_HTML = """
         input_path: document.getElementById("input_path").value,
         output_path: document.getElementById("output_path").value || null,
         report_path: document.getElementById("report_path").value || null,
+        preprocessing_plan_path: document.getElementById("preprocessing_plan_path").value || null,
         target_width: Number(document.getElementById("target_width").value),
         target_height: Number(document.getElementById("target_height").value),
         gpu_model: document.getElementById("gpu_model").value || null,

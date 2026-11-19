@@ -62,6 +62,18 @@ class ProcessingReport:
     processing_fps: float
     gpu: str
     notes: list[str]
+    preprocessing_plan: dict | None = None
+
+
+@dataclass(frozen=True)
+class PreprocessingConfig:
+    summary: dict
+    crop_rect: tuple[int, int, int, int] | None
+    decode_filter: str | None
+    source_width_before: int
+    source_height_before: int
+    source_width_effective: int
+    source_height_effective: int
 
 
 class ProgressEmitter:
@@ -133,6 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models-dir", default="/opt/models")
     parser.add_argument("--report", default=None, help="JSON report path")
     parser.add_argument("--min-free-gb", type=float, default=2.0)
+    parser.add_argument("--preprocessing-plan", default=None, help="Remote preprocessing contract JSON path")
     return parser.parse_args()
 
 
@@ -148,6 +161,7 @@ def main() -> int:
     started = time.perf_counter()
     progress = ProgressEmitter(started_at=started)
     notes: list[str] = []
+    preprocessing_plan_summary: dict | None = None
     frames_processed = 0
     staged_output: Path | None = None
 
@@ -161,6 +175,34 @@ def main() -> int:
         _ensure_disk_space(output_path.parent, min_free_gb=args.min_free_gb)
 
         source = probe_video(input_path)
+        preprocessing_config = PreprocessingConfig(
+            summary={
+                "present": False,
+                "received": False,
+                "validated": False,
+                "version": None,
+                "requested_operations": [],
+                "applied_operations": [],
+                "source_dimensions": {"width": source.width, "height": source.height},
+                "effective_dimensions": {"width": source.width, "height": source.height},
+                "decode_filter": None,
+            },
+            crop_rect=None,
+            decode_filter=None,
+            source_width_before=source.width,
+            source_height_before=source.height,
+            source_width_effective=source.width,
+            source_height_effective=source.height,
+        )
+        if args.preprocessing_plan:
+            preprocessing_config = _load_and_validate_preprocessing_plan(
+                plan_path=Path(args.preprocessing_plan).resolve(),
+                source_width=source.width,
+                source_height=source.height,
+            )
+            preprocessing_plan_summary = preprocessing_config.summary
+        source_width_for_upscale = preprocessing_config.source_width_effective
+        source_height_for_upscale = preprocessing_config.source_height_effective
         frames_total = _estimate_total_frames(duration_seconds=source.duration_seconds, fps=source.fps)
         target_width, target_height = compute_target_canvas(
             source_width=source.width,
@@ -190,16 +232,19 @@ def main() -> int:
             frames_processed = run_streaming_upscale(
                 input_path=input_path,
                 encoded_video_path=encoded_video,
-                source_width=source.width,
-                source_height=source.height,
+                source_width=source_width_for_upscale,
+                source_height=source_height_for_upscale,
                 source_fps=source.fps,
                 target_width=target_width,
                 target_height=target_height,
                 upscaler=upscaler,
                 crf=args.video_crf,
+                decode_filter=preprocessing_config.decode_filter,
                 progress=progress,
                 frames_total=frames_total,
             )
+            if preprocessing_plan_summary is not None and preprocessing_config.crop_rect is not None:
+                preprocessing_plan_summary["applied_operations"] = ["crop"]
 
             progress.emit(stage="finalization", frames_done=frames_processed, frames_total=frames_total, force=True)
             mux_with_source_streams(input_path=input_path, video_only_path=encoded_video, output_path=staged_output)
@@ -222,6 +267,7 @@ def main() -> int:
                 processing_fps=fps,
                 gpu=RealesrganUpscaler.detect_gpu_name(),
                 notes=notes,
+                preprocessing_plan=preprocessing_plan_summary,
             )
             write_report(report_path, report)
             progress.emit(stage="completed", frames_done=frames_processed, frames_total=frames_total, force=True)
@@ -238,6 +284,7 @@ def main() -> int:
             notes + [str(exc)],
             status="failed",
             frames_processed=frames_processed,
+            preprocessing_plan=preprocessing_plan_summary,
         )
     except ProcessingStageError as exc:
         _cleanup_staged_output(staged_output)
@@ -249,6 +296,7 @@ def main() -> int:
             notes + [str(exc)],
             status="failed",
             frames_processed=frames_processed,
+            preprocessing_plan=preprocessing_plan_summary,
         )
     except (WorkerError, ProbeError, RealesrganError) as exc:
         _cleanup_staged_output(staged_output)
@@ -259,6 +307,7 @@ def main() -> int:
             notes + [str(exc)],
             status="failed",
             frames_processed=frames_processed,
+            preprocessing_plan=preprocessing_plan_summary,
         )
     except Exception as exc:  # noqa: BLE001
         _cleanup_staged_output(staged_output)
@@ -269,6 +318,7 @@ def main() -> int:
             notes + [f"Unexpected error: {exc}"],
             status="failed",
             frames_processed=frames_processed,
+            preprocessing_plan=preprocessing_plan_summary,
         )
 
 
@@ -282,29 +332,14 @@ def run_streaming_upscale(
     target_height: int,
     upscaler: RealesrganUpscaler,
     crf: int,
+    decode_filter: str | None,
     progress: ProgressEmitter,
     frames_total: int | None,
 ) -> int:
     import cv2
     import numpy as np
 
-    decode_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-pix_fmt",
-        "rgb24",
-        "-f",
-        "rawvideo",
-        "-vsync",
-        "0",
-        "-",
-    ]
+    decode_cmd = _build_decode_command(input_path=input_path, decode_filter=decode_filter)
 
     encode_cmd = [
         "ffmpeg",
@@ -414,6 +449,33 @@ def compute_target_canvas(source_width: int, source_height: int, target_width: i
     if target_width <= 0 or target_height <= 0:
         raise WorkerError("Invalid target dimensions")
     return target_width, target_height
+
+
+def _build_decode_command(*, input_path: Path, decode_filter: str | None) -> list[str]:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+    ]
+    if decode_filter:
+        cmd.extend(["-vf", decode_filter])
+    cmd.extend(
+        [
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-vsync",
+            "0",
+            "-",
+        ]
+    )
+    return cmd
 
 
 def mux_with_source_streams(input_path: Path, video_only_path: Path, output_path: Path) -> None:
@@ -533,6 +595,8 @@ def write_report(path: Path, report: ProcessingReport) -> None:
         "gpu": report.gpu,
         "notes": report.notes,
     }
+    if report.preprocessing_plan is not None:
+        payload["preprocessing_plan"] = report.preprocessing_plan
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -543,6 +607,7 @@ def _fail(
     notes: list[str],
     status: str,
     frames_processed: int = 0,
+    preprocessing_plan: dict | None = None,
 ) -> int:
     elapsed = time.perf_counter() - started
     report = ProcessingReport(
@@ -556,11 +621,123 @@ def _fail(
         processing_fps=(max(0, frames_processed) / elapsed) if elapsed > 0 else 0.0,
         gpu=RealesrganUpscaler.detect_gpu_name(),
         notes=notes,
+        preprocessing_plan=preprocessing_plan,
     )
     write_report(report_path, report)
     for note in notes:
         print(note)
     return 1
+
+
+def _load_and_validate_preprocessing_plan(
+    *,
+    plan_path: Path,
+    source_width: int,
+    source_height: int,
+) -> PreprocessingConfig:
+    if not plan_path.exists() or not plan_path.is_file():
+        raise WorkerError(f"Preprocessing plan file does not exist: {plan_path}")
+    try:
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise WorkerError(f"Unable to read preprocessing plan file: {plan_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise WorkerError(f"Invalid preprocessing plan JSON file: {plan_path}") from exc
+    if not isinstance(payload, dict):
+        raise WorkerError("Preprocessing plan root must be a JSON object.")
+
+    version = payload.get("version")
+    if version != "1.0":
+        raise WorkerError(f"Unsupported preprocessing plan contract version: {version!r}. Expected '1.0'.")
+
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        raise WorkerError("Preprocessing plan must contain an operations array.")
+
+    requested_operations: list[str] = []
+    seen_ids: set[str] = set()
+    crop_rect: tuple[int, int, int, int] | None = None
+    for item in operations:
+        if not isinstance(item, dict):
+            raise WorkerError("Each preprocessing operation must be a JSON object.")
+        operation_id = item.get("id")
+        if operation_id not in {"crop", "deinterlace"}:
+            raise WorkerError(f"Unsupported preprocessing operation id: {operation_id!r}")
+        if operation_id in seen_ids:
+            raise WorkerError(f"Duplicate preprocessing operation id: {operation_id!r}")
+        seen_ids.add(operation_id)
+
+        params = item.get("params")
+        if not isinstance(params, dict):
+            raise WorkerError(f"Operation '{operation_id}' must provide params as a JSON object.")
+        if operation_id == "crop":
+            _validate_crop_operation_params(params=params, source_width=source_width, source_height=source_height)
+            if crop_rect is not None:
+                raise WorkerError("Duplicate preprocessing crop operation is not allowed.")
+            crop_rect = (int(params["x"]), int(params["y"]), int(params["width"]), int(params["height"]))
+        elif operation_id == "deinterlace":
+            _validate_deinterlace_operation_params(params=params)
+            raise WorkerError("Deinterlace operation is not supported in this phase. Remove it from the contract.")
+        requested_operations.append(str(operation_id))
+
+    effective_width = source_width
+    effective_height = source_height
+    decode_filter = None
+    if crop_rect is not None:
+        _, _, crop_width, crop_height = crop_rect
+        effective_width = crop_width
+        effective_height = crop_height
+        decode_filter = f"crop={crop_width}:{crop_height}:{crop_rect[0]}:{crop_rect[1]}"
+
+    return PreprocessingConfig(
+        summary={
+            "present": True,
+            "received": True,
+            "validated": True,
+            "version": "1.0",
+            "requested_operations": requested_operations,
+            "applied_operations": [],
+            "source_dimensions": {"width": source_width, "height": source_height},
+            "effective_dimensions": {"width": effective_width, "height": effective_height},
+            "decode_filter": decode_filter,
+        },
+        crop_rect=crop_rect,
+        decode_filter=decode_filter,
+        source_width_before=source_width,
+        source_height_before=source_height,
+        source_width_effective=effective_width,
+        source_height_effective=effective_height,
+    )
+
+
+def _validate_crop_operation_params(*, params: dict, source_width: int, source_height: int) -> None:
+    required_keys = {"x", "y", "width", "height"}
+    missing = sorted(required_keys.difference(params.keys()))
+    if missing:
+        raise WorkerError(f"Crop operation params missing required keys: {', '.join(missing)}")
+    x = params.get("x")
+    y = params.get("y")
+    width = params.get("width")
+    height = params.get("height")
+    if not all(isinstance(value, int) for value in (x, y, width, height)):
+        raise WorkerError("Crop operation params x/y/width/height must be integers.")
+    if x < 0 or y < 0 or width <= 0 or height <= 0:
+        raise WorkerError("Crop operation params must define positive in-bounds coordinates and dimensions.")
+    if x + width > source_width or y + height > source_height:
+        raise WorkerError("Crop operation rectangle is out of source bounds.")
+    if width % 2 != 0 or height % 2 != 0 or x % 2 != 0 or y % 2 != 0:
+        raise WorkerError("Crop operation params must use even x/y/width/height for yuv420 compatibility.")
+
+
+def _validate_deinterlace_operation_params(*, params: dict) -> None:
+    if params.get("algorithm") != "bwdif":
+        raise WorkerError("Deinterlace operation algorithm must be 'bwdif'.")
+    if params.get("mode") != "send_frame":
+        raise WorkerError("Deinterlace operation mode must be 'send_frame'.")
+    if params.get("parity") != "auto":
+        raise WorkerError("Deinterlace operation parity must be 'auto'.")
+    if params.get("deint") != "all":
+        raise WorkerError("Deinterlace operation deint must be 'all'.")
 
 
 def _ensure_disk_space(directory: Path, min_free_gb: float) -> None:

@@ -41,6 +41,13 @@ from vast_upscaler.orchestrator import (
     resume_session,
     run_upscale_workflow,
 )
+from vast_upscaler.preprocessing_contract import (
+    RemotePreprocessingContractError,
+    RemotePreprocessingContractValidationError,
+    build_remote_preprocessing_contract_from_plan_payload,
+    dump_remote_preprocessing_contract_payload,
+    load_preprocessing_plan_payload,
+)
 from vast_upscaler.preprocessing_planner import (
     PlannerUserChoices,
     PreprocessingPlannerError,
@@ -89,6 +96,11 @@ PROVISIONING_TIMEOUT_OPTION = typer.Option(
     "--provisioning-timeout-seconds",
     min=30.0,
     help="Timeout for instance provisioning/readiness wait.",
+)
+PREPROCESSING_PLAN_OPTION = typer.Option(
+    None,
+    "--preprocessing-plan",
+    help="Path to a preprocessing plan JSON to validate and transport to the remote worker.",
 )
 SSH_BOOTSTRAP_MODE_OPTION = typer.Option(
     "tofu",
@@ -484,6 +496,7 @@ def upscale(
     fps_processing: float | None = FPS_PROCESSING_OPTION,
     offer_id: int | None = OFFER_ID_OPTION,
     provisioning_timeout_seconds: float = PROVISIONING_TIMEOUT_OPTION,
+    preprocessing_plan: Path | None = PREPROCESSING_PLAN_OPTION,
     ssh_bootstrap_mode: Literal["tofu", "strict"] = SSH_BOOTSTRAP_MODE_OPTION,
 ) -> None:
     settings = _load_settings_or_exit(config)
@@ -497,6 +510,15 @@ def upscale(
 
     out_path = output_path or video_path.with_name(f"{video_path.stem}-upscaled{video_path.suffix or '.mkv'}")
     rep_path = report_path or out_path.with_suffix(out_path.suffix + ".report.json")
+    remote_preprocessing_contract: dict[str, Any] | None = None
+    if preprocessing_plan is not None:
+        try:
+            plan_payload = load_preprocessing_plan_payload(preprocessing_plan)
+            contract = build_remote_preprocessing_contract_from_plan_payload(plan_payload)
+            remote_preprocessing_contract = dump_remote_preprocessing_contract_payload(contract)
+        except (RemotePreprocessingContractError, RemotePreprocessingContractValidationError) as exc:
+            console.print(f"Preprocessing plan is invalid for remote transport: {exc}")
+            raise typer.Exit(code=1) from exc
 
     read_client = _build_read_client(settings=settings)
     write_client = _build_write_client(settings=settings) if not dry_run else _NoopWriteClient()
@@ -524,6 +546,7 @@ def upscale(
                     sort_by=sort_by,
                     offer_id=offer_id,
                     max_wait_ready_seconds=provisioning_timeout_seconds,
+                    preprocessing_contract=remote_preprocessing_contract,
                     ssh_bootstrap_mode=ssh_bootstrap_mode,
                 ),
                 session_store=store,

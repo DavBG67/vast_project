@@ -98,6 +98,7 @@ class OrchestrationOptions:
     processing_fps: float | None = None
     sort_by: str = "price"
     offer_id: int | None = None
+    preprocessing_contract: dict[str, object] | None = None
     ssh_bootstrap_mode: Literal["tofu", "strict"] = "tofu"
 
 
@@ -335,6 +336,7 @@ def run_upscale_workflow(
                 target_width=options.target_width,
                 target_height=options.target_height,
                 profile=options.profile,
+                preprocessing_contract=options.preprocessing_contract,
             ),
             progress_callback=report_worker_progress,
         )
