@@ -35,6 +35,7 @@ from vast_upscaler.orchestrator import (
     run_upscale_workflow,
 )
 from vast_upscaler.session_store import SessionStore
+from vast_upscaler.source_analysis import SourceAnalysisError, analyze_source_video
 from vast_upscaler.transfer import OpenSshTransport
 from vast_upscaler.vast_client import (
     VastApiError,
@@ -137,6 +138,18 @@ def inspect(video_path: Path, json_output: bool = typer.Option(False, "--json"))
 
     for key, value in payload.items():
         typer.echo(f"{key}: {value}")
+
+
+@app.command("analyze-source")
+def analyze_source(video_path: Path) -> None:
+    """Analyze source video metadata for profile/preprocessing decisions (local only)."""
+    try:
+        analysis = analyze_source_video(video_path)
+    except SourceAnalysisError as exc:
+        typer.echo(f"Source analysis failed: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(json.dumps(analysis.model_dump(mode="json"), indent=2, sort_keys=True))
 
 
 @app.command()

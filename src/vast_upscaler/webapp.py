@@ -30,6 +30,7 @@ from vast_upscaler.remote_worker import (
     execute_remote_worker,
 )
 from vast_upscaler.session_store import SessionStore
+from vast_upscaler.source_analysis import SourceAnalysisError, analyze_source_video
 from vast_upscaler.transfer import OpenSshTransport
 from vast_upscaler.vast_client import VastClient, VastClientConfig
 from vast_upscaler.vast_write_client import VastWriteClient
@@ -71,6 +72,10 @@ class StartJobRequest(BaseModel):
 class PromptReplyRequest(BaseModel):
     approved: bool | None = None
     fingerprint: str | None = None
+
+
+class SourceAnalysisRequest(BaseModel):
+    input_path: str
 
 
 @dataclass(frozen=True)
@@ -721,6 +726,14 @@ def create_app(
     @app.get("/api/config")
     def api_config() -> dict[str, Any]:
         return manager.defaults()
+
+    @app.post("/api/video/analyze")
+    def api_video_analyze(request: SourceAnalysisRequest) -> dict[str, Any]:
+        try:
+            analysis = analyze_source_video(Path(request.input_path))
+        except SourceAnalysisError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return analysis.model_dump(mode="json")
 
     @app.get("/api/instances")
     def api_instances() -> dict[str, Any]:

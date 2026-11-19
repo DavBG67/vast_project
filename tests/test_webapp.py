@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from vast_upscaler.orchestrator import OrchestrationError
+from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
 from vast_upscaler.webapp import (
     RunCallbacks,
     StartJobRequest,
@@ -59,6 +60,39 @@ def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
     assert "vast_api_key" not in body
     assert "worker_image_latest_known" in body
     assert body["worker_image_latest_known"] != "ghcr.io/acme/worker:test"
+
+
+def test_web_video_analyze_endpoint(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"x")
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+
+    monkeypatch.setattr(
+        "vast_upscaler.webapp.analyze_source_video",
+        lambda _path: SourceVideoAnalysis(
+            file_path=str(video_path),
+            width=1920,
+            height=1080,
+            frame_rate_fps=24.0,
+            audio_tracks=[],
+            subtitle_tracks=[],
+            interlace=InterlaceInfo(
+                field_order=None,
+                interlaced=None,
+                confidence="uncertain",
+                note="ffprobe did not provide field_order.",
+            ),
+        ),
+    )
+
+    response = client.post("/api/video/analyze", json={"input_path": str(video_path)})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["width"] == 1920
+    assert body["height"] == 1080
+    assert body["interlace"]["confidence"] == "uncertain"
 
 
 def test_web_job_prompt_and_completion(tmp_path: Path) -> None:

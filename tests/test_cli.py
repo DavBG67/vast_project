@@ -3,6 +3,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from vast_upscaler.cli import app
+from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
 from vast_upscaler.video import VideoInfo
 
 runner = CliRunner()
@@ -40,6 +41,35 @@ def test_inspect_json_output(monkeypatch, tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert '"width": 720' in result.stdout
     assert '"height": 576' in result.stdout
+
+
+def test_analyze_source_json_output(monkeypatch, tmp_path: Path) -> None:
+    video_path = tmp_path / "video.mkv"
+    video_path.write_bytes(b"x")
+
+    monkeypatch.setattr(
+        "vast_upscaler.cli.analyze_source_video",
+        lambda _path: SourceVideoAnalysis(
+            file_path=str(video_path),
+            width=1280,
+            height=720,
+            frame_rate_fps=30.0,
+            audio_tracks=[],
+            subtitle_tracks=[],
+            interlace=InterlaceInfo(
+                field_order="progressive",
+                interlaced=False,
+                confidence="certain",
+                note="ok",
+            ),
+        ),
+    )
+
+    result = runner.invoke(app, ["analyze-source", str(video_path)])
+
+    assert result.exit_code == 0
+    assert '"width": 1280' in result.stdout
+    assert '"confidence": "certain"' in result.stdout
 
 
 def test_offers_offline_fixture(tmp_path: Path) -> None:
