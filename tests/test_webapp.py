@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from vast_upscaler.local_preprocessing import LocalExecutionReport
 from vast_upscaler.orchestrator import OrchestrationError
 from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
 from vast_upscaler.webapp import (
@@ -200,6 +201,87 @@ def test_web_preprocessing_plan_rejects_invalid_custom_crop(tmp_path: Path) -> N
         },
     )
     assert response.status_code == 400
+
+
+def test_web_preprocessing_execution_preview_endpoint(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+
+    monkeypatch.setattr(
+        "vast_upscaler.webapp.execute_preprocessing_plan",
+        lambda **_kwargs: LocalExecutionReport(
+            status="dry_run",
+            source_path="input.mp4",
+            destination_path="output.mp4",
+            planned_operations=["crop"],
+            applied_operations=["crop"],
+            filter_chain="crop=100:100:0:0",
+            ffmpeg_command=["ffmpeg", "..."],
+            encoding={"video_codec": "libx264", "crf": 18},
+            resolution_before={"width": 320, "height": 180},
+            resolution_after={"width": 320, "height": 140},
+            duration_seconds=0.0,
+            warnings=[],
+            ffprobe_validation=None,
+        ),
+    )
+
+    response = client.post(
+        "/api/video/preprocessing-execution/preview",
+        json={
+            "plan_payload": {
+                "version": "1.0",
+                "source_summary": {
+                    "file_path": "sample.mp4",
+                    "width": 320,
+                    "height": 180,
+                    "frame_rate_fps": 25.0,
+                    "duration_seconds": 10.0,
+                    "video_codec": "h264",
+                    "interlace_metadata": {},
+                    "diagnostics_available": False,
+                },
+                "recommendations": [],
+                "user_choices": {
+                    "crop_mode": "preserve",
+                    "custom_crop_margins": None,
+                    "deinterlace_mode": "preserve",
+                    "denoise_mode": "preserve",
+                    "deblock_mode": "preserve",
+                },
+                "operations": [
+                    {
+                        "operation_id": "crop",
+                        "kind": "crop",
+                        "enabled": True,
+                        "recommended": False,
+                        "confidence": "high",
+                        "parameters": {
+                            "mode": "auto_crop",
+                            "crop_rect": {"x": 0, "y": 20, "width": 320, "height": 140},
+                            "preserve_aspect_ratio": True,
+                            "allow_stretch": False,
+                            "fit_policy_after_crop": "letterbox_or_pad",
+                        },
+                        "justification": "manual",
+                        "risk_notes": [],
+                    }
+                ],
+                "warnings": [],
+                "estimated_impact": {
+                    "cpu_cost": "low",
+                    "gpu_gain": "unknown",
+                    "quality_risk": "low",
+                    "note": "n/a",
+                },
+            },
+            "output_path": str(tmp_path / "preview-out.mp4"),
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "dry_run"
 
 
 def test_web_job_prompt_and_completion(tmp_path: Path) -> None:

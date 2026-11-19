@@ -16,6 +16,13 @@ from rich.table import Table
 from vast_upscaler import __version__
 from vast_upscaler.config import ConfigError, Settings, load_config
 from vast_upscaler.cost import estimate_cost
+from vast_upscaler.local_preprocessing import (
+    LocalEncodingOptions,
+    LocalExecutionOptions,
+    LocalPreprocessingError,
+    execute_preprocessing_plan,
+    load_preprocessing_plan,
+)
 from vast_upscaler.offers import (
     OfferConstraints,
     build_offers_query,
@@ -109,6 +116,15 @@ PLAN_CROP_RIGHT_OPTION = typer.Option(0, "--crop-right", min=0)
 PLAN_DEINTERLACE_MODE_OPTION = typer.Option("preserve", "--deinterlace-mode")
 PLAN_DENOISE_MODE_OPTION = typer.Option("preserve", "--denoise-mode")
 PLAN_DEBLOCK_MODE_OPTION = typer.Option("preserve", "--deblock-mode")
+EXECUTE_PLAN_OPTION = typer.Option(..., "--plan", help="Path to preprocessing plan JSON.")
+EXECUTE_OUTPUT_OPTION = typer.Option(..., "--output", help="Destination path for preprocessed video.")
+EXECUTE_DRY_RUN_OPTION = typer.Option(False, "--dry-run", help="Preview command and filters without creating files.")
+EXECUTE_OVERWRITE_OPTION = typer.Option(False, "--overwrite", help="Allow overwriting destination if it exists.")
+EXECUTE_CODEC_OPTION = typer.Option("libx264", "--video-codec")
+EXECUTE_CRF_OPTION = typer.Option(18, "--crf", min=0, max=51)
+EXECUTE_PRESET_OPTION = typer.Option("medium", "--preset")
+EXECUTE_PIXEL_FORMAT_OPTION = typer.Option("yuv420p", "--pixel-format")
+EXECUTE_REPORT_OPTION = typer.Option(None, "--report", help="Optional path to write execution report JSON.")
 
 app.add_typer(session_app, name="session")
 
@@ -261,6 +277,46 @@ def plan_preprocessing(
         raise typer.Exit(code=1)
 
     typer.echo(json.dumps(plan.model_dump(mode="json"), indent=2, sort_keys=True))
+
+
+@app.command("execute-preprocessing")
+def execute_preprocessing(
+    plan_path: Path = EXECUTE_PLAN_OPTION,
+    output_path: Path = EXECUTE_OUTPUT_OPTION,
+    dry_run: bool = EXECUTE_DRY_RUN_OPTION,
+    overwrite: bool = EXECUTE_OVERWRITE_OPTION,
+    video_codec: str = EXECUTE_CODEC_OPTION,
+    crf: int = EXECUTE_CRF_OPTION,
+    preset: str = EXECUTE_PRESET_OPTION,
+    pixel_format: str = EXECUTE_PIXEL_FORMAT_OPTION,
+    report_path: Path | None = EXECUTE_REPORT_OPTION,
+) -> None:
+    """Execute selected local preprocessing operations from an existing plan."""
+    try:
+        plan = load_preprocessing_plan(plan_path)
+        report = execute_preprocessing_plan(
+            plan=plan,
+            output_path=output_path,
+            encoding=LocalEncodingOptions(
+                video_codec=video_codec,
+                crf=crf,
+                preset=preset,
+                pixel_format=pixel_format,
+            ),
+            options=LocalExecutionOptions(
+                dry_run=dry_run,
+                overwrite_output=overwrite,
+            ),
+        )
+    except LocalPreprocessingError as exc:
+        typer.echo(f"Preprocessing execution failed: {exc}")
+        raise typer.Exit(code=1)
+
+    payload = report.model_dump(mode="json")
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
 @app.command()

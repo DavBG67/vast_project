@@ -4,6 +4,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from vast_upscaler.cli import app
+from vast_upscaler.local_preprocessing import LocalExecutionReport
 from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
 from vast_upscaler.video import VideoInfo
 
@@ -116,6 +117,39 @@ def test_plan_preprocessing_from_existing_analysis_report_does_not_reanalyze(mon
     assert result.exit_code == 0
     assert '"version": "1.0"' in result.stdout
     assert '"operations"' in result.stdout
+
+
+def test_execute_preprocessing_dry_run_command(monkeypatch, tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("vast_upscaler.cli.load_preprocessing_plan", lambda _p: object())
+    monkeypatch.setattr(
+        "vast_upscaler.cli.execute_preprocessing_plan",
+        lambda **_kwargs: LocalExecutionReport(
+            status="dry_run",
+            source_path="in.mp4",
+            destination_path="out.mp4",
+            planned_operations=["crop"],
+            applied_operations=["crop"],
+            filter_chain="crop=100:100:0:0",
+            ffmpeg_command=["ffmpeg", "..."],
+            encoding={"video_codec": "libx264"},
+            resolution_before={"width": 320, "height": 180},
+            resolution_after={"width": 320, "height": 140},
+            duration_seconds=0.0,
+            warnings=[],
+            ffprobe_validation=None,
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        ["execute-preprocessing", "--plan", str(plan_path), "--output", str(tmp_path / "out.mp4"), "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert '"status": "dry_run"' in result.stdout
 
 
 def test_offers_offline_fixture(tmp_path: Path) -> None:

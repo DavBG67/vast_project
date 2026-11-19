@@ -282,3 +282,96 @@ Alternative API sources:
 - `analysis_report_path`
 
 Exactly one source is accepted per request.
+
+## Local FFmpeg preprocessing executor (explicit operations only)
+
+### Mandatory audit findings (before implementation)
+
+- Plan schema source of truth:
+  - [PreprocessingPlan](../src/vast_upscaler/preprocessing_planner.py)
+  - stable operation IDs currently expected by planner: `crop`, `deinterlace`, `denoise`, `deblock`.
+- User-choice validation already present at planning level:
+  - crop modes and custom margins are validated for planner output.
+  - planner keeps operations disabled unless explicitly selected.
+- Worker resolution behavior remains unchanged:
+  - worker target canvas is explicit (`compute_target_canvas`) and letterbox-fit preserves proportions.
+  - no automatic crop in remote worker; crop policy must stay local and explicit.
+- Worker encoding path constraints remain unchanged:
+  - remote worker decodes/encodes with ffmpeg and re-muxes audio/subtitles.
+  - profile behavior is still `balanced`-only at runtime.
+
+### Consequences of local crop on downstream upscale
+
+- Cropping reduces processed pixel count and can reduce remote GPU workload/cost.
+- Cropping changes source framing and potentially output composition; wrong crop can remove content.
+- Crop aspect-ratio changes may alter later letterbox behavior when targeting fixed output size.
+- Therefore crop is never auto-applied; explicit selection remains required.
+
+### Executor module
+
+- Module: [local_preprocessing.py](../src/vast_upscaler/local_preprocessing.py)
+- Inputs:
+  - existing preprocessing plan JSON (`PreprocessingPlan`)
+  - destination output path
+  - explicit execution options and encoding parameters
+- Behavior:
+  - validates plan and enabled operations before any ffmpeg run
+  - applies only explicitly enabled operations
+  - rejects unsupported enabled operations (`denoise`, `deblock`) in this phase
+  - rejects ambiguous/invalid crop or deinterlace settings
+  - uses deterministic ffmpeg filter chain
+  - writes temp output first, validates via ffprobe, then publishes final file atomically
+  - never overwrites source
+
+### Operations implemented in this phase
+
+- `crop`:
+  - allowed only with mode `auto_crop` or `custom_crop`
+  - requires explicit `crop_rect`
+  - validates bounds and even coordinates/dimensions for yuv420 compatibility
+  - enforces `allow_stretch=false` and `preserve_aspect_ratio=true`
+- `deinterlace`:
+  - allowed only with explicit mode `enable`
+  - uses `bwdif=mode=send_frame:parity=auto:deint=all`
+- `denoise` and `deblock`:
+  - recommendation-only in this phase; enabled state is rejected at execution time
+
+### Encoding, streams and report
+
+- Default local encoding:
+  - video codec `libx264`, `crf=18`, `preset=medium`, `pix_fmt=yuv420p`
+- Stream handling:
+  - attempts to copy audio/subtitle streams and preserve metadata/chapters
+  - incompatible stream/codec failures are surfaced explicitly as execution errors
+- Execution report:
+  - version, source/destination, planned vs applied operations
+  - filter chain and ffmpeg command
+  - encoding parameters actually used
+  - resolution before/after, duration, warnings
+  - ffprobe validation summary
+
+### Interfaces
+
+CLI execution command:
+
+```bash
+upscaler execute-preprocessing --plan plan.json --output out.mp4
+```
+
+CLI dry-run:
+
+```bash
+upscaler execute-preprocessing --plan plan.json --output out.mp4 --dry-run
+```
+
+API preview endpoint (dry-run semantics only, non-blocking planning preview):
+
+```http
+POST /api/video/preprocessing-execution/preview
+```
+
+### Limits
+
+- Re-encoding is lossy with current defaults (not lossless claim).
+- No automatic integration with remote upscale pipeline in this phase.
+- No Vast.ai interaction in executor module.

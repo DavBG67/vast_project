@@ -15,6 +15,12 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from vast_upscaler.config import Settings, load_config
+from vast_upscaler.local_preprocessing import (
+    LocalEncodingOptions,
+    LocalExecutionOptions,
+    LocalPreprocessingError,
+    execute_preprocessing_plan,
+)
 from vast_upscaler.orchestrator import (
     OrchestrationError,
     OrchestrationOptions,
@@ -26,6 +32,7 @@ from vast_upscaler.orchestrator import (
 )
 from vast_upscaler.preprocessing_planner import (
     PlannerUserChoices,
+    PreprocessingPlan,
     PreprocessingPlannerError,
     build_preprocessing_plan,
     load_analysis_payload_from_file,
@@ -98,6 +105,15 @@ class PreprocessingPlanRequest(BaseModel):
     include_visual_diagnostics: bool = False
     diagnostic_options: VisualDiagnosticsOptions | None = None
     user_choices: PlannerUserChoices | None = None
+
+
+class PreprocessingExecutionPreviewRequest(BaseModel):
+    plan_payload: dict[str, Any]
+    output_path: str
+    video_codec: str = "libx264"
+    crf: int = Field(default=18, ge=0, le=51)
+    preset: str = "medium"
+    pixel_format: str = "yuv420p"
 
 
 @dataclass(frozen=True)
@@ -792,6 +808,25 @@ def create_app(
         except (SourceAnalysisError, PreprocessingPlannerError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return plan.model_dump(mode="json")
+
+    @app.post("/api/video/preprocessing-execution/preview")
+    def api_preprocessing_execution_preview(request: PreprocessingExecutionPreviewRequest) -> dict[str, Any]:
+        try:
+            plan = PreprocessingPlan.model_validate(request.plan_payload)
+            report = execute_preprocessing_plan(
+                plan=plan,
+                output_path=Path(request.output_path),
+                encoding=LocalEncodingOptions(
+                    video_codec=request.video_codec,
+                    crf=request.crf,
+                    preset=request.preset,
+                    pixel_format=request.pixel_format,
+                ),
+                options=LocalExecutionOptions(dry_run=True),
+            )
+        except (LocalPreprocessingError, PreprocessingPlannerError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return report.model_dump(mode="json")
 
     @app.get("/api/instances")
     def api_instances() -> dict[str, Any]:
