@@ -871,6 +871,41 @@ def _list_video_sources_payload() -> dict[str, Any]:
     return {"directory": str(sources_dir), "sources": sources}
 
 
+def _preview_dimensions_from_plan_payload(plan_payload: dict[str, Any]) -> dict[str, int] | None:
+    source_summary = plan_payload.get("source_summary")
+    if not isinstance(source_summary, dict):
+        return None
+    width = source_summary.get("width")
+    height = source_summary.get("height")
+    if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
+        return None
+
+    operations = plan_payload.get("operations")
+    if not isinstance(operations, list):
+        return {"width": width, "height": height}
+    crop_operation = next(
+        (
+            item
+            for item in operations
+            if isinstance(item, dict) and item.get("operation_id") == "crop" and item.get("enabled") is True
+        ),
+        None,
+    )
+    if not isinstance(crop_operation, dict):
+        return {"width": width, "height": height}
+    parameters = crop_operation.get("parameters")
+    if not isinstance(parameters, dict):
+        return {"width": width, "height": height}
+    crop_rect = parameters.get("crop_rect")
+    if not isinstance(crop_rect, dict):
+        return {"width": width, "height": height}
+    out_width = crop_rect.get("width")
+    out_height = crop_rect.get("height")
+    if not isinstance(out_width, int) or not isinstance(out_height, int) or out_width <= 0 or out_height <= 0:
+        return {"width": width, "height": height}
+    return {"width": out_width, "height": out_height}
+
+
 def _load_latest_known_worker_image() -> str:
     try:
         payload = json.loads(_WORKER_IMAGE_HISTORY_PATH.read_text(encoding="utf-8"))
@@ -973,7 +1008,9 @@ def create_app(
             )
         except (SourceAnalysisError, PreprocessingPlannerError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return plan.model_dump(mode="json")
+        payload = plan.model_dump(mode="json")
+        payload["preview_dimensions"] = _preview_dimensions_from_plan_payload(payload)
+        return payload
 
     @app.post("/api/video/preprocessing-execution/preview")
     def api_preprocessing_execution_preview(request: PreprocessingExecutionPreviewRequest) -> dict[str, Any]:
@@ -1209,8 +1246,19 @@ _INDEX_HTML = """
       const srcW = Number(latestAnalysisPayload.width);
       const srcH = Number(latestAnalysisPayload.height);
       const mode = readCropMode();
-      if (mode !== "custom_crop") {
-        info.textContent = `Resulting dimensions: ${srcW} x ${srcH} (manual margins are ignored in this mode)`;
+      const preview = latestPlanPayload?.preview_dimensions;
+      if (preview && Number.isFinite(Number(preview.width)) && Number.isFinite(Number(preview.height))) {
+        const planW = Number(preview.width);
+        const planH = Number(preview.height);
+        info.textContent = `Resulting dimensions: ${planW} x ${planH} (from validated preprocessing plan)`;
+        return;
+      }
+      if (mode === "auto_crop") {
+        info.textContent = `Resulting dimensions: ${srcW} x ${srcH} (waiting for validated plan or no reliable recommended crop)`;
+        return;
+      }
+      if (mode === "preserve") {
+        info.textContent = `Resulting dimensions: ${srcW} x ${srcH} (keep original frame)`;
         return;
       }
       const m = cropMarginsFromInputs();
@@ -1338,6 +1386,7 @@ _INDEX_HTML = """
       if (!latestAnalysisPayload) return;
       const planStatus = document.getElementById("preprocessing-plan-status");
       planStatus.textContent = "Building preprocessing plan...";
+      updateCropDimensionsPreview();
       const response = await fetch("/api/video/preprocessing-plan", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -1352,9 +1401,11 @@ _INDEX_HTML = """
         latestPlanPayload = null;
         planStatus.textContent = "Preprocessing plan error: " + (payload.detail || JSON.stringify(payload));
         setRecommendationTableVisible(false);
+        updateCropDimensionsPreview();
         return;
       }
       latestPlanPayload = payload;
+      updateCropDimensionsPreview();
       renderRecommendations(payload, latestAnalysisPayload);
       const enabled = (payload.operations || []).filter(op => op.enabled).map(op => op.operation_id);
       planStatus.textContent = enabled.length
@@ -1371,6 +1422,7 @@ _INDEX_HTML = """
       const token = ++analysisRequestToken;
       latestAnalysisPayload = null;
       latestPlanPayload = null;
+      updateCropDimensionsPreview();
       setRecommendationTableVisible(false);
       document.getElementById("analysis-status").textContent = "Analysis running...";
       document.getElementById("analysis-summary").textContent = "";
@@ -1388,6 +1440,7 @@ _INDEX_HTML = """
       if (!response.ok) {
         document.getElementById("analysis-status").textContent = "Analysis failed.";
         document.getElementById("analysis-summary").textContent = payload.detail || JSON.stringify(payload);
+        updateCropDimensionsPreview();
         return;
       }
       latestAnalysisPayload = payload;

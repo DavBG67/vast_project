@@ -16,6 +16,7 @@ from vast_upscaler.webapp import (
     WorkflowExecutionResult,
     _default_auto_runner,
     _default_manual_runner,
+    _preview_dimensions_from_plan_payload,
     _resolve_remote_preprocessing_contract,
     create_app,
 )
@@ -66,6 +67,18 @@ def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
     assert "vast_api_key" not in body
     assert "worker_image_latest_known" in body
     assert body["worker_image_latest_known"] != "ghcr.io/acme/worker:test"
+
+
+def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    root = client.get("/")
+    assert root.status_code == 200
+    html = root.text
+    assert "latestPlanPayload?.preview_dimensions" in html
+    assert "from validated preprocessing plan" in html
+    assert "waiting for validated plan or no reliable recommended crop" in html
 
 
 def test_web_video_sources_listing_filters_outputs_and_non_video(tmp_path: Path, monkeypatch) -> None:
@@ -250,6 +263,7 @@ def test_web_preprocessing_plan_from_analysis_payload_without_reanalysis(tmp_pat
     payload = response.json()
     assert payload["version"] == "1.0"
     assert payload["operations"][0]["operation_id"] == "crop"
+    assert payload["preview_dimensions"] == {"width": 1280, "height": 720}
 
 
 def test_web_preprocessing_plan_accepts_user_custom_crop(tmp_path: Path) -> None:
@@ -277,6 +291,7 @@ def test_web_preprocessing_plan_accepts_user_custom_crop(tmp_path: Path) -> None
     assert response.status_code == 200
     crop = next(item for item in response.json()["operations"] if item["operation_id"] == "crop")
     assert crop["enabled"] is True
+    assert response.json()["preview_dimensions"] == {"width": 1240, "height": 700}
 
 
 def test_web_preprocessing_plan_rejects_invalid_custom_crop(tmp_path: Path) -> None:
@@ -302,6 +317,90 @@ def test_web_preprocessing_plan_rejects_invalid_custom_crop(tmp_path: Path) -> N
         },
     )
     assert response.status_code == 400
+
+
+def test_web_preprocessing_plan_auto_crop_uses_plan_effective_dimensions(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post(
+        "/api/video/preprocessing-plan",
+        json={
+            "analysis_payload": {
+                "file_path": "sample.mp4",
+                "width": 640,
+                "height": 480,
+                "frame_rate_fps": 25.0,
+                "duration_seconds": 10.0,
+                "video_codec": "h264",
+                "interlace": {"field_order": "progressive", "interlaced": False, "confidence": "certain", "note": "meta"},
+                "analysis_report": {
+                    "version": "1.0",
+                    "visual_diagnostics": {
+                        "partial": False,
+                        "cropdetect": {
+                            "status": "ok",
+                            "confidence": "high",
+                            "recommended_crop": {"x": 6, "y": 36, "width": 628, "height": 408},
+                            "probable_margins": {"top": 36, "bottom": 36, "left": 6, "right": 6},
+                        },
+                        "idet": {"status": "ok", "confidence": "high", "classification": "progressive"},
+                        "noise_artifacts": {
+                            "status": "ok",
+                            "confidence": "low",
+                            "likely_noise": "unknown",
+                            "likely_compression_artifacts": "unknown",
+                        },
+                    },
+                },
+            },
+            "user_choices": {"crop_mode": "auto_crop"},
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    crop = next(item for item in payload["operations"] if item["operation_id"] == "crop")
+    assert crop["enabled"] is True
+    assert crop["parameters"]["crop_rect"] == {"x": 6, "y": 36, "width": 628, "height": 408}
+    assert payload["preview_dimensions"] == {"width": 628, "height": 408}
+
+
+def test_preview_dimensions_helper_handles_preserve_auto_and_custom_cases() -> None:
+    preserve_plan = {
+        "source_summary": {"width": 640, "height": 480},
+        "operations": [{"operation_id": "crop", "enabled": False, "parameters": {"crop_rect": None}}],
+    }
+    assert _preview_dimensions_from_plan_payload(preserve_plan) == {"width": 640, "height": 480}
+
+    auto_plan = {
+        "source_summary": {"width": 640, "height": 480},
+        "operations": [
+            {
+                "operation_id": "crop",
+                "enabled": True,
+                "parameters": {"crop_rect": {"x": 6, "y": 36, "width": 628, "height": 408}},
+            }
+        ],
+    }
+    assert _preview_dimensions_from_plan_payload(auto_plan) == {"width": 628, "height": 408}
+
+    custom_plan = {
+        "source_summary": {"width": 640, "height": 480},
+        "operations": [
+            {
+                "operation_id": "crop",
+                "enabled": True,
+                "parameters": {"crop_rect": {"x": 6, "y": 36, "width": 628, "height": 408}},
+            }
+        ],
+    }
+    assert _preview_dimensions_from_plan_payload(custom_plan) == {"width": 628, "height": 408}
+
+    no_reliable_auto_plan = {
+        "source_summary": {"width": 640, "height": 480},
+        "operations": [{"operation_id": "crop", "enabled": False, "parameters": {"crop_rect": None}}],
+    }
+    assert _preview_dimensions_from_plan_payload(no_reliable_auto_plan) == {"width": 640, "height": 480}
 
 
 def test_web_preprocessing_execution_preview_endpoint(tmp_path: Path, monkeypatch) -> None:
