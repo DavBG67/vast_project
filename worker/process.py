@@ -339,7 +339,7 @@ def main() -> int:
                         "input_video_codec": getattr(source, "codec", None),
                         "input_audio_streams": input_audio_streams,
                         "output_audio_codec": "aac" if input_audio_streams > 0 else None,
-                        "audio_transcoded": True if input_audio_streams > 0 else False,
+                        "audio_transcoded": input_audio_streams > 0,
                         "subtitle_passthrough": False,
                     },
                 },

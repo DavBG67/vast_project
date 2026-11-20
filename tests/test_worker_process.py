@@ -20,9 +20,9 @@ from worker.process import (
     _emit_cuda_diagnostics,
     _estimate_total_frames,
     _fail,
-    mux_with_source_streams,
     compute_target_canvas,
     main,
+    mux_with_source_streams,
     validate_output,
     write_report,
 )
@@ -207,7 +207,7 @@ def test_mux_with_source_streams_transcodes_primary_audio_to_aac(monkeypatch) ->
         returncode = 0
         stderr = ""
 
-    def _fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+    def _fake_run(cmd, capture_output, text, check):
         calls.append(cmd)
         return _RunResult()
 
