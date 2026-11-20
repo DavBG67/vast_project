@@ -90,6 +90,10 @@ def test_write_report_includes_v2_schema_and_comparison_context(tmp_path: Path) 
             "upscaler": {"engine": "realesrgan", "model": "RealESRGAN_x4plus", "profile": "balanced"},
             "encoding": {"video_codec": "libx265", "crf": 20, "pixel_format": "yuv420p"},
         },
+        hardware={"gpu": {"container_visible": {"count": 1}}},
+        software={"runtime": {"python_version": "3.12.0"}},
+        environment={"containerized": True, "sensitive_identifiers_included": False},
+        collection_warnings=["gpu_inventory_unavailable: sample"],
     )
 
     write_report(report_path, report)
@@ -102,6 +106,10 @@ def test_write_report_includes_v2_schema_and_comparison_context(tmp_path: Path) 
     assert payload["telemetry"]["raw_samples"] == []
     assert payload["telemetry"]["aggregates"] == {}
     assert payload["instance_metadata"]["sensitive_identifiers_included"] is False
+    assert payload["hardware"]["gpu"]["container_visible"]["count"] == 1
+    assert payload["software"]["runtime"]["python_version"] == "3.12.0"
+    assert payload["environment"]["containerized"] is True
+    assert payload["collection_warnings"] == ["gpu_inventory_unavailable: sample"]
     assert payload["metric_schema"]["units"]["duration"] == "seconds"
 
 

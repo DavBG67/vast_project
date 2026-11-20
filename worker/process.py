@@ -20,6 +20,7 @@ try:
         RealesrganUpscaler,
     )
     from .video_probe import ProbeError, probe_video
+    from .system_inventory import StaticInventory, collect_static_inventory
 except ImportError:
     from models import ProfileNotSupportedError, select_model
     from pipelines.realesrgan import (
@@ -28,6 +29,7 @@ except ImportError:
         RealesrganUpscaler,
     )
     from video_probe import ProbeError, probe_video
+    from system_inventory import StaticInventory, collect_static_inventory
 
 
 class WorkerError(RuntimeError):
@@ -64,6 +66,10 @@ class ProcessingReport:
     notes: list[str]
     preprocessing_plan: dict | None = None
     comparison_context: dict | None = None
+    hardware: dict | None = None
+    software: dict | None = None
+    environment: dict | None = None
+    collection_warnings: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +171,15 @@ def main() -> int:
     preprocessing_plan_summary: dict | None = None
     frames_processed = 0
     staged_output: Path | None = None
+    try:
+        static_inventory = collect_static_inventory()
+    except Exception as exc:  # noqa: BLE001
+        static_inventory = StaticInventory(
+            hardware={},
+            software={},
+            environment={},
+            warnings=[f"inventory_collection_failed: {exc}"],
+        )
 
     try:
         _emit_cuda_diagnostics()
@@ -295,6 +310,10 @@ def main() -> int:
                         "pixel_format": "yuv420p",
                     },
                 },
+                hardware=static_inventory.hardware,
+                software=static_inventory.software,
+                environment=static_inventory.environment,
+                collection_warnings=static_inventory.warnings,
             )
             write_report(report_path, report)
             progress.emit(stage="completed", frames_done=frames_processed, frames_total=frames_total, force=True)
@@ -312,6 +331,10 @@ def main() -> int:
             status="failed",
             frames_processed=frames_processed,
             preprocessing_plan=preprocessing_plan_summary,
+            hardware=static_inventory.hardware,
+            software=static_inventory.software,
+            environment=static_inventory.environment,
+            collection_warnings=static_inventory.warnings,
         )
     except ProcessingStageError as exc:
         _cleanup_staged_output(staged_output)
@@ -324,6 +347,10 @@ def main() -> int:
             status="failed",
             frames_processed=frames_processed,
             preprocessing_plan=preprocessing_plan_summary,
+            hardware=static_inventory.hardware,
+            software=static_inventory.software,
+            environment=static_inventory.environment,
+            collection_warnings=static_inventory.warnings,
         )
     except (WorkerError, ProbeError, RealesrganError) as exc:
         _cleanup_staged_output(staged_output)
@@ -335,6 +362,10 @@ def main() -> int:
             status="failed",
             frames_processed=frames_processed,
             preprocessing_plan=preprocessing_plan_summary,
+            hardware=static_inventory.hardware,
+            software=static_inventory.software,
+            environment=static_inventory.environment,
+            collection_warnings=static_inventory.warnings,
         )
     except Exception as exc:  # noqa: BLE001
         _cleanup_staged_output(staged_output)
@@ -346,6 +377,10 @@ def main() -> int:
             status="failed",
             frames_processed=frames_processed,
             preprocessing_plan=preprocessing_plan_summary,
+            hardware=static_inventory.hardware,
+            software=static_inventory.software,
+            environment=static_inventory.environment,
+            collection_warnings=static_inventory.warnings,
         )
 
 
@@ -632,6 +667,9 @@ def write_report(path: Path, report: ProcessingReport) -> None:
         "sensitive_identifiers_included": False,
     }
     payload["processing_context"] = report.comparison_context or {}
+    payload["hardware"] = report.hardware or {}
+    payload["software"] = report.software or {}
+    payload["environment"] = report.environment or {}
     payload["telemetry"] = {
         "sampling_interval_seconds": None,
         "raw_samples": [],
@@ -666,8 +704,13 @@ def write_report(path: Path, report: ProcessingReport) -> None:
             "memory": "bytes",
             "cost": "USD",
         },
+        "field_notes": {
+            "hardware": "Observed from inside the worker container; host physical values may be unavailable.",
+            "software": "Runtime and toolchain observed in container at processing time.",
+            "environment": "Containerization and cgroup context observed from procfs/sysfs.",
+        },
     }
-    payload["collection_warnings"] = []
+    payload["collection_warnings"] = list(report.collection_warnings or [])
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -679,6 +722,10 @@ def _fail(
     status: str,
     frames_processed: int = 0,
     preprocessing_plan: dict | None = None,
+    hardware: dict | None = None,
+    software: dict | None = None,
+    environment: dict | None = None,
+    collection_warnings: list[str] | None = None,
 ) -> int:
     elapsed = time.perf_counter() - started
     report = ProcessingReport(
@@ -693,6 +740,10 @@ def _fail(
         gpu=RealesrganUpscaler.detect_gpu_name(),
         notes=notes,
         preprocessing_plan=preprocessing_plan,
+        hardware=hardware,
+        software=software,
+        environment=environment,
+        collection_warnings=collection_warnings,
     )
     write_report(report_path, report)
     for note in notes:

@@ -240,7 +240,8 @@ Produced files and local state:
 - Output report default: `<output-video>.report.json`
   - Legacy top-level fields are preserved for compatibility.
   - Report schema `2.0` also adds structured sections for progressive enrichment (`processing_context`, `telemetry`, `transfer_metrics`, `timings`, `cost_estimate`, `metric_schema`, `collection_warnings`).
-  - In phase 5G.1, telemetry sections are schema-ready (raw samples + aggregates) but not populated yet.
+  - Phase 5G.2 enriches static worker inventory in `hardware`, `software`, and `environment` (best-effort, sensitive identifiers excluded by default).
+  - Telemetry sections are schema-ready (raw samples + aggregates) but not populated dynamically yet.
 - Session store: `%USERPROFILE%\.vast_upscaler\sessions.json`
 - Provisioning history store: `%USERPROFILE%\.vast_upscaler\provisioning_history.json`
 - Workflow lock: `%USERPROFILE%\.vast_upscaler\workflow.lock`
