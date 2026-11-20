@@ -3,7 +3,11 @@ from __future__ import annotations
 import subprocess
 import time
 
-from worker.system_telemetry import TelemetryCollector, _collect_single_sample, _collect_gpu_sample
+from worker.system_telemetry import (
+    TelemetryCollector,
+    _collect_gpu_sample,
+    _collect_single_sample,
+)
 
 
 def test_telemetry_collector_collects_and_aggregates_samples() -> None:

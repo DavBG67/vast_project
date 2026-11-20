@@ -44,12 +44,12 @@ from vast_upscaler.preprocessing_planner import (
     build_preprocessing_plan,
     load_analysis_payload_from_file,
 )
-from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.provisioning_history import ProvisioningAttemptTracker
 from vast_upscaler.remote_worker import (
     RemoteWorkerRequest,
     execute_remote_worker,
 )
+from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.session_store import SessionStore
 from vast_upscaler.source_analysis import (
     SourceAnalysisError,

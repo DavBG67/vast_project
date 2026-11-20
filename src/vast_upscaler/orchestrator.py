@@ -33,7 +33,6 @@ from vast_upscaler.provisioning_history import (
     ProvisioningHistoryStore,
     ProvisioningOutcome,
 )
-from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.remote_worker import (
     RemoteWorkerAmbiguousStateError,
     RemoteWorkerRequest,
@@ -41,6 +40,7 @@ from vast_upscaler.remote_worker import (
     execute_remote_worker,
     recover_remote_results,
 )
+from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.session_store import (
     SessionRecord,
     SessionStore,

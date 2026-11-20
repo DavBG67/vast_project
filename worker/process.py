@@ -19,9 +19,9 @@ try:
         RealesrganError,
         RealesrganUpscaler,
     )
-    from .video_probe import ProbeError, probe_video
     from .system_inventory import StaticInventory, collect_static_inventory
     from .system_telemetry import TelemetryCollector, TelemetrySummary
+    from .video_probe import ProbeError, probe_video
 except ImportError:
     from models import ProfileNotSupportedError, select_model
     from pipelines.realesrgan import (
@@ -29,9 +29,9 @@ except ImportError:
         RealesrganError,
         RealesrganUpscaler,
     )
-    from video_probe import ProbeError, probe_video
     from system_inventory import StaticInventory, collect_static_inventory
     from system_telemetry import TelemetryCollector, TelemetrySummary
+    from video_probe import ProbeError, probe_video
 
 
 class WorkerError(RuntimeError):

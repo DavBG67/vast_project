@@ -1,17 +1,16 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
 import time
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .system_inventory import _read_cpu_quota_cores, _read_memory_limit_bytes
-
 
 SampleProvider = Callable[[list[str], "_CpuSnapshot | None"], tuple[dict[str, Any], "_CpuSnapshot | None"]]
 
