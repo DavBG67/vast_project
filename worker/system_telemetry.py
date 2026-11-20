@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .system_inventory import _read_cpu_quota_cores, _read_memory_limit_bytes
+try:
+    from .system_inventory import _read_cpu_quota_cores, _read_memory_limit_bytes
+except ImportError:
+    from system_inventory import _read_cpu_quota_cores, _read_memory_limit_bytes
 
 SampleProvider = Callable[[list[str], "_CpuSnapshot | None"], tuple[dict[str, Any], "_CpuSnapshot | None"]]
 
