@@ -15,9 +15,9 @@ def test_compatibility_check_logs_expected_and_detected_versions() -> None:
     content = WORKFLOW_PATH.read_text(encoding="utf-8")
     assert "[compat] torch expected=" in content
     assert "[compat] torchvision expected=" in content
-    assert "[compat] cuda expected=" in content
+    assert "[compat] cuda expected_release=" in content
     assert "unexpected torch public version: expected" in content
     assert "unexpected torchvision public version: expected" in content
-    assert "unexpected compiled cuda version: expected" in content
+    assert "unexpected compiled cuda version release: expected" in content
     assert "[compat] expected_arch_token=" in content
     assert "expected arch token" in content
