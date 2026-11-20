@@ -28,3 +28,6 @@ Thumbs.db
 
 #video folder
 video/
+
+# local preprocessing plans and runtime artifacts
+/data/

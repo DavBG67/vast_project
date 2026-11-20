@@ -260,6 +260,7 @@ pytest
 
 - `.github/agents/`: local multi-agent prompts.
 - `docs/`: architecture, security, roadmap, ADR, specs.
+- `data/preprocessing/`: local preprocessing plan JSON files (generated/kept locally, ignored by Git).
 - `public/`: web public folder (unused in phase 1).
 - `scripts/`: helper scripts.
 - `src/vast_upscaler/`: Python package.
