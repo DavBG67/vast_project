@@ -20,6 +20,7 @@ from vast_upscaler.webapp import (
     _default_auto_runner,
     _default_manual_runner,
     _preview_dimensions_from_plan_payload,
+    _resolve_output_path,
     _resolve_remote_preprocessing_contract,
     create_app,
 )
@@ -648,6 +649,7 @@ def test_web_preprocessing_execution_preview_endpoint(tmp_path: Path, monkeypatc
 
 
 def test_web_job_start_accepts_source_name_without_manual_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
     video_dir = tmp_path / "video"
     video_dir.mkdir()
@@ -683,6 +685,81 @@ def test_web_job_start_accepts_source_name_without_manual_path(tmp_path: Path, m
     assert response.status_code == 200
 
 
+def test_resolve_output_path_defaults_to_mp4_for_all_sources(tmp_path: Path) -> None:
+    mkv = tmp_path / "clip.mkv"
+    webm = tmp_path / "clip.webm"
+    mp4 = tmp_path / "clip.mp4"
+    for item in (mkv, webm, mp4):
+        item.write_bytes(b"x")
+    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mkv))).name == "clip-upscaled.mp4"
+    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(webm))).name == "clip-upscaled.mp4"
+    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mp4))).name == "clip-upscaled.mp4"
+
+
+def test_web_job_start_rejects_incompatible_explicit_output_extension(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mkv"
+    source.write_bytes(b"x")
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "input_path": str(source),
+            "output_path": str(tmp_path / "output.webm"),
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+        },
+    )
+    assert response.status_code == 400
+    assert "supports MP4/H.264/AAC output only" in response.json()["detail"]
+
+
+def test_web_job_start_rejects_undecodable_source_before_runner(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.webm"
+    source.write_bytes(b"x")
+
+    called = {"runner": False}
+
+    def _auto_runner(_request: StartJobRequest, _settings, _callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        called["runner"] = True
+        return WorkflowExecutionResult(
+            mode="automatic",
+            session_id="sess",
+            state="COMPLETED",
+            output_path=None,
+            report_path=None,
+            duration_seconds=0.1,
+            estimated_total_usd=0.1,
+            instance_id=None,
+            instance_state=None,
+            cleanup_verified=True,
+            cleanup_warning=None,
+        )
+
+    class _FakeRun:
+        returncode = 1
+        stdout = ""
+        stderr = "Decoder not found for stream"
+
+    monkeypatch.setattr("vast_upscaler.webapp.subprocess.run", lambda *args, **kwargs: _FakeRun())
+
+    app = create_app(config_path=config_path, auto_runner=_auto_runner)
+    client = TestClient(app)
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "input_path": str(source),
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+        },
+    )
+    assert response.status_code == 400
+    assert "decode precheck failed" in response.json()["detail"]
+    assert called["runner"] is False
+
+
 def test_web_job_start_rejects_source_name_plus_input_path(tmp_path: Path, monkeypatch) -> None:
     config_path = _write_config(tmp_path)
     video_dir = tmp_path / "video"
@@ -708,7 +785,8 @@ def test_web_job_start_rejects_source_name_plus_input_path(tmp_path: Path, monke
     assert "either source_name or input_path" in response.json()["detail"]
 
 
-def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
+def test_web_job_prompt_and_completion(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"
     source.write_bytes(b"x")
@@ -766,7 +844,8 @@ def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
     assert done["result"]["estimated_total_usd"] == 0.42
 
 
-def test_web_prompt_cannot_be_answered_twice_and_replay_is_safe(tmp_path: Path) -> None:
+def test_web_prompt_cannot_be_answered_twice_and_replay_is_safe(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"
     source.write_bytes(b"x")
@@ -823,7 +902,8 @@ def test_web_prompt_cannot_be_answered_twice_and_replay_is_safe(tmp_path: Path) 
     assert snapshot_after_replay["pending_prompt"] is None
 
 
-def test_web_rejects_parallel_jobs(tmp_path: Path) -> None:
+def test_web_rejects_parallel_jobs(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"
     source.write_bytes(b"x")
@@ -860,7 +940,8 @@ def test_web_rejects_parallel_jobs(tmp_path: Path) -> None:
     assert finished["status"] in {"cancelled", "completed"}
 
 
-def test_web_rejects_placeholder_worker_image_for_automatic_mode(tmp_path: Path) -> None:
+def test_web_rejects_placeholder_worker_image_for_automatic_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"
     source.write_bytes(b"x")
@@ -879,7 +960,8 @@ def test_web_rejects_placeholder_worker_image_for_automatic_mode(tmp_path: Path)
     assert "placeholder worker image" in response.json()["detail"]
 
 
-def test_manual_mode_keeps_instance_on_failure(tmp_path: Path) -> None:
+def test_manual_mode_keeps_instance_on_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"
     source.write_bytes(b"x")
@@ -900,7 +982,8 @@ def test_manual_mode_keeps_instance_on_failure(tmp_path: Path) -> None:
     assert "manual-instance-preserved" in events_payload
 
 
-def test_manual_mode_keeps_instance_on_cancellation(tmp_path: Path) -> None:
+def test_manual_mode_keeps_instance_on_cancellation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
     source = tmp_path / "input.mp4"
     source.write_bytes(b"x")

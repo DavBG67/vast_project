@@ -204,6 +204,12 @@ def main() -> int:
         _ensure_disk_space(output_path.parent, min_free_gb=args.min_free_gb)
 
         source = probe_video(input_path)
+        input_subtitle_streams = int(getattr(source, "subtitle_streams", 0) or 0)
+        input_audio_streams = int(getattr(source, "audio_streams", 0) or 0)
+        if input_subtitle_streams > 0:
+            notes.append("Subtitle streams are not muxed to MP4 output in this phase.")
+        if input_audio_streams > 1:
+            notes.append("Multiple audio tracks detected; only the primary audio track is kept in MP4 output.")
         preprocessing_config = PreprocessingConfig(
             summary={
                 "present": False,
@@ -326,10 +332,15 @@ def main() -> int:
                     },
                     "encoding": {
                         "container": output_path.suffix.lstrip(".") or None,
-                        "video_codec": "libx265",
+                        "video_codec": "libx264",
                         "preset": "medium",
                         "crf": args.video_crf,
                         "pixel_format": "yuv420p",
+                        "input_video_codec": getattr(source, "codec", None),
+                        "input_audio_streams": input_audio_streams,
+                        "output_audio_codec": "aac" if input_audio_streams > 0 else None,
+                        "audio_transcoded": True if input_audio_streams > 0 else False,
+                        "subtitle_passthrough": False,
                     },
                 },
                 hardware=static_inventory.hardware,
@@ -478,7 +489,7 @@ def run_streaming_upscale(
         "-",
         "-an",
         "-c:v",
-        "libx265",
+        "libx264",
         "-preset",
         "medium",
         "-crf",
@@ -611,9 +622,7 @@ def mux_with_source_streams(input_path: Path, video_only_path: Path, output_path
         "-map",
         "0:v:0",
         "-map",
-        "1:a?",
-        "-map",
-        "1:s?",
+        "1:a:0?",
         "-map_metadata",
         "1",
         "-map_chapters",
@@ -621,9 +630,11 @@ def mux_with_source_streams(input_path: Path, video_only_path: Path, output_path
         "-c:v",
         "copy",
         "-c:a",
-        "copy",
-        "-c:s",
-        "copy",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
         str(output_path),
     ]
 
@@ -644,15 +655,19 @@ def mux_with_source_streams(input_path: Path, video_only_path: Path, output_path
         "-map",
         "0:v:0",
         "-map",
-        "1:a?",
+        "1:a:0?",
         "-map_metadata",
-        "1",
+        "-1",
         "-map_chapters",
-        "1",
+        "-1",
         "-c:v",
         "copy",
         "-c:a",
-        "copy",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
         str(output_path),
     ]
     result_fallback = subprocess.run(cmd_fallback, capture_output=True, text=True, check=False)

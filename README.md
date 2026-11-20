@@ -242,7 +242,10 @@ Validation manuelle rapide de l'IHM:
 
 Produced files and local state:
 
-- Output video default: `<input-dir>/<input-stem>-upscaled.<ext>`
+- Output video default: `<input-dir>/<input-stem>-upscaled.mp4`
+  - Output profile is MP4 + H.264 (`libx264`) + AAC (primary audio track only when present)
+  - Source subtitle streams are not muxed into output in this phase
+  - Explicit output paths with incompatible extensions are rejected (no silent codec/container fallback)
 - Output report default: `<output-video>.report.json`
   - Legacy top-level fields are preserved for compatibility.
   - Report schema `2.0` also adds structured sections for progressive enrichment (`processing_context`, `telemetry`, `transfer_metrics`, `timings`, `cost_estimate`, `metric_schema`, `collection_warnings`).

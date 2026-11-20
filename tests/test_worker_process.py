@@ -1,4 +1,7 @@
 import json
+import re
+import shutil
+import subprocess
 import sys
 from argparse import Namespace
 from io import StringIO
@@ -17,11 +20,66 @@ from worker.process import (
     _emit_cuda_diagnostics,
     _estimate_total_frames,
     _fail,
+    mux_with_source_streams,
     compute_target_canvas,
     main,
     validate_output,
     write_report,
 )
+
+_FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def _run_cmd(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, capture_output=True, text=True, check=False, cwd=str(cwd) if cwd else None)
+
+
+def _require_ffmpeg_encoder(encoder: str) -> None:
+    listing = _run_cmd(["ffmpeg", "-hide_banner", "-loglevel", "error", "-encoders"])
+    if listing.returncode != 0 or encoder not in listing.stdout:
+        pytest.skip(f"ffmpeg encoder '{encoder}' is unavailable in this environment")
+
+
+def _probe_streams(path: Path) -> tuple[dict, list[dict], list[dict]]:
+    probe = _run_cmd(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_format",
+            "-show_streams",
+            "-print_format",
+            "json",
+            str(path),
+        ]
+    )
+    if probe.returncode != 0:
+        raise AssertionError(f"ffprobe failed for {path}:\n{probe.stderr}")
+    payload = json.loads(probe.stdout)
+    streams = payload.get("streams", [])
+    video_streams = [item for item in streams if isinstance(item, dict) and item.get("codec_type") == "video"]
+    audio_streams = [item for item in streams if isinstance(item, dict) and item.get("codec_type") == "audio"]
+    return payload, video_streams, audio_streams
+
+
+def _assert_av_timing_sane(path: Path, *, expected_fps: float, expected_duration: float, tolerance: float = 0.2) -> None:
+    payload, video_streams, audio_streams = _probe_streams(path)
+    assert len(video_streams) == 1
+    video = video_streams[0]
+    fps_raw = video.get("avg_frame_rate")
+    assert isinstance(fps_raw, str) and "/" in fps_raw
+    num_str, den_str = fps_raw.split("/", maxsplit=1)
+    fps = float(num_str) / float(den_str)
+    assert abs(fps - expected_fps) <= 0.2
+
+    duration = float(payload["format"]["duration"])
+    assert abs(duration - expected_duration) <= tolerance
+
+    if audio_streams:
+        audio = audio_streams[0]
+        audio_start = float(audio.get("start_time") or 0.0)
+        video_start = float(video.get("start_time") or 0.0)
+        assert abs(audio_start - video_start) <= 0.1
 
 
 def test_compute_target_canvas() -> None:
@@ -88,7 +146,7 @@ def test_write_report_includes_v2_schema_and_comparison_context(tmp_path: Path) 
                 "target_canvas": {"width": 1920, "height": 1080},
             },
             "upscaler": {"engine": "realesrgan", "model": "RealESRGAN_x4plus", "profile": "balanced"},
-            "encoding": {"video_codec": "libx265", "crf": 20, "pixel_format": "yuv420p"},
+            "encoding": {"video_codec": "libx264", "crf": 20, "pixel_format": "yuv420p"},
         },
         hardware={"gpu": {"container_visible": {"count": 1}}},
         software={"runtime": {"python_version": "3.12.0"}},
@@ -140,6 +198,285 @@ def test_build_staged_output_path_preserves_container_suffix() -> None:
     assert _build_staged_output_path(Path("/workspace/output/test-upscaled.mp4")).name == "test-upscaled.tmp.mp4"
     assert _build_staged_output_path(Path("/workspace/output/test-upscaled.mkv")).name == "test-upscaled.tmp.mkv"
     assert _build_staged_output_path(Path("/workspace/output/test-upscaled")).name == "test-upscaled.tmp"
+
+
+def test_mux_with_source_streams_transcodes_primary_audio_to_aac(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    class _RunResult:
+        returncode = 0
+        stderr = ""
+
+    def _fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+        calls.append(cmd)
+        return _RunResult()
+
+    monkeypatch.setattr("worker.process.subprocess.run", _fake_run)
+    mux_with_source_streams(
+        input_path=Path("/tmp/source.webm"),
+        video_only_path=Path("/tmp/video_only.mkv"),
+        output_path=Path("/tmp/out.mp4"),
+    )
+    assert len(calls) == 1
+    command = calls[0]
+    assert "-map" in command and "1:a:0?" in command
+    assert "-c:a" in command and command[command.index("-c:a") + 1] == "aac"
+    assert "-c:s" not in command
+
+
+@pytest.mark.skipif(not _FFMPEG_AVAILABLE, reason="ffmpeg/ffprobe is required for mux integration tests")
+@pytest.mark.parametrize(
+    ("label", "source_name", "source_video_codec", "source_audio_codec", "source_container", "expected_source_audio"),
+    [
+        ("webm-vp9-opus", "Clip Source.WEBM", "libvpx-vp9", "libopus", "webm", "opus"),
+        ("mkv-h265-aac", "clip source.mkv", "libx265", "aac", "matroska", "aac"),
+        ("mp4-h264-aac", "clip source.mp4", "libx264", "aac", "mp4", "aac"),
+    ],
+)
+def test_mux_integration_transcodes_supported_sources_to_mp4_h264_aac(
+    tmp_path: Path,
+    label: str,
+    source_name: str,
+    source_video_codec: str,
+    source_audio_codec: str,
+    source_container: str,
+    expected_source_audio: str,
+) -> None:
+    _require_ffmpeg_encoder(source_video_codec)
+    _require_ffmpeg_encoder(source_audio_codec)
+    _require_ffmpeg_encoder("libx264")
+    _require_ffmpeg_encoder("aac")
+
+    case_dir = tmp_path / label
+    case_dir.mkdir(parents=True)
+    source = case_dir / source_name
+    source_duration = 2.0
+    expected_fps = 24.0
+    source_build = _run_cmd(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000",
+            "-t",
+            str(source_duration),
+            "-c:v",
+            source_video_codec,
+            "-c:a",
+            source_audio_codec,
+            "-f",
+            source_container,
+            str(source),
+        ]
+    )
+    if source_build.returncode != 0:
+        pytest.skip(f"Cannot generate source '{label}' with available ffmpeg codecs: {source_build.stderr.strip()}")
+
+    _, source_video_streams, source_audio_streams = _probe_streams(source)
+    assert source_video_streams and source_video_streams[0].get("codec_name") is not None
+    assert source_audio_streams and source_audio_streams[0].get("codec_name") == expected_source_audio
+
+    video_only = case_dir / "video_only.mp4"
+    video_only_build = _run_cmd(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=384x216:rate=24",
+            "-t",
+            str(source_duration),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(video_only),
+        ]
+    )
+    if video_only_build.returncode != 0:
+        raise AssertionError(video_only_build.stderr)
+
+    output = case_dir / "output upscaled.mp4"
+    mux_with_source_streams(input_path=source, video_only_path=video_only, output_path=output)
+    payload, video_streams, audio_streams = _probe_streams(output)
+    assert len(video_streams) == 1
+    assert len(audio_streams) == 1
+    assert video_streams[0].get("codec_name") == "h264"
+    assert audio_streams[0].get("codec_name") == "aac"
+    assert "mp4" in str(payload.get("format", {}).get("format_name", ""))
+    _assert_av_timing_sane(output, expected_fps=expected_fps, expected_duration=source_duration)
+
+
+@pytest.mark.skipif(not _FFMPEG_AVAILABLE, reason="ffmpeg/ffprobe is required for mux integration tests")
+def test_mux_integration_preserves_video_when_source_has_no_audio(tmp_path: Path) -> None:
+    _require_ffmpeg_encoder("libx264")
+    source = tmp_path / "No Audio Source.MKV"
+    source_duration = 1.8
+    source_build = _run_cmd(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=25",
+            "-t",
+            str(source_duration),
+            "-an",
+            "-c:v",
+            "libx264",
+            str(source),
+        ]
+    )
+    if source_build.returncode != 0:
+        raise AssertionError(source_build.stderr)
+
+    video_only = tmp_path / "VideoOnly.MP4"
+    build_video_only = _run_cmd(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=384x216:rate=25",
+            "-t",
+            str(source_duration),
+            "-an",
+            "-c:v",
+            "libx264",
+            str(video_only),
+        ]
+    )
+    if build_video_only.returncode != 0:
+        raise AssertionError(build_video_only.stderr)
+
+    output = tmp_path / "No Audio Output.mp4"
+    mux_with_source_streams(input_path=source, video_only_path=video_only, output_path=output)
+    _, video_streams, audio_streams = _probe_streams(output)
+    assert len(video_streams) == 1
+    assert len(audio_streams) == 0
+    assert video_streams[0].get("codec_name") == "h264"
+    _assert_av_timing_sane(output, expected_fps=25.0, expected_duration=source_duration)
+
+
+@pytest.mark.skipif(not _FFMPEG_AVAILABLE, reason="ffmpeg/ffprobe is required for mux integration tests")
+def test_mux_integration_keeps_only_primary_audio_track(tmp_path: Path) -> None:
+    _require_ffmpeg_encoder("libx264")
+    _require_ffmpeg_encoder("aac")
+
+    source = tmp_path / "multi audio source.mkv"
+    source_duration = 2.2
+    source_build = _run_cmd(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=mono:sample_rate=48000",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000",
+            "-t",
+            str(source_duration),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map",
+            "2:a:0",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            str(source),
+        ]
+    )
+    if source_build.returncode != 0:
+        raise AssertionError(source_build.stderr)
+
+    video_only = tmp_path / "video-only.mp4"
+    video_only_build = _run_cmd(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=384x216:rate=24",
+            "-t",
+            str(source_duration),
+            "-an",
+            "-c:v",
+            "libx264",
+            str(video_only),
+        ]
+    )
+    if video_only_build.returncode != 0:
+        raise AssertionError(video_only_build.stderr)
+
+    output = tmp_path / "multi-audio-output.mp4"
+    mux_with_source_streams(input_path=source, video_only_path=video_only, output_path=output)
+    _, video_streams, audio_streams = _probe_streams(output)
+    assert len(video_streams) == 1
+    assert len(audio_streams) == 1
+    assert audio_streams[0].get("codec_name") == "aac"
+
+    silence_probe = _run_cmd(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-i",
+            str(output),
+            "-vn",
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    if silence_probe.returncode != 0:
+        raise AssertionError(silence_probe.stderr)
+    match = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", silence_probe.stderr)
+    assert match is not None
+    mean_volume = float(match.group(1))
+    assert mean_volume <= -70.0
+    _assert_av_timing_sane(output, expected_fps=24.0, expected_duration=source_duration)
 
 
 def test_fail_report_preserves_frames_processed(tmp_path: Path, monkeypatch) -> None:

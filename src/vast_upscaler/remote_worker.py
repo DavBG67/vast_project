@@ -309,6 +309,7 @@ def execute_remote_worker(
         report_payload=report_payload,
         local_report_path=request.local_report_path,
         timing_state=timing_state,
+        output_video_info=video_info,
     )
 
     return RemoteWorkerResult(
@@ -458,6 +459,7 @@ def _persist_enriched_report(
     report_payload: dict,
     local_report_path: Path,
     timing_state: _TransferTimingState,
+    output_video_info: VideoInfo | None = None,
 ) -> dict:
     enriched = dict(report_payload)
     enriched.setdefault("report_schema_version", "2.0")
@@ -489,6 +491,18 @@ def _persist_enriched_report(
     enriched["timings"] = timings
     enriched["metric_schema"] = metric_schema
     enriched["collection_warnings"] = warnings
+    if output_video_info is not None:
+        context = enriched.get("processing_context")
+        if not isinstance(context, dict):
+            context = {}
+            enriched["processing_context"] = context
+        encoding = context.get("encoding")
+        if not isinstance(encoding, dict):
+            encoding = {}
+            context["encoding"] = encoding
+        encoding["output_container"] = output_video_info.container_format
+        encoding["output_video_codec_actual"] = output_video_info.video_codec
+        encoding["output_audio_codec_actual"] = output_video_info.audio_codec
     local_report_path.write_text(json.dumps(enriched, indent=2), encoding="utf-8")
     return enriched
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -92,6 +93,7 @@ _VIDEO_SOURCE_EXTENSIONS = {
     ".wmv",
 }
 _VIDEO_SOURCE_EXCLUDED_SUFFIXES = ("-upscaled", "-cropped")
+_ALLOWED_OUTPUT_CONTAINER_EXTENSIONS = {".mp4"}
 
 
 class WebWorkflowCancelled(RuntimeError):
@@ -552,7 +554,9 @@ class WebTaskManager:
             source_path=input_path,
         )
         output_path = _resolve_output_path(request=request)
+        _validate_output_container_compatibility(output_path=output_path)
         report_path = _resolve_report_path(request=request, output_path=output_path)
+        _validate_local_decode_capability(input_path=input_path)
         if output_path.exists():
             raise HTTPException(status_code=400, detail=f"Refusing to overwrite existing output: {output_path}")
         if report_path.exists():
@@ -827,8 +831,7 @@ def _resolve_output_path(*, request: StartJobRequest) -> Path:
     if request.output_path:
         return Path(request.output_path)
     source = _resolve_input_video_path(request=request)
-    suffix = source.suffix or ".mkv"
-    return source.with_name(f"{source.stem}-upscaled{suffix}")
+    return source.with_name(f"{source.stem}-upscaled.mp4")
 
 
 def _resolve_report_path(*, request: StartJobRequest, output_path: Path) -> Path:
@@ -969,6 +972,46 @@ def _validate_excerpt_request(*, enabled: bool, start_timecode: str | None, dura
         )
     except VideoExcerptError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _validate_output_container_compatibility(*, output_path: Path) -> None:
+    suffix = output_path.suffix.lower()
+    if suffix not in _ALLOWED_OUTPUT_CONTAINER_EXTENSIONS:
+        allowed = ", ".join(sorted(_ALLOWED_OUTPUT_CONTAINER_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported output container '{output_path.suffix or '<none>'}'. "
+                f"This phase supports MP4/H.264/AAC output only. Allowed extensions: {allowed}."
+            ),
+        )
+
+
+def _validate_local_decode_capability(*, input_path: Path, ffmpeg_bin: str = "ffmpeg") -> None:
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-v",
+        "error",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        run = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Local ffmpeg is unavailable for codec validation: {exc}") from exc
+    if run.returncode != 0:
+        message = (run.stderr or "").strip() or "Unsupported or undecodable source video stream."
+        raise HTTPException(status_code=400, detail=f"Source decode precheck failed: {message}")
 
 
 def _normalize_source_name(source_name: str) -> str:
