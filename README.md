@@ -213,6 +213,12 @@ V1 behavior:
   4. Configure and launch upscale
 - Video sources are listed from `<project-root>/video/` (project-root derived from package location, not process CWD).
 - Explicit source exclusion rule in video listing: files ending with `-upscaled.<ext>`, `-cropped.<ext>`, and `*.report.json` are hidden from source selection.
+- Test excerpt mode (phase 6A.1):
+  - Scope can be set to full video or excerpt (`MM:SS` / `HH:MM:SS` start + duration in seconds).
+  - Excerpt preparation is local-only (FFmpeg), before any remote transfer.
+  - Effective job analysis/preprocessing is computed from the excerpt when excerpt mode is enabled.
+  - Temporary excerpt files are created under `<project-root>/data/excerpts/` with unique names, then cleaned up per-job (without touching other jobs).
+  - The final report is enriched with: `original_source`, `excerpt_enabled`, `excerpt_start_seconds`, `excerpt_requested_duration_seconds`, `excerpt_actual_duration_seconds`, `excerpt_source`.
 - Path safety for source selection: no path traversal, no path separators in source names, and no resolved path outside the allowed `video/` directory.
 - Manual input path remains available under Advanced options for compatibility/troubleshooting.
 - `Preprocessing plan path (optional)` remains available under Advanced options.

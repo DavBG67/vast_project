@@ -60,6 +60,13 @@ from vast_upscaler.source_analysis import (
 from vast_upscaler.transfer import OpenSshTransport
 from vast_upscaler.vast_client import VastClient, VastClientConfig
 from vast_upscaler.vast_write_client import InstanceSummary, VastWriteClient
+from vast_upscaler.video import VideoProbeError, inspect_video
+from vast_upscaler.video_excerpt import (
+    VideoExcerptError,
+    VideoExcerptResult,
+    create_video_excerpt,
+    resolve_excerpt_window,
+)
 
 RunMode = Literal["automatic", "manual"]
 SortBy = Literal["price", "reliability", "performance"]
@@ -108,6 +115,9 @@ class StartJobRequest(BaseModel):
     preprocessing_plan_path: str | None = None
     preprocessing_plan_payload: dict[str, Any] | None = None
     ssh_bootstrap_mode: SshBootstrapMode = "tofu"
+    excerpt_enabled: bool = False
+    excerpt_start: str | None = None
+    excerpt_duration_seconds: float = Field(default=10.0, gt=0)
 
 
 class PromptReplyRequest(BaseModel):
@@ -120,6 +130,9 @@ class SourceAnalysisRequest(BaseModel):
     source_name: str | None = None
     include_visual_diagnostics: bool = False
     diagnostic_options: VisualDiagnosticsOptions | None = None
+    excerpt_enabled: bool = False
+    excerpt_start: str | None = None
+    excerpt_duration_seconds: float = Field(default=10.0, gt=0)
 
 
 class PreprocessingPlanRequest(BaseModel):
@@ -163,6 +176,14 @@ class RunCallbacks:
     confirm_ssh_trust: Callable[[str], bool]
     request_verified_fingerprint: Callable[[str], str | None]
     raise_if_cancelled: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class _EffectiveJobInput:
+    input_path: Path
+    original_source: Path
+    excerpt_result: VideoExcerptResult | None
+    cleanup_excerpt_path: Path | None
 
 
 class _Job:
@@ -268,6 +289,9 @@ class WebTaskManager:
                 "worker_image_requested": (request.worker_image or "").strip() or None,
                 "offer_id": request.offer_id,
                 "instance_id": request.instance_id,
+                "excerpt_enabled": request.excerpt_enabled,
+                "excerpt_start": request.excerpt_start,
+                "excerpt_duration_seconds": request.excerpt_duration_seconds,
             },
         )
         thread = threading.Thread(target=self._run_job, args=(job,), daemon=True)
@@ -521,6 +545,12 @@ class WebTaskManager:
         input_path = _resolve_input_video_path(request=request)
         if not input_path.exists() or not input_path.is_file():
             raise HTTPException(status_code=400, detail="Input path must be an existing file.")
+        _validate_excerpt_request(
+            enabled=request.excerpt_enabled,
+            start_timecode=request.excerpt_start,
+            duration_seconds=request.excerpt_duration_seconds,
+            source_path=input_path,
+        )
         output_path = _resolve_output_path(request=request)
         report_path = _resolve_report_path(request=request, output_path=output_path)
         if output_path.exists():
@@ -561,7 +591,9 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
 
     output_path = _resolve_output_path(request=request)
     report_path = _resolve_report_path(request=request, output_path=output_path)
-    input_path = _resolve_input_video_path(request=request)
+    source_path = _resolve_input_video_path(request=request)
+    effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
+    input_path = effective_input.input_path
     preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
     worker_image = (request.worker_image or _load_latest_known_worker_image()).strip()
     if not worker_image:
@@ -585,51 +617,65 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
     store = SessionStore()
 
     try:
-        with SessionExecutionLock():
-            summary = run_upscale_workflow(
-                settings=effective_settings,
-                options=OrchestrationOptions(
-                    input_path=input_path,
-                    output_path=output_path,
-                    report_path=report_path,
-                    worker_image=worker_image,
-                    profile=effective_settings.video.default_profile,
-                    target_width=request.target_width or effective_settings.video.target_width,
-                    target_height=request.target_height or effective_settings.video.target_height,
-                    keep_instance=False,
-                    processing_fps=request.processing_fps,
-                    sort_by=request.sort_by,
-                    offer_id=request.offer_id,
-                    preprocessing_contract=preprocessing_contract,
-                    ssh_bootstrap_mode=request.ssh_bootstrap_mode,
-                ),
-                session_store=store,
-                read_client=read_client,
-                write_client=write_client,
-                transport=transport,
-                confirm_paid=lambda message: callbacks.confirm_paid(message),
-                confirm_ssh_trust=lambda message: callbacks.confirm_ssh_trust(message),
-                request_verified_fingerprint=lambda message: callbacks.request_verified_fingerprint(message),
-                report_provisioning_status=lambda payload: callbacks.report_provisioning_status(payload),
-                report_worker_progress=lambda payload: callbacks.report_worker_progress(payload),
+        try:
+            with SessionExecutionLock():
+                summary = run_upscale_workflow(
+                    settings=effective_settings,
+                    options=OrchestrationOptions(
+                        input_path=input_path,
+                        output_path=output_path,
+                        report_path=report_path,
+                        worker_image=worker_image,
+                        profile=effective_settings.video.default_profile,
+                        target_width=request.target_width or effective_settings.video.target_width,
+                        target_height=request.target_height or effective_settings.video.target_height,
+                        keep_instance=False,
+                        processing_fps=request.processing_fps,
+                        sort_by=request.sort_by,
+                        offer_id=request.offer_id,
+                        preprocessing_contract=preprocessing_contract,
+                        ssh_bootstrap_mode=request.ssh_bootstrap_mode,
+                    ),
+                    session_store=store,
+                    read_client=read_client,
+                    write_client=write_client,
+                    transport=transport,
+                    confirm_paid=lambda message: callbacks.confirm_paid(message),
+                    confirm_ssh_trust=lambda message: callbacks.confirm_ssh_trust(message),
+                    request_verified_fingerprint=lambda message: callbacks.request_verified_fingerprint(message),
+                    report_provisioning_status=lambda payload: callbacks.report_provisioning_status(payload),
+                    report_worker_progress=lambda payload: callbacks.report_worker_progress(payload),
+                )
+            final_report_path = (
+                summary.worker_result.local_report_path if summary.worker_result is not None else report_path
             )
+            _safe_merge_report_metadata(
+                report_path=final_report_path,
+                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+            )
+            return WorkflowExecutionResult(
+                mode="automatic",
+                session_id=summary.session_id,
+                state=summary.state,
+                output_path=str(summary.worker_result.local_output_path) if summary.worker_result is not None else None,
+                report_path=str(final_report_path),
+                duration_seconds=0.0,
+                estimated_total_usd=summary.estimate.total_estimated_usd,
+                instance_id=summary.instance_id,
+                instance_state=summary.state,
+                cleanup_verified=summary.cleanup_verified,
+                cleanup_warning=summary.cleanup_warning,
+            )
+        except Exception:
+            _safe_merge_report_metadata(
+                report_path=report_path,
+                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+            )
+            raise
     finally:
+        _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
         read_client.close()
         write_client.close()
-
-    return WorkflowExecutionResult(
-        mode="automatic",
-        session_id=summary.session_id,
-        state=summary.state,
-        output_path=str(summary.worker_result.local_output_path) if summary.worker_result is not None else None,
-        report_path=str(summary.worker_result.local_report_path) if summary.worker_result is not None else str(report_path),
-        duration_seconds=0.0,
-        estimated_total_usd=summary.estimate.total_estimated_usd,
-        instance_id=summary.instance_id,
-        instance_state=summary.state,
-        cleanup_verified=summary.cleanup_verified,
-        cleanup_warning=summary.cleanup_warning,
-    )
 
 
 def _default_manual_runner(request: StartJobRequest, settings: Settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
@@ -639,7 +685,9 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
 
     output_path = _resolve_output_path(request=request)
     report_path = _resolve_report_path(request=request, output_path=output_path)
-    input_path = _resolve_input_video_path(request=request)
+    source_path = _resolve_input_video_path(request=request)
+    effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
+    input_path = effective_input.input_path
     preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
 
     transport = OpenSshTransport()
@@ -725,6 +773,10 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             instance=instance,
             offer=None,
         )
+        _safe_merge_report_metadata(
+            report_path=worker_result.local_report_path,
+            metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+        )
         elapsed = time.perf_counter() - started
         return WorkflowExecutionResult(
             mode="manual",
@@ -747,8 +799,13 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             instance=instance,
             offer=None,
         )
+        _safe_merge_report_metadata(
+            report_path=report_path,
+            metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+        )
         raise
     finally:
+        _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
         write_client.close()
 
 
@@ -801,6 +858,117 @@ def _project_root_path() -> Path:
 
 def _video_sources_dir() -> Path:
     return _project_root_path() / "video"
+
+
+def _excerpts_dir() -> Path:
+    return _project_root_path() / "data" / "excerpts"
+
+
+def _cleanup_job_excerpt(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except OSError:
+        return
+
+
+def _safe_merge_report_metadata(*, report_path: Path, metadata: dict[str, Any]) -> None:
+    if not report_path.exists() or not report_path.is_file():
+        return
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    payload.update(metadata)
+    try:
+        report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _build_excerpt_report_metadata(*, effective_input: _EffectiveJobInput) -> dict[str, Any]:
+    excerpt = effective_input.excerpt_result
+    return {
+        "original_source": str(effective_input.original_source),
+        "excerpt_enabled": excerpt is not None,
+        "excerpt_start_seconds": excerpt.start_seconds if excerpt is not None else None,
+        "excerpt_requested_duration_seconds": excerpt.requested_duration_seconds if excerpt is not None else None,
+        "excerpt_actual_duration_seconds": excerpt.actual_duration_seconds if excerpt is not None else None,
+        "excerpt_source": str(excerpt.excerpt_path) if excerpt is not None else None,
+    }
+
+
+def _prepare_effective_job_input(*, request: StartJobRequest, source_path: Path, job_prefix: str) -> _EffectiveJobInput:
+    if not request.excerpt_enabled:
+        return _EffectiveJobInput(
+            input_path=source_path,
+            original_source=source_path,
+            excerpt_result=None,
+            cleanup_excerpt_path=None,
+        )
+
+    excerpt_dir = _excerpts_dir()
+    excerpt_file = excerpt_dir / f"{job_prefix}-{uuid4().hex[:16]}.mkv"
+    excerpt_result = _create_excerpt_for_range(
+        source_path=source_path,
+        excerpt_path=excerpt_file,
+        start_timecode=request.excerpt_start,
+        requested_duration_seconds=request.excerpt_duration_seconds,
+    )
+    return _EffectiveJobInput(
+        input_path=excerpt_result.excerpt_path,
+        original_source=source_path,
+        excerpt_result=excerpt_result,
+        cleanup_excerpt_path=excerpt_result.excerpt_path,
+    )
+
+
+def _create_excerpt_for_range(
+    *,
+    source_path: Path,
+    excerpt_path: Path,
+    start_timecode: str | None,
+    requested_duration_seconds: float | None,
+) -> VideoExcerptResult:
+    try:
+        source_info = inspect_video(source_path)
+    except VideoProbeError as exc:
+        raise HTTPException(status_code=400, detail=f"Could not inspect source for excerpt validation: {exc}") from exc
+    try:
+        start_seconds, duration_seconds = resolve_excerpt_window(
+            start_timecode=start_timecode,
+            requested_duration_seconds=requested_duration_seconds,
+            source_duration_seconds=source_info.duration_seconds,
+        )
+        return create_video_excerpt(
+            source_path=source_path,
+            excerpt_path=excerpt_path,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+        )
+    except VideoExcerptError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _validate_excerpt_request(*, enabled: bool, start_timecode: str | None, duration_seconds: float | None, source_path: Path) -> None:
+    if not enabled:
+        return
+    try:
+        source_info = inspect_video(source_path)
+    except VideoProbeError as exc:
+        raise HTTPException(status_code=400, detail=f"Could not inspect source for excerpt validation: {exc}") from exc
+    try:
+        resolve_excerpt_window(
+            start_timecode=start_timecode,
+            requested_duration_seconds=duration_seconds,
+            source_duration_seconds=source_info.duration_seconds,
+        )
+    except VideoExcerptError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _normalize_source_name(source_name: str) -> str:
@@ -982,21 +1150,47 @@ def create_app(
         source_count = sum(value is not None and value != "" for value in (request.input_path, request.source_name))
         if source_count != 1:
             raise HTTPException(status_code=400, detail="Provide exactly one source: input_path or source_name.")
+        cleanup_excerpt_path: Path | None = None
+        excerpt_result: VideoExcerptResult | None = None
         try:
             if request.source_name:
-                video_path = _resolve_video_source_path(source_name=request.source_name)
+                original_video_path = _resolve_video_source_path(source_name=request.source_name)
             else:
-                video_path = Path(request.input_path or "")
+                original_video_path = Path(request.input_path or "")
+            video_path = original_video_path
+            if request.excerpt_enabled:
+                excerpt_dir = _excerpts_dir()
+                excerpt_path = excerpt_dir / f"analysis-excerpt-{uuid4().hex[:16]}.mkv"
+                excerpt_result = _create_excerpt_for_range(
+                    source_path=original_video_path,
+                    excerpt_path=excerpt_path,
+                    start_timecode=request.excerpt_start,
+                    requested_duration_seconds=request.excerpt_duration_seconds,
+                )
+                cleanup_excerpt_path = excerpt_result.excerpt_path
+                video_path = excerpt_result.excerpt_path
             if not request.include_visual_diagnostics:
                 analysis = analyze_source_video(video_path)
-                return analysis.model_dump(mode="json")
-            return analyze_source_video_report(
+                payload = analysis.model_dump(mode="json")
+            else:
+                payload = analyze_source_video_report(
                 video_path=video_path,
                 include_visual_diagnostics=True,
                 diagnostics_options=request.diagnostic_options,
+                )
+            payload["original_source"] = str(original_video_path)
+            payload["excerpt_enabled"] = excerpt_result is not None
+            payload["excerpt_start_seconds"] = excerpt_result.start_seconds if excerpt_result is not None else None
+            payload["excerpt_requested_duration_seconds"] = (
+                excerpt_result.requested_duration_seconds if excerpt_result is not None else None
             )
+            payload["excerpt_actual_duration_seconds"] = excerpt_result.actual_duration_seconds if excerpt_result is not None else None
+            payload["excerpt_source"] = str(excerpt_result.excerpt_path) if excerpt_result is not None else None
+            return payload
         except SourceAnalysisError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            _cleanup_job_excerpt(cleanup_excerpt_path)
 
     @app.post("/api/video/preprocessing-plan")
     def api_preprocessing_plan(request: PreprocessingPlanRequest) -> dict[str, Any]:
@@ -1430,6 +1624,23 @@ _INDEX_HTML = """
       <div id="video-sources-dir" class="muted"></div>
       <div id="selected-source-meta" class="muted"></div>
       <div id="video-selection-state" class="status-line muted"></div>
+      <h3>Périmètre du traitement</h3>
+      <div class="radio-group" role="radiogroup" aria-label="Périmètre du traitement">
+        <label class="radio-option"><input type="radio" name="processing_scope" value="full_video" checked />Vidéo entière</label>
+        <label class="radio-option"><input type="radio" name="processing_scope" value="test_excerpt" />Extrait de test</label>
+      </div>
+      <div id="excerpt-controls" class="hidden">
+        <div class="row">
+          <label for="excerpt_start">Début de l'extrait (MM:SS ou HH:MM:SS)
+            <input id="excerpt_start" value="00:00" />
+          </label>
+          <label for="excerpt_duration_seconds">Durée (secondes)
+            <input id="excerpt_duration_seconds" type="number" min="0.1" step="0.1" value="10" />
+          </label>
+        </div>
+        <div id="excerpt-range" class="muted">Plage sélectionnée : n/a</div>
+        <div id="excerpt-upload-note" class="warn">Mode extrait actif : seul l'extrait préparé localement sera transféré vers Vast.ai.</div>
+      </div>
       <div class="kpi-grid">
         <div class="kpi"><div class="kpi-label">Résolution</div><div id="video-kpi-resolution" class="kpi-value">n/a</div></div>
         <div class="kpi"><div class="kpi-label">Durée</div><div id="video-kpi-duration" class="kpi-value">n/a</div></div>
@@ -1619,6 +1830,84 @@ _INDEX_HTML = """
       } else {
         box.textContent = "Mode automatique : l’application recherche une offre, crée l’instance, exécute le traitement puis applique la logique de nettoyage existante.";
       }
+    }
+
+    function readProcessingScope() {
+      const selected = document.querySelector("input[name='processing_scope']:checked");
+      return selected ? selected.value : "full_video";
+    }
+
+    function excerptEnabled() {
+      return readProcessingScope() === "test_excerpt";
+    }
+
+    function parseExcerptStartToSeconds(value) {
+      const text = String(value || "").trim();
+      const hhmmss = /^(\\d{1,3}):(\\d{2}):(\\d{2})$/;
+      const mmss = /^(\\d{1,3}):(\\d{2})$/;
+      let match = text.match(hhmmss);
+      if (match) {
+        const h = Number(match[1]);
+        const m = Number(match[2]);
+        const s = Number(match[3]);
+        if (m >= 60 || s >= 60) return null;
+        return h * 3600 + m * 60 + s;
+      }
+      match = text.match(mmss);
+      if (match) {
+        const m = Number(match[1]);
+        const s = Number(match[2]);
+        if (s >= 60) return null;
+        return m * 60 + s;
+      }
+      return null;
+    }
+
+    function formatHms(totalSeconds) {
+      if (!Number.isFinite(Number(totalSeconds)) || Number(totalSeconds) < 0) return "n/a";
+      const rounded = Math.floor(Number(totalSeconds));
+      const h = Math.floor(rounded / 3600);
+      const m = Math.floor((rounded % 3600) / 60);
+      const s = rounded % 60;
+      if (h > 0) {
+        return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+      }
+      return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
+
+    function excerptRequestPayload() {
+      if (!excerptEnabled()) {
+        return {
+          excerpt_enabled: false,
+          excerpt_start: null,
+          excerpt_duration_seconds: 10,
+        };
+      }
+      const startRaw = document.getElementById("excerpt_start").value.trim() || "00:00";
+      const duration = Number(document.getElementById("excerpt_duration_seconds").value || 10);
+      return {
+        excerpt_enabled: true,
+        excerpt_start: startRaw,
+        excerpt_duration_seconds: duration,
+      };
+    }
+
+    function updateExcerptControls() {
+      const controls = document.getElementById("excerpt-controls");
+      const rangeLabel = document.getElementById("excerpt-range");
+      controls.classList.toggle("hidden", !excerptEnabled());
+      if (!excerptEnabled()) {
+        rangeLabel.textContent = "Plage sélectionnée : n/a";
+        return;
+      }
+      const startRaw = document.getElementById("excerpt_start").value.trim() || "00:00";
+      const startSeconds = parseExcerptStartToSeconds(startRaw);
+      const duration = Number(document.getElementById("excerpt_duration_seconds").value || 10);
+      if (startSeconds === null || !Number.isFinite(duration) || duration <= 0) {
+        rangeLabel.textContent = "Plage sélectionnée : format invalide";
+        return;
+      }
+      rangeLabel.textContent = `Plage sélectionnée : ${formatHms(startSeconds)} → ${formatHms(startSeconds + duration)}`;
     }
 
     function readCropMode() {
@@ -1915,7 +2204,8 @@ _INDEX_HTML = """
 
     async function analyzeSelectedSource() {
       const sourceName = document.getElementById("source_name").value;
-      if (!sourceName) {
+      const manualInput = document.getElementById("input_path").value.trim();
+      if (!sourceName && !manualInput) {
         document.getElementById("analysis-status").textContent = "Aucune source sélectionnée.";
         return;
       }
@@ -1930,10 +2220,14 @@ _INDEX_HTML = """
       const response = await fetch("/api/video/analyze", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          source_name: sourceName,
-          include_visual_diagnostics: true,
-        }),
+        body: JSON.stringify(Object.assign(
+          {
+            source_name: sourceName || null,
+            input_path: sourceName ? null : manualInput,
+            include_visual_diagnostics: true,
+          },
+          excerptRequestPayload(),
+        )),
       });
       const payload = await response.json();
       if (token !== analysisRequestToken) return;
@@ -1950,6 +2244,9 @@ _INDEX_HTML = """
       const dims = payload.width && payload.height ? `${payload.width} x ${payload.height}` : "inconnue";
       document.getElementById("analysis-status").textContent = "Analyse terminée.";
       document.getElementById("analysis-summary").textContent = `Codec : ${payload.video_codec || "inconnu"}, résolution : ${dims}, cadence : ${prettyFps(Number(payload.frame_rate_fps || 0))}`;
+      if (payload.excerpt_enabled) {
+        appendEvent(`Analyse de l'extrait local : ${payload.excerpt_start_seconds}s → ${Number(payload.excerpt_start_seconds || 0) + Number(payload.excerpt_actual_duration_seconds || 0)}s`);
+      }
       document.getElementById("video-kpi-resolution").textContent = dims;
       document.getElementById("video-kpi-duration").textContent = prettyDuration(Number(payload.duration_seconds || 0));
       document.getElementById("video-kpi-fps").textContent = prettyFps(Number(payload.frame_rate_fps || 0));
@@ -1967,7 +2264,9 @@ _INDEX_HTML = """
       }
       const modified = meta.modified_at ? new Date(meta.modified_at).toLocaleString() : "n/a";
       document.getElementById("selected-source-meta").textContent = `Fichier sélectionné : ${meta.name} | ${prettyBytes(meta.size_bytes)} | modifié ${modified}`;
-      document.getElementById("video-selection-state").textContent = "Source valide.";
+      document.getElementById("video-selection-state").textContent = excerptEnabled()
+        ? "Source valide. Un extrait local sera préparé avant transfert Vast.ai."
+        : "Source valide.";
       document.getElementById("video-kpi-size").textContent = prettyBytes(meta.size_bytes);
       analyzeSelectedSource();
     }
@@ -2122,6 +2421,9 @@ _INDEX_HTML = """
         offer_id: document.getElementById("offer_id").value ? Number(document.getElementById("offer_id").value) : null,
         instance_id: document.getElementById("instance_id").value ? Number(document.getElementById("instance_id").value) : null,
         ssh_bootstrap_mode: document.getElementById("ssh_bootstrap_mode").value,
+        excerpt_enabled: excerptEnabled(),
+        excerpt_start: excerptEnabled() ? (document.getElementById("excerpt_start").value.trim() || "00:00") : null,
+        excerpt_duration_seconds: excerptEnabled() ? Number(document.getElementById("excerpt_duration_seconds").value || 10) : 10,
       };
       const response = await fetch("/api/jobs/start", {
         method: "POST",
@@ -2163,6 +2465,16 @@ _INDEX_HTML = """
     document.getElementById("refresh-sources-btn").addEventListener("click", loadVideoSources);
     document.getElementById("source_name").addEventListener("change", selectedSourceChanged);
     document.getElementById("analyze-btn").addEventListener("click", analyzeSelectedSource);
+    for (const radio of document.querySelectorAll("input[name='processing_scope']")) {
+      radio.addEventListener("change", async () => {
+        updateExcerptControls();
+        if (document.getElementById("source_name").value) {
+          await analyzeSelectedSource();
+        }
+      });
+    }
+    document.getElementById("excerpt_start").addEventListener("input", updateExcerptControls);
+    document.getElementById("excerpt_duration_seconds").addEventListener("input", updateExcerptControls);
     for (const radio of document.querySelectorAll("input[name='crop_mode']")) {
       radio.addEventListener("change", async () => {
         setCropInputsDisabled(readCropMode() !== "custom_crop");
@@ -2182,6 +2494,7 @@ _INDEX_HTML = """
 
     setCropInputsDisabled(true);
     setModeHelp();
+    updateExcerptControls();
     loadDefaults();
     loadVideoSources();
   </script>

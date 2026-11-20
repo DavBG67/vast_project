@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +23,8 @@ from vast_upscaler.webapp import (
     _resolve_remote_preprocessing_contract,
     create_app,
 )
+
+_FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
 def _write_config(tmp_path: Path) -> Path:
@@ -89,11 +94,15 @@ def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) ->
     assert root.status_code == 200
     html = root.text
     assert "Choisir une vidéo" in html
+    assert "Périmètre du traitement" in html
+    assert "Extrait de test" in html
     assert "Analyser la source" in html
     assert "Examiner et valider les prétraitements" in html
     assert "Configurer et lancer l’upscale" in html
     for control_id in (
         "source_name",
+        "excerpt_start",
+        "excerpt_duration_seconds",
         "refresh-sources-btn",
         "analyze-btn",
         "recommendations-body",
@@ -171,6 +180,131 @@ def test_web_video_analyze_by_source_name(tmp_path: Path, monkeypatch) -> None:
     response = client.post("/api/video/analyze", json={"source_name": "sample.mp4"})
     assert response.status_code == 200
     assert Path(str(captured["path"])).resolve() == video_path.resolve()
+
+
+@pytest.mark.skipif(not _FFMPEG_AVAILABLE, reason="ffmpeg/ffprobe are required")
+def test_web_video_analyze_uses_excerpt_when_enabled_and_cleans_temp_file(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    source = video_dir / "sample.mp4"
+    build = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000",
+            "-t",
+            "2.0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if build.returncode != 0:
+        raise AssertionError(build.stderr)
+
+    monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
+    captured: dict[str, Path] = {}
+
+    def _fake_analyze_report(**kwargs):
+        path = kwargs["video_path"]
+        captured["path"] = path
+        assert path.exists()
+        return {
+            "file_path": str(path),
+            "width": 320,
+            "height": 180,
+            "duration_seconds": 1.0,
+            "frame_rate_fps": 25.0,
+            "video_codec": "h264",
+            "analysis_report": {"visual_diagnostics": {}},
+        }
+
+    monkeypatch.setattr("vast_upscaler.webapp.analyze_source_video_report", _fake_analyze_report)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post(
+        "/api/video/analyze",
+        json={
+            "source_name": "sample.mp4",
+            "include_visual_diagnostics": True,
+            "excerpt_enabled": True,
+            "excerpt_start": "00:01",
+            "excerpt_duration_seconds": 0.8,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["excerpt_enabled"] is True
+    assert payload["original_source"].endswith("sample.mp4")
+    excerpt_path = captured["path"]
+    assert excerpt_path.parent == tmp_path / "data" / "excerpts"
+    assert not excerpt_path.exists()
+
+
+@pytest.mark.skipif(not _FFMPEG_AVAILABLE, reason="ffmpeg/ffprobe are required")
+def test_web_job_start_rejects_excerpt_outside_source_duration(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    build = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=25",
+            "-t",
+            "1.0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if build.returncode != 0:
+        raise AssertionError(build.stderr)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "input_path": str(source),
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+            "excerpt_enabled": True,
+            "excerpt_start": "00:00",
+            "excerpt_duration_seconds": 3.0,
+        },
+    )
+    assert response.status_code == 400
+    assert "exceeds source duration" in response.json()["detail"]
 
 
 def test_web_video_analyze_rejects_source_traversal(tmp_path: Path, monkeypatch) -> None:
@@ -945,6 +1079,91 @@ def test_web_auto_and_manual_use_identical_preprocessing_contract(tmp_path: Path
         "version": "1.0",
         "operations": [{"id": "crop", "params": {"x": 0, "y": 0, "width": 640, "height": 360}}],
     }
+
+
+def test_default_auto_runner_merges_excerpt_metadata_and_cleans_temp_excerpt(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+    output = tmp_path / "output.mp4"
+    report = tmp_path / "report.json"
+    report.write_text('{"status":"completed","report_schema_version":"2.0"}', encoding="utf-8")
+    excerpt_file = tmp_path / "data" / "excerpts" / "job-excerpt-test.mkv"
+    excerpt_file.parent.mkdir(parents=True, exist_ok=True)
+    excerpt_file.write_bytes(b"x")
+
+    request = StartJobRequest(
+        mode="automatic",
+        input_path=str(source),
+        output_path=str(output),
+        report_path=str(report),
+        worker_image="ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+        excerpt_enabled=True,
+        excerpt_start="00:01",
+        excerpt_duration_seconds=2.0,
+    )
+    settings = _write_config(tmp_path)
+    from vast_upscaler.config import load_config
+
+    loaded_settings = load_config(settings)
+    callbacks = RunCallbacks(
+        report_provisioning_status=lambda _payload: None,
+        report_worker_progress=lambda _payload: None,
+        confirm_paid=lambda _message: True,
+        confirm_ssh_trust=lambda _message: True,
+        request_verified_fingerprint=lambda _message: None,
+        raise_if_cancelled=lambda: None,
+    )
+
+    class _FakeClient:
+        def close(self) -> None:
+            return
+
+    class _NoLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return None
+
+    effective_input = SimpleNamespace(
+        input_path=excerpt_file,
+        original_source=source,
+        excerpt_result=SimpleNamespace(
+            excerpt_path=excerpt_file,
+            start_seconds=1.0,
+            requested_duration_seconds=2.0,
+            actual_duration_seconds=1.95,
+        ),
+        cleanup_excerpt_path=excerpt_file,
+    )
+
+    monkeypatch.setattr("vast_upscaler.webapp._prepare_effective_job_input", lambda **_kwargs: effective_input)
+    monkeypatch.setattr("vast_upscaler.webapp._build_read_client", lambda _s: _FakeClient())
+    monkeypatch.setattr("vast_upscaler.webapp._build_write_client", lambda _s: _FakeClient())
+    monkeypatch.setattr("vast_upscaler.webapp.SessionExecutionLock", _NoLock)
+    monkeypatch.setattr(
+        "vast_upscaler.webapp.run_upscale_workflow",
+        lambda **_kwargs: SimpleNamespace(
+            session_id="sess",
+            state="COMPLETED",
+            worker_result=SimpleNamespace(local_output_path=output, local_report_path=report),
+            estimate=SimpleNamespace(total_estimated_usd=0.1),
+            instance_id=123,
+            cleanup_verified=True,
+            cleanup_warning=None,
+        ),
+    )
+
+    result = _default_auto_runner(request, loaded_settings, callbacks)
+    assert result.report_path == str(report)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["original_source"] == str(source)
+    assert payload["excerpt_enabled"] is True
+    assert payload["excerpt_start_seconds"] == 1.0
+    assert payload["excerpt_requested_duration_seconds"] == 2.0
+    assert payload["excerpt_actual_duration_seconds"] == 1.95
+    assert payload["excerpt_source"] == str(excerpt_file)
+    assert not excerpt_file.exists()
 
 
 def test_manual_plan_path_overrides_generated_plan_payload_for_contract_resolution(tmp_path: Path) -> None:
