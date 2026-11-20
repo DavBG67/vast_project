@@ -77,8 +77,37 @@ def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -
     assert root.status_code == 200
     html = root.text
     assert "latestPlanPayload?.preview_dimensions" in html
-    assert "from validated preprocessing plan" in html
-    assert "waiting for validated plan or no reliable recommended crop" in html
+    assert "issues du plan validé" in html
+    assert "en attente du plan validé ou recadrage non fiable" in html
+
+
+def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    root = client.get("/")
+    assert root.status_code == 200
+    html = root.text
+    assert "Choisir une vidéo" in html
+    assert "Analyser la source" in html
+    assert "Examiner et valider les prétraitements" in html
+    assert "Configurer et lancer l’upscale" in html
+    for control_id in (
+        "source_name",
+        "refresh-sources-btn",
+        "analyze-btn",
+        "recommendations-body",
+        "crop_top",
+        "crop_bottom",
+        "crop_left",
+        "crop_right",
+        "mode",
+        "worker_image",
+        "status",
+        "events",
+        "cancel-btn",
+    ):
+        assert f'id="{control_id}"' in html
 
 
 def test_web_video_sources_listing_filters_outputs_and_non_video(tmp_path: Path, monkeypatch) -> None:

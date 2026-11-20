@@ -1061,126 +1061,451 @@ def create_app(
 
 _INDEX_HTML = """
 <!doctype html>
-<html lang="en">
+<html lang="fr">
 <head>
   <meta charset="utf-8"/>
-  <title>Vast Upscaler Local Web</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Vast Upscaler — Interface locale</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    fieldset { margin-bottom: 14px; }
-    details { margin-top: 10px; }
-    label { display: block; margin-top: 8px; }
-    input, select { width: 100%; padding: 6px; margin-top: 2px; }
-    button { padding: 8px 12px; margin-right: 8px; margin-top: 8px; }
-    #events { background: #111; color: #ddd; padding: 10px; white-space: pre-wrap; height: 300px; overflow: auto; }
-    .warn { color: #9a6700; font-weight: bold; }
+    :root {
+      --bg: #f7f8fb;
+      --surface: #ffffff;
+      --surface-alt: #f1f4fa;
+      --text: #1a2233;
+      --text-muted: #51607a;
+      --border: #d7deea;
+      --brand: #2f6feb;
+      --brand-contrast: #ffffff;
+      --success: #0a7a39;
+      --warning: #9a6700;
+      --danger: #b42318;
+      --shadow: 0 6px 24px rgba(23, 35, 58, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.4;
+    }
+
+    .app {
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 16px 32px;
+    }
+
+    .app-header {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 1.55rem;
+      font-weight: 700;
+    }
+
+    h2 {
+      margin: 0 0 10px;
+      font-size: 1.18rem;
+    }
+
+    h3 {
+      margin: 12px 0 8px;
+      font-size: 1rem;
+    }
+
+    p { margin: 0; }
+
+    .warn {
+      margin-top: 8px;
+      color: var(--warning);
+      font-weight: 600;
+    }
+
+    form { margin: 0; }
+
+    fieldset {
+      margin: 0 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      min-width: 0;
+    }
+
+    legend {
+      font-weight: 700;
+      padding: 0 8px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .step-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      font-size: 0.85rem;
+      font-weight: 700;
+    }
+
+    .section-help {
+      margin-top: 4px;
+      color: var(--text-muted);
+      font-size: 0.92rem;
+    }
+
+    label {
+      display: block;
+      margin-top: 10px;
+      font-weight: 600;
+      font-size: 0.93rem;
+    }
+
+    input, select {
+      width: 100%;
+      margin-top: 5px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 10px;
+      background: #fff;
+      color: var(--text);
+      font-size: 0.95rem;
+    }
+
+    input:focus, select:focus, button:focus-visible, details summary:focus-visible {
+      outline: 3px solid rgba(47, 111, 235, 0.24);
+      outline-offset: 1px;
+      border-color: var(--brand);
+    }
+
+    button {
+      border: 1px solid var(--brand);
+      background: var(--brand);
+      color: var(--brand-contrast);
+      border-radius: 10px;
+      padding: 9px 12px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+
+    button.secondary {
+      background: #fff;
+      color: var(--brand);
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .chips { display: flex; gap: 8px; flex-wrap: wrap; }
-    .chip { background: #f3f3f3; border-radius: 12px; padding: 2px 8px; font-size: 12px; }
-    .muted { color: #555; font-size: 13px; }
-    .status-line { margin-top: 6px; font-weight: bold; }
-    .hidden { display: none; }
-    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-    th, td { border: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: top; }
-    code { white-space: pre-wrap; word-break: break-word; }
+    .row-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .muted { color: var(--text-muted); font-size: 0.9rem; }
+    .status-line { margin-top: 8px; font-weight: 700; }
+    .hidden { display: none !important; }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      font-size: 0.82rem;
+      padding: 4px 9px;
+      margin: 3px 6px 0 0;
+      color: var(--text-muted);
+    }
+
+    .mode-note {
+      margin-top: 8px;
+      border: 1px dashed var(--border);
+      background: var(--surface-alt);
+      border-radius: 10px;
+      padding: 10px;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .radio-group {
+      margin-top: 8px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .radio-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      margin: 0;
+      cursor: pointer;
+    }
+
+    .radio-option input[type="radio"] {
+      width: 18px;
+      height: 18px;
+      margin: 0;
+      flex: 0 0 auto;
+    }
+
+    .recommendations-grid {
+      display: grid;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .recommendation-card {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: var(--surface-alt);
+    }
+
+    .recommendation-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .recommendation-title {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .confidence {
+      font-size: 0.82rem;
+      border-radius: 999px;
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      background: #fff;
+    }
+
+    .state-label {
+      font-size: 0.82rem;
+      font-weight: 700;
+      border-radius: 999px;
+      padding: 3px 8px;
+      border: 1px solid transparent;
+    }
+
+    .state-recommande { color: #0f5132; background: #d1f4e0; border-color: #90e0b5; }
+    .state-inutile { color: #2459a4; background: #dfeeff; border-color: #b8d2ff; }
+    .state-incertain { color: #7a5600; background: #fff1cc; border-color: #f5d77d; }
+    .state-indisponible { color: #7a7f8d; background: #eef0f4; border-color: #d8dde6; }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .kpi {
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 10px;
+      padding: 8px;
+    }
+
+    .kpi-label {
+      color: var(--text-muted);
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .kpi-value {
+      margin-top: 4px;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+
+    details {
+      margin-top: 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px 10px;
+    }
+
+    details summary {
+      cursor: pointer;
+      font-weight: 700;
+      color: var(--text);
+      list-style: none;
+    }
+
+    details summary::-webkit-details-marker { display: none; }
+
+    .result-box {
+      margin-top: 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      padding: 10px;
+    }
+
+    .result-box strong { display: block; margin-bottom: 4px; }
+
+    #events {
+      background: #101726;
+      color: #d9e2f3;
+      padding: 10px;
+      border-radius: 10px;
+      white-space: pre-wrap;
+      height: 260px;
+      overflow: auto;
+      margin-top: 8px;
+      border: 1px solid #1f314f;
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+
+    @media (max-width: 920px) {
+      .row, .row-3, .kpi-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h1>Vast Upscaler (local)</h1>
-  <p class="warn">Runs only on 127.0.0.1. API keys are never sent to the browser.</p>
-  <form id="job-form">
+  <main class="app">
+    <header class="app-header">
+      <h1>Vast Upscaler (local)</h1>
+      <p class="muted">Interface locale de traitement vidéo assisté Vast.ai (analyse et orchestration sur votre machine).</p>
+      <p class="warn">Sécurité : cette interface reste locale (127.0.0.1) et n’expose pas vos clés API au navigateur.</p>
+    </header>
+
+    <form id="job-form">
     <fieldset>
-      <legend>1) Choose video</legend>
-      <label>Source video (project video/ folder)
+      <legend><span class="step-badge">1</span>Choisir une vidéo</legend>
+      <p class="section-help">Sélectionnez une vidéo du dossier <code>video/</code>. Aucun upload HTTP n’est effectué.</p>
+      <label for="source_name">Vidéo source (dossier projet <code>video/</code>)
         <select id="source_name">
-          <option value="">-- Select a video --</option>
+          <option value="">-- Sélectionner une vidéo --</option>
         </select>
       </label>
-      <div class="chips">
-        <button type="button" id="refresh-sources-btn">Refresh</button>
+      <div class="actions">
+        <button type="button" id="refresh-sources-btn" class="secondary">Actualiser</button>
       </div>
       <div id="video-sources-dir" class="muted"></div>
       <div id="selected-source-meta" class="muted"></div>
+      <div id="video-selection-state" class="status-line muted"></div>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-label">Résolution</div><div id="video-kpi-resolution" class="kpi-value">n/a</div></div>
+        <div class="kpi"><div class="kpi-label">Durée</div><div id="video-kpi-duration" class="kpi-value">n/a</div></div>
+        <div class="kpi"><div class="kpi-label">FPS</div><div id="video-kpi-fps" class="kpi-value">n/a</div></div>
+        <div class="kpi"><div class="kpi-label">Taille</div><div id="video-kpi-size" class="kpi-value">n/a</div></div>
+      </div>
       <details>
-        <summary>Advanced options</summary>
-        <label>Input video path (manual override)
+        <summary>Options avancées — chemin manuel</summary>
+        <label for="input_path">Chemin vidéo manuel (dépannage / compatibilité)
           <input id="input_path" placeholder="C:\\\\path\\\\to\\\\video.mp4" />
         </label>
       </details>
     </fieldset>
 
     <fieldset>
-      <legend>2) Analyze</legend>
-      <div class="chips">
-        <button type="button" id="analyze-btn">Analyze selected video</button>
+      <legend><span class="step-badge">2</span>Analyser la source</legend>
+      <p class="section-help">Analyse locale : FFprobe + diagnostics visuels (cropdetect, idet…). Aucune location Vast.ai à cette étape.</p>
+      <div class="actions">
+        <button type="button" id="analyze-btn">Analyser la vidéo sélectionnée</button>
       </div>
-      <div id="analysis-status" class="status-line">idle</div>
+      <div id="analysis-status" class="status-line">En attente</div>
       <div id="analysis-summary" class="muted"></div>
     </fieldset>
 
     <fieldset>
-      <legend>3) Validate preprocessing</legend>
-      <h3>Recommended preprocessing</h3>
-      <div id="recommendation-status" class="muted">Run analysis to get recommendations.</div>
-      <table id="recommendations-table" class="hidden">
-        <thead>
-          <tr>
-            <th>Operation</th>
-            <th>Diagnostic</th>
-            <th>Recommendation</th>
-            <th>Confidence</th>
-            <th>Explanation</th>
-            <th>Validation / tweak command</th>
-          </tr>
-        </thead>
-        <tbody id="recommendations-body"></tbody>
-      </table>
-      <h3>Crop configuration</h3>
-      <label><input type="radio" name="crop_mode" value="preserve" checked /> Keep original frame</label>
-      <label><input type="radio" name="crop_mode" value="auto_crop" /> Apply recommended crop (if reliable)</label>
-      <label><input type="radio" name="crop_mode" value="custom_crop" /> Manual margins</label>
-      <div class="row">
-        <label>Top margin (px) <input id="crop_top" type="number" min="0" value="0" /></label>
-        <label>Bottom margin (px) <input id="crop_bottom" type="number" min="0" value="0" /></label>
+      <legend><span class="step-badge">3</span>Examiner et valider les prétraitements</legend>
+      <p class="section-help">Les recommandations sont issues du diagnostic. Seules les opérations compatibles worker sont exécutables à distance.</p>
+      <h3>Prétraitements recommandés</h3>
+      <div id="recommendation-status" class="muted">Lancez d’abord une analyse pour afficher les recommandations.</div>
+      <div id="recommendations-table" class="recommendations-grid hidden">
+        <div id="recommendations-body"></div>
+      </div>
+
+      <h3>Configuration du recadrage</h3>
+      <div class="radio-group" role="radiogroup" aria-label="Mode de recadrage">
+        <label class="radio-option"><input type="radio" name="crop_mode" value="preserve" checked />Conserver le cadrage original</label>
+        <label class="radio-option"><input type="radio" name="crop_mode" value="auto_crop" />Appliquer le recadrage recommandé</label>
+        <label class="radio-option"><input type="radio" name="crop_mode" value="custom_crop" />Définir des marges personnalisées</label>
       </div>
       <div class="row">
-        <label>Left margin (px) <input id="crop_left" type="number" min="0" value="0" /></label>
-        <label>Right margin (px) <input id="crop_right" type="number" min="0" value="0" /></label>
+        <label for="crop_top">Marge haut (px) <input id="crop_top" type="number" min="0" value="0" /></label>
+        <label for="crop_bottom">Marge bas (px) <input id="crop_bottom" type="number" min="0" value="0" /></label>
+      </div>
+      <div class="row">
+        <label for="crop_left">Marge gauche (px) <input id="crop_left" type="number" min="0" value="0" /></label>
+        <label for="crop_right">Marge droite (px) <input id="crop_right" type="number" min="0" value="0" /></label>
+      </div>
+      <div class="row-3">
+        <div class="kpi"><div class="kpi-label">Dimensions originales</div><div id="crop-source-dimensions" class="kpi-value">n/a</div></div>
+        <div class="kpi"><div class="kpi-label">Dimensions après crop</div><div id="crop-result-dimensions" class="kpi-value">n/a</div></div>
+        <div class="kpi"><div class="kpi-label">Réduction pixels</div><div id="crop-pixel-reduction" class="kpi-value">n/a</div></div>
       </div>
       <div id="crop-dimensions" class="muted"></div>
-      <div id="preprocessing-plan-status" class="status-line">No plan generated yet.</div>
-      <div class="muted">Unsupported remote operations are displayed as disabled (deinterlace/denoise/deblock in this phase).</div>
+      <div id="crop-applied-margins" class="muted"></div>
+      <div id="preprocessing-plan-status" class="status-line">Aucun plan généré pour le moment.</div>
+      <div class="muted">Exécutable à distance actuellement : recadrage. Les autres opérations restent informatives.</div>
     </fieldset>
 
     <fieldset>
-      <legend>4) Configure and launch upscale</legend>
-      <label>Mode
+      <legend><span class="step-badge">4</span>Configurer et lancer l’upscale</legend>
+      <label for="mode">Mode Vast.ai
         <select id="mode">
-          <option value="automatic">Automatic (create + cleanup)</option>
-          <option value="manual">Manual (existing instance, no auto-destroy)</option>
+          <option value="automatic">Automatique (recherche, création, traitement, nettoyage)</option>
+          <option value="manual">Manuel (instance existante, sans création/destruction auto)</option>
         </select>
       </label>
-      <div class="row">
-        <label>Target width <input id="target_width" type="number" min="1" /></label>
-        <label>Target height <input id="target_height" type="number" min="1" /></label>
+      <div id="mode-help" class="mode-note">
+        Mode automatique : l’application orchestre le cycle complet selon la logique existante.
       </div>
-      <label>Worker image tag <input id="worker_image" /></label>
-      <label>GPU model <select id="gpu_model"></select></label>
-      <label>Sort offers by
+      <div class="row">
+        <label for="target_width">Largeur cible <input id="target_width" type="number" min="1" /></label>
+        <label for="target_height">Hauteur cible <input id="target_height" type="number" min="1" /></label>
+      </div>
+      <label for="worker_image">Image Docker worker (tag/version)
+        <input id="worker_image" />
+      </label>
+      <div class="muted">Le tag proposé est le dernier connu localement. En mode manuel, changer ce champ ne modifie pas l’image d’une instance déjà démarrée.</div>
+      <label for="gpu_model">Modèle GPU <select id="gpu_model"></select></label>
+      <label for="sort_by">Tri des offres (mode automatique)
         <select id="sort_by">
-          <option value="price">price</option>
-          <option value="reliability">reliability</option>
+          <option value="price">prix</option>
+          <option value="reliability">fiabilité</option>
           <option value="performance">performance</option>
         </select>
       </label>
-      <label>Instance ID (manual mode required) <input id="instance_id" type="number" /></label>
+      <label for="instance_id">ID instance (obligatoire en mode manuel) <input id="instance_id" type="number" /></label>
       <details>
-        <summary>Advanced options</summary>
-        <label>Output path (optional) <input id="output_path" /></label>
-        <label>Report path (optional) <input id="report_path" /></label>
-        <label>Preprocessing plan path (manual override, optional) <input id="preprocessing_plan_path" /></label>
-        <label>Offer ID (automatic mode optional) <input id="offer_id" type="number" /></label>
-        <label>SSH bootstrap mode
+        <summary>Options avancées de lancement</summary>
+        <label for="output_path">Chemin sortie (optionnel) <input id="output_path" /></label>
+        <label for="report_path">Chemin rapport (optionnel) <input id="report_path" /></label>
+        <label for="preprocessing_plan_path">Chemin plan de prétraitement (prioritaire sur le plan IHM)</label>
+        <input id="preprocessing_plan_path" />
+        <label for="offer_id">Offer ID (optionnel, mode automatique) <input id="offer_id" type="number" /></label>
+        <label for="ssh_bootstrap_mode">Mode bootstrap SSH
           <select id="ssh_bootstrap_mode">
             <option value="tofu">tofu</option>
             <option value="strict">strict</option>
@@ -1188,14 +1513,38 @@ _INDEX_HTML = """
         </label>
       </details>
     </fieldset>
-    <button type="submit">Start</button>
-    <button type="button" id="cancel-btn">Cancel</button>
-  </form>
 
-  <h2>Status</h2>
-  <div id="status">idle</div>
-  <h2>Events</h2>
-  <div id="events"></div>
+    <div class="actions">
+      <button type="submit">Lancer le traitement</button>
+      <button type="button" id="cancel-btn" class="secondary">Annuler</button>
+    </div>
+    </form>
+
+    <fieldset>
+      <legend>Suivi du traitement</legend>
+      <p class="section-help">Les états ci-dessous reflètent les événements backend (SSE) réellement disponibles.</p>
+      <div class="row-3">
+        <div class="kpi"><div class="kpi-label">État courant</div><div id="status" class="kpi-value">idle</div></div>
+        <div class="kpi"><div class="kpi-label">Étape</div><div id="job-stage" class="kpi-value">n/a</div></div>
+        <div class="kpi"><div class="kpi-label">Progression</div><div id="job-progress" class="kpi-value">n/a</div></div>
+      </div>
+      <div class="row">
+        <div class="result-box">
+          <strong>Durée écoulée</strong>
+          <div id="job-elapsed" class="muted">n/a</div>
+        </div>
+        <div class="result-box">
+          <strong>Résultat</strong>
+          <div id="job-result" class="muted">Aucun résultat pour l’instant.</div>
+        </div>
+      </div>
+      <div id="job-error" class="status-line hidden" style="color: var(--danger);"></div>
+      <details>
+        <summary>Journal technique (SSE)</summary>
+        <div id="events"></div>
+      </details>
+    </fieldset>
+  </main>
 
   <script>
     let currentJobId = null;
@@ -1206,6 +1555,7 @@ _INDEX_HTML = """
     let latestPlanPayload = null;
     let analysisRequestToken = 0;
     let sourcesIndex = new Map();
+    let currentJobStartedAt = null;
     const handledPromptIds = new Set();
     const unsupportedRemoteOps = new Set(["deinterlace", "denoise", "deblock"]);
 
@@ -1223,6 +1573,36 @@ _INDEX_HTML = """
       return `${(size / (1024 ** 3)).toFixed(2)} GB`;
     }
 
+    function prettyDuration(seconds) {
+      if (typeof seconds !== "number" || Number.isNaN(seconds) || seconds < 0) return "n/a";
+      const rounded = Math.round(seconds);
+      const h = Math.floor(rounded / 3600);
+      const m = Math.floor((rounded % 3600) / 60);
+      const s = rounded % 60;
+      if (h > 0) return `${h}h ${m}m ${s}s`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    function prettyFps(fps) {
+      if (typeof fps !== "number" || Number.isNaN(fps) || fps <= 0) return "n/a";
+      return fps.toFixed(3).replace(/\\.000$/, "") + " fps";
+    }
+
+    function setStatusLabel(value) {
+      document.getElementById("status").textContent = value || "n/a";
+    }
+
+    function setModeHelp() {
+      const mode = document.getElementById("mode").value;
+      const box = document.getElementById("mode-help");
+      if (mode === "manual") {
+        box.textContent = "Mode manuel : vous louez et gérez l’instance vous-même. L’application ne crée ni ne détruit automatiquement l’instance.";
+      } else {
+        box.textContent = "Mode automatique : l’application recherche une offre, crée l’instance, exécute le traitement puis applique la logique de nettoyage existante.";
+      }
+    }
+
     function readCropMode() {
       const selected = document.querySelector("input[name='crop_mode']:checked");
       return selected ? selected.value : "preserve";
@@ -1237,10 +1617,74 @@ _INDEX_HTML = """
       };
     }
 
+    function setCropInputsDisabled(disabled) {
+      for (const id of ["crop_top", "crop_bottom", "crop_left", "crop_right"]) {
+        document.getElementById(id).disabled = disabled;
+      }
+    }
+
+    function getEnabledCropRectFromPlan() {
+      const operations = latestPlanPayload?.operations || [];
+      const cropOperation = operations.find((op) => op.operation_id === "crop" && op.enabled === true);
+      const rect = cropOperation?.parameters?.crop_rect;
+      if (!rect) return null;
+      if (!Number.isFinite(Number(rect.width)) || !Number.isFinite(Number(rect.height))) return null;
+      return {
+        x: Number(rect.x),
+        y: Number(rect.y),
+        width: Number(rect.width),
+        height: Number(rect.height),
+      };
+    }
+
+    function updateCropMetrics() {
+      const sourceInfo = document.getElementById("crop-source-dimensions");
+      const resultInfo = document.getElementById("crop-result-dimensions");
+      const reductionInfo = document.getElementById("crop-pixel-reduction");
+      const marginsInfo = document.getElementById("crop-applied-margins");
+      if (!latestAnalysisPayload || !latestAnalysisPayload.width || !latestAnalysisPayload.height) {
+        sourceInfo.textContent = "n/a";
+        resultInfo.textContent = "n/a";
+        reductionInfo.textContent = "n/a";
+        marginsInfo.textContent = "Marges appliquées : n/a";
+        return;
+      }
+      const srcW = Number(latestAnalysisPayload.width);
+      const srcH = Number(latestAnalysisPayload.height);
+      sourceInfo.textContent = `${srcW} x ${srcH}`;
+
+      const cropRect = getEnabledCropRectFromPlan();
+      let outW = srcW;
+      let outH = srcH;
+      let margins = { top: 0, bottom: 0, left: 0, right: 0 };
+      if (cropRect) {
+        outW = cropRect.width;
+        outH = cropRect.height;
+        margins = {
+          top: cropRect.y,
+          left: cropRect.x,
+          right: Math.max(0, srcW - (cropRect.x + cropRect.width)),
+          bottom: Math.max(0, srcH - (cropRect.y + cropRect.height)),
+        };
+      }
+      resultInfo.textContent = `${outW} x ${outH}`;
+      const srcPixels = srcW * srcH;
+      const outPixels = outW * outH;
+      const delta = srcPixels - outPixels;
+      if (delta <= 0) {
+        reductionInfo.textContent = "Aucune";
+      } else {
+        const pct = ((delta / srcPixels) * 100).toFixed(1);
+        reductionInfo.textContent = `${delta.toLocaleString("fr-FR")} px (${pct}%)`;
+      }
+      marginsInfo.textContent = `Marges appliquées : haut ${margins.top}px, bas ${margins.bottom}px, gauche ${margins.left}px, droite ${margins.right}px`;
+    }
+
     function updateCropDimensionsPreview() {
       const info = document.getElementById("crop-dimensions");
       if (!latestAnalysisPayload || !latestAnalysisPayload.width || !latestAnalysisPayload.height) {
-        info.textContent = "Resulting dimensions: n/a";
+        info.textContent = "Dimensions finales : n/a";
+        updateCropMetrics();
         return;
       }
       const srcW = Number(latestAnalysisPayload.width);
@@ -1250,21 +1694,41 @@ _INDEX_HTML = """
       if (preview && Number.isFinite(Number(preview.width)) && Number.isFinite(Number(preview.height))) {
         const planW = Number(preview.width);
         const planH = Number(preview.height);
-        info.textContent = `Resulting dimensions: ${planW} x ${planH} (from validated preprocessing plan)`;
+        info.textContent = `Dimensions finales : ${planW} x ${planH} (issues du plan validé)`;
+        updateCropMetrics();
         return;
       }
       if (mode === "auto_crop") {
-        info.textContent = `Resulting dimensions: ${srcW} x ${srcH} (waiting for validated plan or no reliable recommended crop)`;
+        info.textContent = `Dimensions finales : ${srcW} x ${srcH} (en attente du plan validé ou recadrage non fiable)`;
+        updateCropMetrics();
         return;
       }
       if (mode === "preserve") {
-        info.textContent = `Resulting dimensions: ${srcW} x ${srcH} (keep original frame)`;
+        info.textContent = `Dimensions finales : ${srcW} x ${srcH} (conservation du cadrage original)`;
+        updateCropMetrics();
         return;
       }
       const m = cropMarginsFromInputs();
       const outW = srcW - m.left - m.right;
       const outH = srcH - m.top - m.bottom;
-      info.textContent = `Resulting dimensions: ${outW} x ${outH} (source: ${srcW} x ${srcH})`;
+      info.textContent = `Dimensions finales : ${outW} x ${outH} (source : ${srcW} x ${srcH})`;
+      updateCropMetrics();
+    }
+
+    function recommendationStateLabel(rec, op) {
+      if (unsupportedRemoteOps.has(rec.key)) {
+        return { text: "Indisponible (worker)", css: "state-indisponible" };
+      }
+      if (op?.enabled) {
+        return { text: "Recommandé", css: "state-recommande" };
+      }
+      if (rec.recommended_action === "preserve" || rec.recommended_action === "avoid_deinterlace") {
+        return { text: "Inutile", css: "state-inutile" };
+      }
+      if (rec.confidence === "low" || rec.confidence === "unknown") {
+        return { text: "Incertain", css: "state-incertain" };
+      }
+      return { text: "Incertain", css: "state-incertain" };
     }
 
     function commandHintFor(opKey, planCropRect) {
@@ -1290,17 +1754,17 @@ _INDEX_HTML = """
         const crop = visual.cropdetect || {};
         const margins = crop.probable_margins;
         if (margins) {
-          return `cropdetect: status=${crop.status || "unknown"}, margins T${margins.top || 0}/B${margins.bottom || 0}/L${margins.left || 0}/R${margins.right || 0}`;
+          return `cropdetect : état=${crop.status || "unknown"}, marges H${margins.top || 0}/B${margins.bottom || 0}/G${margins.left || 0}/D${margins.right || 0}`;
         }
-        return `cropdetect: status=${crop.status || "unknown"}`;
+        return `cropdetect : état=${crop.status || "unknown"}`;
       }
       if (opKey === "deinterlace") {
         const idet = visual.idet || {};
-        return `idet: classification=${idet.classification || "indeterminate"}, status=${idet.status || "unknown"}`;
+        return `idet : classification=${idet.classification || "indeterminate"}, état=${idet.status || "unknown"}`;
       }
       if (opKey === "denoise" || opKey === "deblock") {
         const noise = visual.noise_artifacts || {};
-        return `noise/artifacts: noise=${noise.likely_noise || "unknown"}, compression=${noise.likely_compression_artifacts || "unknown"}, status=${noise.status || "unknown"}`;
+        return `bruit/artéfacts : bruit=${noise.likely_noise || "unknown"}, compression=${noise.likely_compression_artifacts || "unknown"}, état=${noise.status || "unknown"}`;
       }
       return "n/a";
     }
@@ -1316,33 +1780,45 @@ _INDEX_HTML = """
       const cropOp = byKey.get("crop");
       const cropRect = cropOp?.parameters?.crop_rect || null;
       const labels = {
-        crop: "Black-bar crop",
-        deinterlace: "Deinterlace",
-        denoise: "Noise reduction",
-        deblock: "Compression artifact reduction",
+        crop: "Recadrage des bandes noires",
+        deinterlace: "Désentrelacement",
+        denoise: "Réduction du bruit",
+        deblock: "Réduction des artéfacts de compression",
       };
 
       for (const rec of plan.recommendations || []) {
         const op = byKey.get(rec.key);
-        const tr = document.createElement("tr");
-        const disabledNote = unsupportedRemoteOps.has(rec.key)
-          ? "Disabled in this phase (worker does not execute it remotely)."
-          : "Executable remotely.";
-        tr.innerHTML = `
-          <td><strong>${labels[rec.key] || rec.key}</strong><div class="muted">${disabledNote}</div></td>
-          <td>${diagnosticSummaryFor(rec.key, analysis)}</td>
-          <td>${rec.recommended_action || "unknown"}</td>
-          <td>${rec.confidence || "unknown"}</td>
-          <td>${rec.reason || ""}</td>
-          <td><code>${commandHintFor(rec.key, cropRect)}</code></td>
+        const state = recommendationStateLabel(rec, op);
+        const block = document.createElement("article");
+        block.className = "recommendation-card";
+        const command = commandHintFor(rec.key, cropRect);
+        const executable = unsupportedRemoteOps.has(rec.key) ? "Non exécutable à distance dans cette phase." : "Exécutable à distance.";
+        const confidence = rec.confidence || "unknown";
+        const confidenceLabel = confidence === "high" ? "élevée" : confidence === "medium" ? "moyenne" : confidence === "low" ? "faible" : "inconnue";
+        block.innerHTML = `
+          <div class="recommendation-head">
+            <h4 class="recommendation-title">${labels[rec.key] || rec.key}</h4>
+            <div>
+              <span class="state-label ${state.css}">${state.text}</span>
+              <span class="confidence">Confiance : ${confidenceLabel}</span>
+            </div>
+          </div>
+          <div class="muted"><strong>Diagnostic</strong> : ${diagnosticSummaryFor(rec.key, analysis)}</div>
+          <div class="muted"><strong>Recommandation</strong> : ${rec.recommended_action || "unknown"}</div>
+          <div class="muted"><strong>Explication</strong> : ${rec.reason || "n/a"}</div>
+          <div class="muted"><strong>Exécution worker</strong> : ${executable}</div>
+          <details>
+            <summary>Détails techniques (commande de validation)</summary>
+            <code>${command}</code>
+          </details>
         `;
-        body.appendChild(tr);
+        body.appendChild(block);
       }
       setRecommendationTableVisible((plan.recommendations || []).length > 0);
       const warnings = (plan.warnings || []).join(" | ");
       document.getElementById("recommendation-status").textContent = warnings
-        ? `Recommendations ready. Warnings: ${warnings}`
-        : "Recommendations ready.";
+        ? `Recommandations prêtes. Avertissements : ${warnings}`
+        : "Recommandations prêtes.";
     }
 
     function currentUserChoices() {
@@ -1364,11 +1840,12 @@ _INDEX_HTML = """
       const res = await fetch("/api/video/sources");
       const data = await res.json();
       if (!res.ok) {
-        appendEvent("Failed to list video sources: " + (data.detail || JSON.stringify(data)));
+        appendEvent("Échec de lecture des vidéos : " + (data.detail || JSON.stringify(data)));
+        document.getElementById("video-selection-state").textContent = "Impossible de lire le dossier vidéo.";
         return;
       }
       const select = document.getElementById("source_name");
-      select.innerHTML = '<option value="">-- Select a video --</option>';
+      select.innerHTML = '<option value="">-- Sélectionner une vidéo --</option>';
       sourcesIndex = new Map();
       for (const item of data.sources || []) {
         const opt = document.createElement("option");
@@ -1378,14 +1855,19 @@ _INDEX_HTML = """
         select.appendChild(opt);
         sourcesIndex.set(item.name, item);
       }
-      document.getElementById("video-sources-dir").textContent = `Sources directory: ${data.directory}`;
-      appendEvent(`Video sources refreshed: ${(data.sources || []).length} selectable file(s).`);
+      document.getElementById("video-sources-dir").textContent = `Dossier source : ${data.directory}`;
+      if ((data.sources || []).length === 0) {
+        document.getElementById("video-selection-state").textContent = "Aucune vidéo détectée dans le dossier video/.";
+      } else {
+        document.getElementById("video-selection-state").textContent = `${data.sources.length} vidéo(s) disponible(s).`;
+      }
+      appendEvent(`Liste des vidéos actualisée : ${(data.sources || []).length} fichier(s) sélectionnable(s).`);
     }
 
     async function rebuildPlanFromCurrentAnalysis(token) {
       if (!latestAnalysisPayload) return;
       const planStatus = document.getElementById("preprocessing-plan-status");
-      planStatus.textContent = "Building preprocessing plan...";
+      planStatus.textContent = "Génération du plan de prétraitement…";
       updateCropDimensionsPreview();
       const response = await fetch("/api/video/preprocessing-plan", {
         method: "POST",
@@ -1399,7 +1881,7 @@ _INDEX_HTML = """
       if (token !== analysisRequestToken) return;
       if (!response.ok) {
         latestPlanPayload = null;
-        planStatus.textContent = "Preprocessing plan error: " + (payload.detail || JSON.stringify(payload));
+        planStatus.textContent = "Erreur de plan de prétraitement : " + (payload.detail || JSON.stringify(payload));
         setRecommendationTableVisible(false);
         updateCropDimensionsPreview();
         return;
@@ -1409,14 +1891,14 @@ _INDEX_HTML = """
       renderRecommendations(payload, latestAnalysisPayload);
       const enabled = (payload.operations || []).filter(op => op.enabled).map(op => op.operation_id);
       planStatus.textContent = enabled.length
-        ? `Plan ready. Enabled operations: ${enabled.join(", ")}`
-        : "Plan ready. No operation is enabled (legacy behavior on launch).";
+        ? `Plan prêt. Opérations activées : ${enabled.join(", ")}`
+        : "Plan prêt. Aucune opération activée (comportement inchangé).";
     }
 
     async function analyzeSelectedSource() {
       const sourceName = document.getElementById("source_name").value;
       if (!sourceName) {
-        document.getElementById("analysis-status").textContent = "No source selected.";
+        document.getElementById("analysis-status").textContent = "Aucune source sélectionnée.";
         return;
       }
       const token = ++analysisRequestToken;
@@ -1424,9 +1906,9 @@ _INDEX_HTML = """
       latestPlanPayload = null;
       updateCropDimensionsPreview();
       setRecommendationTableVisible(false);
-      document.getElementById("analysis-status").textContent = "Analysis running...";
+      document.getElementById("analysis-status").textContent = "Analyse en cours…";
       document.getElementById("analysis-summary").textContent = "";
-      document.getElementById("recommendation-status").textContent = "Waiting for analysis...";
+      document.getElementById("recommendation-status").textContent = "Analyse en cours…";
       const response = await fetch("/api/video/analyze", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -1438,15 +1920,21 @@ _INDEX_HTML = """
       const payload = await response.json();
       if (token !== analysisRequestToken) return;
       if (!response.ok) {
-        document.getElementById("analysis-status").textContent = "Analysis failed.";
+        document.getElementById("analysis-status").textContent = "Échec de l’analyse.";
         document.getElementById("analysis-summary").textContent = payload.detail || JSON.stringify(payload);
+        document.getElementById("video-kpi-resolution").textContent = "n/a";
+        document.getElementById("video-kpi-duration").textContent = "n/a";
+        document.getElementById("video-kpi-fps").textContent = "n/a";
         updateCropDimensionsPreview();
         return;
       }
       latestAnalysisPayload = payload;
-      const dims = payload.width && payload.height ? `${payload.width} x ${payload.height}` : "unknown size";
-      document.getElementById("analysis-status").textContent = "Analysis completed.";
-      document.getElementById("analysis-summary").textContent = `Codec: ${payload.video_codec || "unknown"}, ${dims}, fps: ${payload.frame_rate_fps || "unknown"}`;
+      const dims = payload.width && payload.height ? `${payload.width} x ${payload.height}` : "inconnue";
+      document.getElementById("analysis-status").textContent = "Analyse terminée.";
+      document.getElementById("analysis-summary").textContent = `Codec : ${payload.video_codec || "inconnu"}, résolution : ${dims}, cadence : ${prettyFps(Number(payload.frame_rate_fps || 0))}`;
+      document.getElementById("video-kpi-resolution").textContent = dims;
+      document.getElementById("video-kpi-duration").textContent = prettyDuration(Number(payload.duration_seconds || 0));
+      document.getElementById("video-kpi-fps").textContent = prettyFps(Number(payload.frame_rate_fps || 0));
       updateCropDimensionsPreview();
       await rebuildPlanFromCurrentAnalysis(token);
     }
@@ -1456,10 +1944,13 @@ _INDEX_HTML = """
       const meta = sourcesIndex.get(selected);
       if (!selected || !meta) {
         document.getElementById("selected-source-meta").textContent = "";
+        document.getElementById("video-selection-state").textContent = "Sélection invalide.";
         return;
       }
       const modified = meta.modified_at ? new Date(meta.modified_at).toLocaleString() : "n/a";
-      document.getElementById("selected-source-meta").textContent = `Selected: ${meta.name} | ${prettyBytes(meta.size_bytes)} | modified ${modified}`;
+      document.getElementById("selected-source-meta").textContent = `Fichier sélectionné : ${meta.name} | ${prettyBytes(meta.size_bytes)} | modifié ${modified}`;
+      document.getElementById("video-selection-state").textContent = "Source valide.";
+      document.getElementById("video-kpi-size").textContent = prettyBytes(meta.size_bytes);
       analyzeSelectedSource();
     }
 
@@ -1470,7 +1961,7 @@ _INDEX_HTML = """
       document.getElementById("target_height").value = cfg.target_height;
       document.getElementById("worker_image").value = cfg.worker_image_latest_known;
       if (cfg.worker_image_required) {
-        appendEvent("No reliable worker image default is known. Enter an explicit real tag before automatic mode.");
+        appendEvent("Aucun tag worker fiable par défaut n’est connu. Renseignez un tag explicite en mode automatique.");
       }
       const gpu = document.getElementById("gpu_model");
       gpu.innerHTML = "";
@@ -1480,7 +1971,7 @@ _INDEX_HTML = """
         opt.textContent = model;
         gpu.appendChild(opt);
       }
-      appendEvent("Default worker image (latest known): " + cfg.worker_image_latest_known);
+      appendEvent("Tag worker par défaut (dernier connu) : " + cfg.worker_image_latest_known);
     }
 
     async function answerPrompt(jobId, prompt) {
@@ -1488,7 +1979,7 @@ _INDEX_HTML = """
       handledPromptIds.add(prompt.prompt_id);
       promptDialogOpen = true;
       if (prompt.kind === "verified_fingerprint") {
-        const fp = window.prompt(prompt.message + "\\n\\nEnter independently verified SHA256 fingerprint:");
+        const fp = window.prompt(prompt.message + "\\n\\nEntrez l’empreinte SHA256 vérifiée indépendamment :");
         await fetch(`/api/jobs/${jobId}/prompts/${prompt.prompt_id}`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
@@ -1516,6 +2007,58 @@ _INDEX_HTML = """
       await answerPrompt(jobId, prompt);
     }
 
+    function updateJobSummaryFromEvent(data) {
+      const type = data.type;
+      const payload = data.payload || {};
+      if (type === "status") {
+        const state = payload.state || payload.message || "running";
+        setStatusLabel(state);
+        if (payload.message) {
+          document.getElementById("job-stage").textContent = payload.message;
+        }
+      } else if (type === "provisioning") {
+        const phase = payload.phase || payload.status || "provisioning";
+        document.getElementById("job-stage").textContent = String(phase);
+      } else if (type === "worker") {
+        const stage = payload.stage || "worker";
+        document.getElementById("job-stage").textContent = String(stage);
+        const framesDone = payload.frames_done;
+        const framesTotal = payload.frames_total;
+        const fps = payload.fps_processing;
+        if (Number.isFinite(Number(framesDone)) && Number.isFinite(Number(framesTotal)) && Number(framesTotal) > 0) {
+          const pct = ((Number(framesDone) / Number(framesTotal)) * 100).toFixed(1);
+          document.getElementById("job-progress").textContent = `${pct}% (${framesDone}/${framesTotal})`;
+        } else if (Number.isFinite(Number(framesDone))) {
+          document.getElementById("job-progress").textContent = `${framesDone} images traitées`;
+        } else {
+          document.getElementById("job-progress").textContent = "n/a";
+        }
+        if (Number.isFinite(Number(payload.elapsed_seconds))) {
+          document.getElementById("job-elapsed").textContent = prettyDuration(Number(payload.elapsed_seconds));
+        } else if (currentJobStartedAt) {
+          const elapsed = (Date.now() - currentJobStartedAt) / 1000;
+          document.getElementById("job-elapsed").textContent = prettyDuration(elapsed);
+        }
+        if (Number.isFinite(Number(fps))) {
+          document.getElementById("analysis-summary").textContent = `Cadence de traitement en cours : ${prettyFps(Number(fps))}`;
+        }
+      } else if (type === "result") {
+        setStatusLabel("completed");
+        document.getElementById("job-stage").textContent = String(payload.state || "completed");
+        document.getElementById("job-progress").textContent = "Terminé";
+        document.getElementById("job-elapsed").textContent = prettyDuration(Number(payload.duration_seconds || 0));
+        const outputPath = payload.output_path || "n/a";
+        const reportPath = payload.report_path || "n/a";
+        document.getElementById("job-result").innerHTML = `Sortie : <code>${outputPath}</code><br/>Rapport : <code>${reportPath}</code>`;
+      } else if (type === "error") {
+        setStatusLabel("failed");
+        document.getElementById("job-error").classList.remove("hidden");
+        document.getElementById("job-error").textContent = "Erreur : " + String(payload.message || "échec inconnu");
+      } else if (type === "prompt") {
+        document.getElementById("job-stage").textContent = "Confirmation requise";
+      }
+    }
+
     function watchEvents(jobId) {
       if (es) es.close();
       es = new EventSource(`/api/jobs/${jobId}/events?last_event_id=${lastEventId}`);
@@ -1523,11 +2066,12 @@ _INDEX_HTML = """
         const data = JSON.parse(evt.data);
         lastEventId = data.id;
         appendEvent(`[${data.type}] ${JSON.stringify(data.payload)}`);
+        updateJobSummaryFromEvent(data);
         if (data.type === "prompt") {
           await maybeHandlePrompt(jobId, data.payload);
         }
         if (data.type === "result" || data.type === "error") {
-          document.getElementById("status").textContent = data.type === "result" ? "completed" : "failed";
+          setStatusLabel(data.type === "result" ? "completed" : "failed");
         }
       };
     }
@@ -1537,7 +2081,7 @@ _INDEX_HTML = """
       const sourceName = document.getElementById("source_name").value || null;
       const manualInput = document.getElementById("input_path").value.trim();
       if (!sourceName && !manualInput) {
-        appendEvent("Start failed: choose a source from video/ or provide a manual input path in advanced options.");
+        appendEvent("Échec du démarrage : sélectionnez une source video/ ou fournissez un chemin manuel (options avancées).");
         return;
       }
       const manualPlanPath = document.getElementById("preprocessing_plan_path").value.trim() || null;
@@ -1568,32 +2112,42 @@ _INDEX_HTML = """
       });
       const data = await response.json();
       if (!response.ok) {
-        appendEvent("Start failed: " + (data.detail || JSON.stringify(data)));
+        appendEvent("Échec du démarrage : " + (data.detail || JSON.stringify(data)));
+        document.getElementById("job-error").classList.remove("hidden");
+        document.getElementById("job-error").textContent = "Erreur : " + (data.detail || "démarrage refusé");
         return;
       }
       if (manualPlanPath && latestPlanPayload) {
-        appendEvent("Manual preprocessing plan path is set: it overrides UI-generated preprocessing choices.");
+        appendEvent("Un plan manuel est défini : il priorise les choix de prétraitement de l’IHM.");
       }
       currentJobId = data.job_id;
       lastEventId = 0;
+      currentJobStartedAt = Date.now();
       handledPromptIds.clear();
       promptDialogOpen = false;
-      document.getElementById("status").textContent = "running";
-      appendEvent("Job started: " + currentJobId);
+      document.getElementById("job-error").classList.add("hidden");
+      document.getElementById("job-error").textContent = "";
+      document.getElementById("job-result").textContent = "Traitement démarré…";
+      document.getElementById("job-progress").textContent = "n/a";
+      document.getElementById("job-stage").textContent = "Initialisation";
+      setStatusLabel("running");
+      appendEvent("Traitement démarré : " + currentJobId);
       watchEvents(currentJobId);
     });
 
     document.getElementById("cancel-btn").addEventListener("click", async () => {
       if (!currentJobId) return;
       await fetch(`/api/jobs/${currentJobId}/cancel`, {method: "POST"});
-      appendEvent("Cancel requested.");
+      appendEvent("Annulation demandée.");
     });
 
+    document.getElementById("mode").addEventListener("change", setModeHelp);
     document.getElementById("refresh-sources-btn").addEventListener("click", loadVideoSources);
     document.getElementById("source_name").addEventListener("change", selectedSourceChanged);
     document.getElementById("analyze-btn").addEventListener("click", analyzeSelectedSource);
     for (const radio of document.querySelectorAll("input[name='crop_mode']")) {
       radio.addEventListener("change", async () => {
+        setCropInputsDisabled(readCropMode() !== "custom_crop");
         updateCropDimensionsPreview();
         const token = ++analysisRequestToken;
         await rebuildPlanFromCurrentAnalysis(token);
@@ -1608,6 +2162,8 @@ _INDEX_HTML = """
       });
     }
 
+    setCropInputsDisabled(true);
+    setModeHelp();
     loadDefaults();
     loadVideoSources();
   </script>

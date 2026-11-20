@@ -218,6 +218,21 @@ V1 behavior:
 - `Preprocessing plan path (optional)` remains available under Advanced options.
 - If both a generated in-UI preprocessing plan and a manual preprocessing plan path are provided, the manual path takes precedence.
 - In this phase, only crop is executed remotely; other recommendations (deinterlace/denoise/deblock) are displayed as disabled/advisory in UI.
+- Interface ergonomique (phase 5F):
+  - entièrement en français, sections visuelles par étape, largeur max adaptée aux écrans de bureau
+  - recommandations présentées en cartes lisibles (diagnostic, recommandation, confiance, état)
+  - commandes FFmpeg visibles uniquement dans des détails techniques repliables
+  - recadrage avec boutons radio adjacents au libellé et désactivation visuelle des marges manuelles hors mode personnalisé
+  - supervision enrichie: état courant, étape, progression (si fournie), durée, résultat, erreurs, journal SSE repliable
+
+Validation manuelle rapide de l'IHM:
+
+1. Démarrer l’UI locale puis ouvrir `http://127.0.0.1:8765`.
+2. Étape 1: choisir une vidéo du dossier `video/` (vérifier nom, taille, résolution, durée, FPS).
+3. Étape 2: lancer/attendre l’analyse locale (statut + résumé).
+4. Étape 3: vérifier les recommandations, changer le mode crop, confirmer les dimensions finales (issues du plan validé).
+5. Étape 4: choisir mode Vast.ai automatique ou manuel, vérifier le message contextuel du mode.
+6. Lancer un job, vérifier le suivi (état, étape, progression si disponible, durée, résultat), tester annulation et prompts de confirmation.
 
 Produced files and local state:
 
