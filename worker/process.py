@@ -63,6 +63,7 @@ class ProcessingReport:
     gpu: str
     notes: list[str]
     preprocessing_plan: dict | None = None
+    comparison_context: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -268,6 +269,32 @@ def main() -> int:
                 gpu=RealesrganUpscaler.detect_gpu_name(),
                 notes=notes,
                 preprocessing_plan=preprocessing_plan_summary,
+                comparison_context={
+                    "resolutions": {
+                        "source": {"width": source.width, "height": source.height},
+                        "effective_after_preprocessing": {
+                            "width": source_width_for_upscale,
+                            "height": source_height_for_upscale,
+                        },
+                        "target_canvas": {"width": target_width, "height": target_height},
+                    },
+                    "upscaler": {
+                        "engine": "realesrgan",
+                        "model": model.model_name,
+                        "profile": args.profile,
+                        "model_scale": model.model_scale,
+                        "tile": model.tile,
+                        "tile_pad": model.tile_pad,
+                        "pre_pad": model.pre_pad,
+                    },
+                    "encoding": {
+                        "container": output_path.suffix.lstrip(".") or None,
+                        "video_codec": "libx265",
+                        "preset": "medium",
+                        "crf": args.video_crf,
+                        "pixel_format": "yuv420p",
+                    },
+                },
             )
             write_report(report_path, report)
             progress.emit(stage="completed", frames_done=frames_processed, frames_total=frames_total, force=True)
@@ -597,6 +624,50 @@ def write_report(path: Path, report: ProcessingReport) -> None:
     }
     if report.preprocessing_plan is not None:
         payload["preprocessing_plan"] = report.preprocessing_plan
+    payload["report_schema_version"] = "2.0"
+    payload["instance_metadata"] = {
+        "instance_id": None,
+        "offer_id": None,
+        "host_id": None,
+        "sensitive_identifiers_included": False,
+    }
+    payload["processing_context"] = report.comparison_context or {}
+    payload["telemetry"] = {
+        "sampling_interval_seconds": None,
+        "raw_samples": [],
+        "aggregates": {},
+    }
+    payload["transfer_metrics"] = {
+        "upload": {"duration_seconds": None, "bytes_transferred": None, "average_bytes_per_second": None},
+        "download": {"duration_seconds": None, "bytes_transferred": None, "average_bytes_per_second": None},
+    }
+    payload["timings"] = {
+        "processing_seconds": round(report.processing_seconds, 3),
+        "upload_seconds": None,
+        "download_seconds": None,
+        "total_job_seconds": None,
+    }
+    payload["cost_estimate"] = {
+        "currency": "USD",
+        "gpu_processing_cost_estimated": None,
+        "total_job_cost_estimated": None,
+        "note": "Estimated cost fields are populated in orchestration/report-enrichment phases.",
+    }
+    payload["metric_schema"] = {
+        "provenance_values": ["observed", "declared", "estimated"],
+        "units": {
+            "duration": "seconds",
+            "throughput": "bytes/second",
+            "data_size": "bytes",
+            "frame_rate": "frames/second",
+            "temperature": "celsius",
+            "power": "watts",
+            "frequency": "MHz",
+            "memory": "bytes",
+            "cost": "USD",
+        },
+    }
+    payload["collection_warnings"] = []
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 

@@ -68,6 +68,43 @@ def test_write_report(tmp_path: Path) -> None:
     assert payload["frames_processed"] == 100
 
 
+def test_write_report_includes_v2_schema_and_comparison_context(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    report = ProcessingReport(
+        status="completed",
+        source="in.mkv",
+        output="out.mkv",
+        model="realesrgan",
+        profile="balanced",
+        frames_processed=100,
+        processing_seconds=50.0,
+        processing_fps=2.0,
+        gpu="RTX 3090",
+        notes=["ok"],
+        comparison_context={
+            "resolutions": {
+                "source": {"width": 640, "height": 480},
+                "effective_after_preprocessing": {"width": 628, "height": 408},
+                "target_canvas": {"width": 1920, "height": 1080},
+            },
+            "upscaler": {"engine": "realesrgan", "model": "RealESRGAN_x4plus", "profile": "balanced"},
+            "encoding": {"video_codec": "libx265", "crf": 20, "pixel_format": "yuv420p"},
+        },
+    )
+
+    write_report(report_path, report)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert payload["report_schema_version"] == "2.0"
+    assert payload["processing_context"]["resolutions"]["source"] == {"width": 640, "height": 480}
+    assert payload["processing_context"]["resolutions"]["effective_after_preprocessing"] == {"width": 628, "height": 408}
+    assert payload["processing_context"]["resolutions"]["target_canvas"] == {"width": 1920, "height": 1080}
+    assert payload["telemetry"]["raw_samples"] == []
+    assert payload["telemetry"]["aggregates"] == {}
+    assert payload["instance_metadata"]["sensitive_identifiers_included"] is False
+    assert payload["metric_schema"]["units"]["duration"] == "seconds"
+
+
 def test_validate_output_fps_tolerance(tmp_path: Path, monkeypatch) -> None:
     output_path = tmp_path / "out.mkv"
     output_path.write_bytes(b"x")

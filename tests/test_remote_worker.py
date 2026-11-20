@@ -435,3 +435,38 @@ def test_execute_remote_worker_ignores_malformed_progress_events(tmp_path: Path,
     worker_events = [item for item in events if item.get("kind") == "worker"]
     assert len(worker_events) == 1
     assert worker_events[0]["frames_done"] == 12
+
+
+def test_execute_remote_worker_accepts_v2_report_enrichment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _conn(tmp_path)
+    request = _request(tmp_path)
+    transport = FakeTransport()
+    remote_output = "/workspace/upscale-sessions/session-D-01/output/result video.mp4"
+    transport.report_payload = json.dumps(
+        {
+            "status": "completed",
+            "output": remote_output,
+            "frames_processed": 42,
+            "report_schema_version": "2.0",
+            "processing_context": {
+                "resolutions": {
+                    "source": {"width": 640, "height": 480},
+                    "effective_after_preprocessing": {"width": 628, "height": 408},
+                    "target_canvas": {"width": 1920, "height": 1080},
+                }
+            },
+            "telemetry": {"raw_samples": [], "aggregates": {}},
+        }
+    ).encode("utf-8")
+
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.inspect_video",
+        lambda *_a, **_k: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=12.0),
+    )
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.run_ffprobe",
+        lambda *_a, **_k: {"streams": [{"codec_type": "video", "nb_frames": "42"}]},
+    )
+
+    result = execute_remote_worker(transport=transport, connection=conn, request=request)
+    assert result.frames_processed == 42
