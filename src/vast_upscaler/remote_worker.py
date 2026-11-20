@@ -7,6 +7,7 @@ import posixpath
 import re
 import shlex
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +98,20 @@ class RemoteWorkerResult:
     output_frame_count: int | None
     local_output_path: Path
     local_report_path: Path
+    transfer_metrics: dict[str, object] | None = None
+    timings: dict[str, object] | None = None
+
+
+@dataclass
+class _TransferTimingState:
+    upload_seconds: float | None = None
+    remote_execution_seconds: float | None = None
+    download_seconds: float | None = None
+    total_job_seconds: float | None = None
+    worker_processing_seconds: float | None = None
+    upload_bytes: int | None = None
+    download_bytes: int | None = None
+    warnings: list[str] | None = None
 
 
 def execute_remote_worker(
@@ -106,12 +121,18 @@ def execute_remote_worker(
     request: RemoteWorkerRequest,
     progress_callback: ProgressCallback | None = None,
 ) -> RemoteWorkerResult:
+    started_total = time.perf_counter()
+    timing_state = _TransferTimingState(warnings=[])
     paths = _build_remote_paths(request)
     _prepare_remote_dirs(transport=transport, connection=connection, paths=paths)
+
+    report_payload: dict | None = None
+    downloaded_report_size: int | None = None
 
     try:
         if progress_callback is not None:
             progress_callback({"kind": "transfer", "stage": "upload", "status": "started"})
+        upload_started = time.perf_counter()
         uploaded_input = transport.upload_file(
             connection,
             local_path=request.local_input_path,
@@ -119,14 +140,20 @@ def execute_remote_worker(
             timeout_seconds=request.upload_timeout_seconds,
             retry_policy=RetryPolicy(max_attempts=1),
         )
+        timing_state.upload_bytes = _safe_file_size(request.local_input_path)
+        if timing_state.upload_bytes is None:
+            timing_state.warnings.append("transfer_upload_size_unavailable: could not read local input file size")
         if progress_callback is not None:
             progress_callback({"kind": "transfer", "stage": "upload", "status": "completed"})
+        timing_state.upload_seconds = max(0.0, time.perf_counter() - upload_started)
     except TransferError as exc:
+        timing_state.upload_seconds = max(0.0, time.perf_counter() - upload_started) if "upload_started" in locals() else None
         raise RemoteWorkerTransferError(f"Input upload failed: {exc}") from exc
 
     uploaded_preprocessing_plan: str | None = None
     if request.preprocessing_contract is not None:
         try:
+            plan_bytes = len(json.dumps(request.preprocessing_contract, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
             uploaded_preprocessing_plan = _upload_preprocessing_contract(
                 transport=transport,
                 connection=connection,
@@ -134,6 +161,9 @@ def execute_remote_worker(
                 contract_payload=request.preprocessing_contract,
                 timeout_seconds=request.upload_timeout_seconds,
             )
+            if timing_state.upload_bytes is None:
+                timing_state.upload_bytes = 0
+            timing_state.upload_bytes += plan_bytes
         except TransferError as exc:
             raise RemoteWorkerTransferError(f"Preprocessing contract upload failed: {exc}") from exc
 
@@ -153,6 +183,7 @@ def execute_remote_worker(
             if progress_callback is not None:
                 progress_callback(event)
 
+        remote_started = time.perf_counter()
         process_result = transport.run_remote_command(
             connection,
             command=command,
@@ -162,7 +193,9 @@ def execute_remote_worker(
             check=False,
             stdout_line_callback=_on_stdout_line,
         )
+        timing_state.remote_execution_seconds = max(0.0, time.perf_counter() - remote_started)
     except (SshTimeoutError, SshConnectionError) as exc:
+        timing_state.remote_execution_seconds = max(0.0, time.perf_counter() - remote_started) if "remote_started" in locals() else None
         _raise_ambiguous_after_probe(
             transport=transport,
             connection=connection,
@@ -170,6 +203,7 @@ def execute_remote_worker(
             original_error=exc,
         )
 
+    download_started = time.perf_counter()
     try:
         report_payload = _download_and_parse_report(
             transport=transport,
@@ -178,7 +212,11 @@ def execute_remote_worker(
             local_report_path=request.local_report_path,
             timeout_seconds=request.download_timeout_seconds,
         )
+        downloaded_report_size = _safe_file_size(request.local_report_path)
+        if downloaded_report_size is None:
+            timing_state.warnings.append("transfer_download_size_unavailable: could not read downloaded report size")
     except RemoteWorkerReportError as exc:
+        timing_state.download_seconds = max(0.0, time.perf_counter() - download_started)
         if process_result.returncode != 0 and request.preprocessing_contract is not None:
             stderr = (process_result.stderr or "").strip().lower()
             if "unrecognized arguments" in stderr and "--preprocessing-plan" in stderr:
@@ -189,6 +227,17 @@ def execute_remote_worker(
         raise
 
     if process_result.returncode != 0:
+        timing_state.download_seconds = max(0.0, time.perf_counter() - download_started)
+        timing_state.worker_processing_seconds = _as_optional_float(report_payload.get("processing_seconds"))
+        if timing_state.worker_processing_seconds is None:
+            timing_state.warnings.append("timing_processing_unavailable: worker processing_seconds missing from report")
+        timing_state.download_bytes = downloaded_report_size
+        timing_state.total_job_seconds = max(0.0, time.perf_counter() - started_total)
+        _persist_enriched_report(
+            report_payload=report_payload,
+            local_report_path=request.local_report_path,
+            timing_state=timing_state,
+        )
         details = _report_failure_details(report_payload)
         raise RemoteWorkerProcessError(
             f"Remote worker returned non-zero exit code {process_result.returncode}. "
@@ -198,25 +247,69 @@ def execute_remote_worker(
 
     if progress_callback is not None:
         progress_callback({"kind": "transfer", "stage": "download", "status": "started"})
-    local_output_path = _download_output_video(
-        transport=transport,
-        connection=connection,
-        remote_output_path=paths.remote_output_path,
-        local_output_path=request.local_output_path,
-        timeout_seconds=request.download_timeout_seconds,
-    )
+    try:
+        local_output_path = _download_output_video(
+            transport=transport,
+            connection=connection,
+            remote_output_path=paths.remote_output_path,
+            local_output_path=request.local_output_path,
+            timeout_seconds=request.download_timeout_seconds,
+        )
+    except RemoteWorkerOutputError:
+        timing_state.download_seconds = max(0.0, time.perf_counter() - download_started)
+        timing_state.worker_processing_seconds = _as_optional_float(report_payload.get("processing_seconds"))
+        if timing_state.worker_processing_seconds is None:
+            timing_state.warnings.append("timing_processing_unavailable: worker processing_seconds missing from report")
+        timing_state.download_bytes = downloaded_report_size
+        timing_state.total_job_seconds = max(0.0, time.perf_counter() - started_total)
+        _persist_enriched_report(
+            report_payload=report_payload,
+            local_report_path=request.local_report_path,
+            timing_state=timing_state,
+        )
+        raise
     if progress_callback is not None:
         progress_callback({"kind": "transfer", "stage": "download", "status": "completed"})
 
-    video_info = _validate_local_output_video(
-        output_path=local_output_path,
-        target_width=request.target_width,
-        target_height=request.target_height,
-        ffprobe_bin=request.ffprobe_bin,
+    try:
+        video_info = _validate_local_output_video(
+            output_path=local_output_path,
+            target_width=request.target_width,
+            target_height=request.target_height,
+            ffprobe_bin=request.ffprobe_bin,
+        )
+        output_frame_count = _probe_optional_frame_count(local_output_path, ffprobe_bin=request.ffprobe_bin)
+        if output_frame_count is not None and output_frame_count <= 0:
+            raise RemoteWorkerOutputError("Output frame count is available but invalid (<= 0).")
+    except RemoteWorkerOutputError:
+        timing_state.download_seconds = max(0.0, time.perf_counter() - download_started)
+        timing_state.worker_processing_seconds = _as_optional_float(report_payload.get("processing_seconds"))
+        if timing_state.worker_processing_seconds is None:
+            timing_state.warnings.append("timing_processing_unavailable: worker processing_seconds missing from report")
+        output_size = _safe_file_size(local_output_path)
+        timing_state.download_bytes = _sum_optional_ints(downloaded_report_size, output_size)
+        timing_state.total_job_seconds = max(0.0, time.perf_counter() - started_total)
+        _persist_enriched_report(
+            report_payload=report_payload,
+            local_report_path=request.local_report_path,
+            timing_state=timing_state,
+        )
+        raise
+
+    timing_state.download_seconds = max(0.0, time.perf_counter() - download_started)
+    timing_state.worker_processing_seconds = _as_optional_float(report_payload.get("processing_seconds"))
+    if timing_state.worker_processing_seconds is None:
+        timing_state.warnings.append("timing_processing_unavailable: worker processing_seconds missing from report")
+    output_size = _safe_file_size(local_output_path)
+    if output_size is None:
+        timing_state.warnings.append("transfer_download_size_unavailable: could not read downloaded output size")
+    timing_state.download_bytes = _sum_optional_ints(downloaded_report_size, output_size)
+    timing_state.total_job_seconds = max(0.0, time.perf_counter() - started_total)
+    report_payload = _persist_enriched_report(
+        report_payload=report_payload,
+        local_report_path=request.local_report_path,
+        timing_state=timing_state,
     )
-    output_frame_count = _probe_optional_frame_count(local_output_path, ffprobe_bin=request.ffprobe_bin)
-    if output_frame_count is not None and output_frame_count <= 0:
-        raise RemoteWorkerOutputError("Output frame count is available but invalid (<= 0).")
 
     return RemoteWorkerResult(
         session_id=request.session_id,
@@ -231,6 +324,8 @@ def execute_remote_worker(
         output_frame_count=output_frame_count,
         local_output_path=local_output_path,
         local_report_path=request.local_report_path,
+        transfer_metrics=_build_transfer_metrics(timing_state),
+        timings=_build_timings(timing_state),
     )
 
 
@@ -356,6 +451,109 @@ def _download_and_parse_report(
     if not isinstance(payload, dict):
         raise RemoteWorkerReportError("Worker report root must be a JSON object.")
     return payload
+
+
+def _persist_enriched_report(
+    *,
+    report_payload: dict,
+    local_report_path: Path,
+    timing_state: _TransferTimingState,
+) -> dict:
+    enriched = dict(report_payload)
+    enriched.setdefault("report_schema_version", "2.0")
+    existing_warnings = enriched.get("collection_warnings")
+    warnings: list[str] = list(existing_warnings) if isinstance(existing_warnings, list) else []
+    warnings.extend(timing_state.warnings or [])
+
+    transfer_metrics = _build_transfer_metrics(timing_state)
+    timings = _build_timings(timing_state)
+    metric_schema = dict(enriched.get("metric_schema")) if isinstance(enriched.get("metric_schema"), dict) else {}
+    units = dict(metric_schema.get("units")) if isinstance(metric_schema.get("units"), dict) else {}
+    units.setdefault("throughput", "MiB/s")
+    units.setdefault("duration", "seconds")
+    units.setdefault("data_size", "bytes")
+    metric_schema["units"] = units
+
+    field_notes = dict(metric_schema.get("field_notes")) if isinstance(metric_schema.get("field_notes"), dict) else {}
+    field_notes.setdefault(
+        "transfer_metrics",
+        "Measured end-to-end SCP transfer throughput for this job only; not a maximum instance bandwidth.",
+    )
+    field_notes.setdefault(
+        "timings",
+        "Orchestrator-side monotonic timings may include additional remote I/O and validation around worker execution.",
+    )
+    metric_schema["field_notes"] = field_notes
+
+    enriched["transfer_metrics"] = transfer_metrics
+    enriched["timings"] = timings
+    enriched["metric_schema"] = metric_schema
+    enriched["collection_warnings"] = warnings
+    local_report_path.write_text(json.dumps(enriched, indent=2), encoding="utf-8")
+    return enriched
+
+
+def _build_transfer_metrics(state: _TransferTimingState) -> dict[str, object]:
+    return {
+        "upload": {
+            "duration_seconds": _rounded_or_none(state.upload_seconds),
+            "bytes_transferred": state.upload_bytes,
+            "average_mib_per_second": _throughput_mib_per_second(state.upload_bytes, state.upload_seconds),
+            "throughput_unit": "MiB/s",
+        },
+        "download": {
+            "duration_seconds": _rounded_or_none(state.download_seconds),
+            "bytes_transferred": state.download_bytes,
+            "average_mib_per_second": _throughput_mib_per_second(state.download_bytes, state.download_seconds),
+            "throughput_unit": "MiB/s",
+        },
+    }
+
+
+def _build_timings(state: _TransferTimingState) -> dict[str, object]:
+    return {
+        "processing_seconds": _rounded_or_none(state.worker_processing_seconds),
+        "remote_execution_seconds": _rounded_or_none(state.remote_execution_seconds),
+        "upload_seconds": _rounded_or_none(state.upload_seconds),
+        "download_seconds": _rounded_or_none(state.download_seconds),
+        "total_job_seconds": _rounded_or_none(state.total_job_seconds),
+    }
+
+
+def _throughput_mib_per_second(byte_count: int | None, seconds: float | None) -> float | None:
+    if byte_count is None or seconds is None or seconds <= 0:
+        return None
+    return round((float(byte_count) / (1024.0 * 1024.0)) / seconds, 6)
+
+
+def _rounded_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(value, 6)
+
+
+def _safe_file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _sum_optional_ints(a: int | None, b: int | None) -> int | None:
+    if a is None and b is None:
+        return None
+    return int((a or 0) + (b or 0))
+
+
+def _as_optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _validate_report(*, report_payload: dict, expected_output_path: str) -> int:

@@ -68,6 +68,26 @@ def test_telemetry_collector_limits_raw_sample_memory() -> None:
     assert summary.dropped_samples >= 1
 
 
+def test_telemetry_aggregates_include_dropped_raw_samples() -> None:
+    state = {"value": 0}
+
+    def _provider(_warnings, prev):
+        _ = prev
+        state["value"] += 1
+        return ({"cpu": {"usage_percent": float(state["value"] * 10)}}, None)
+
+    collector = TelemetryCollector(sampling_interval_seconds=0.2, max_raw_samples=2, sample_provider=_provider)
+    collector.start()
+    time.sleep(0.75)
+    collector.stop()
+    summary = collector.summary()
+
+    assert len(summary.raw_samples) <= 2
+    assert summary.dropped_samples >= 1
+    assert summary.aggregates["cpu"]["usage_percent"]["count"] >= 3
+    assert summary.aggregates["cpu"]["usage_percent"]["max"] >= 30.0
+
+
 def test_collect_gpu_sample_handles_missing_nvidia_smi(monkeypatch) -> None:
     def _run_command(_command, *, timeout_seconds):
         _ = timeout_seconds

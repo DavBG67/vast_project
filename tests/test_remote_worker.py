@@ -213,6 +213,11 @@ def test_execute_remote_worker_non_zero_exit(tmp_path: Path, monkeypatch: pytest
     with pytest.raises(RemoteWorkerProcessError) as exc:
         execute_remote_worker(transport=transport, connection=conn, request=request)
     assert "runtime failed" in str(exc.value)
+    payload = json.loads(request.local_report_path.read_text(encoding="utf-8"))
+    assert payload["timings"]["remote_execution_seconds"] is not None
+    assert payload["transfer_metrics"]["upload"]["bytes_transferred"] is not None
+    assert payload["transfer_metrics"]["download"]["bytes_transferred"] is not None
+    assert any("timing_processing_unavailable" in warning for warning in payload["collection_warnings"])
 
 
 def test_execute_remote_worker_rejects_legacy_worker_without_contract_support(tmp_path: Path) -> None:
@@ -287,6 +292,42 @@ def test_execute_remote_worker_output_absent(tmp_path: Path, monkeypatch: pytest
 
     with pytest.raises(RemoteWorkerOutputError):
         execute_remote_worker(transport=transport, connection=conn, request=request)
+    payload = json.loads(request.local_report_path.read_text(encoding="utf-8"))
+    assert payload["transfer_metrics"]["download"]["bytes_transferred"] is not None
+    assert payload["timings"]["download_seconds"] is not None
+
+
+def test_execute_remote_worker_records_timings_and_throughput(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _conn(tmp_path)
+    request = _request(tmp_path)
+    transport = FakeTransport()
+    remote_output = "/workspace/upscale-sessions/session-D-01/output/result video.mp4"
+    transport.report_payload = _completed_report(remote_output)
+    transport.output_payload = b"x" * (2 * 1024 * 1024)
+
+    ticks = iter([0.0, 1.0, 2.0, 3.0, 5.0, 6.0, 10.0, 11.0])
+    monkeypatch.setattr("vast_upscaler.remote_worker.time.perf_counter", lambda: next(ticks))
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.inspect_video",
+        lambda *_a, **_k: VideoInfo(file_path="x", width=1920, height=1080, duration_seconds=12.0),
+    )
+    monkeypatch.setattr(
+        "vast_upscaler.remote_worker.run_ffprobe",
+        lambda *_a, **_k: {"streams": [{"codec_type": "video", "nb_frames": "42"}]},
+    )
+
+    result = execute_remote_worker(transport=transport, connection=conn, request=request)
+    assert result.timings is not None
+    assert result.transfer_metrics is not None
+    assert result.timings["upload_seconds"] == 1.0
+    assert result.timings["remote_execution_seconds"] == 2.0
+    assert result.timings["download_seconds"] == 4.0
+    assert result.timings["total_job_seconds"] == 11.0
+    assert result.transfer_metrics["upload"]["throughput_unit"] == "MiB/s"
+    assert result.transfer_metrics["download"]["average_mib_per_second"] is not None
 
 
 def test_execute_remote_worker_resolution_incorrect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

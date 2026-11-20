@@ -242,6 +242,7 @@ Produced files and local state:
   - Report schema `2.0` also adds structured sections for progressive enrichment (`processing_context`, `telemetry`, `transfer_metrics`, `timings`, `cost_estimate`, `metric_schema`, `collection_warnings`).
   - Phase 5G.2 enriches static worker inventory in `hardware`, `software`, and `environment` (best-effort, sensitive identifiers excluded by default).
   - Phase 5G.3 adds dynamic `telemetry.raw_samples` and `telemetry.aggregates` (GPU/CPU/RAM/storage best-effort, monotonic elapsed time, bounded memory with explicit `dropped_samples`).
+  - Phase 5G.4 enriches `transfer_metrics` and `timings` with monotonic upload/remote execution/download/total durations and effective transfer throughput (MiB/s, job-scoped measurement only).
 - Session store: `%USERPROFILE%\.vast_upscaler\sessions.json`
 - Provisioning history store: `%USERPROFILE%\.vast_upscaler\provisioning_history.json`
 - Workflow lock: `%USERPROFILE%\.vast_upscaler\workflow.lock`

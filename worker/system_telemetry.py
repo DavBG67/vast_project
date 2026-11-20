@@ -50,6 +50,7 @@ class TelemetryCollector:
         self._max_raw_samples = max(1, max_raw_samples)
         self._sample_provider = sample_provider or _collect_single_sample
         self._raw_samples: list[TelemetrySnapshot] = []
+        self._aggregate_stats: dict[tuple[object, ...], dict[str, float]] = {}
         self._warnings: list[str] = []
         self._dropped_samples = 0
         self._lock = threading.Lock()
@@ -79,7 +80,8 @@ class TelemetryCollector:
             raw = [self._serialize_snapshot(item) for item in self._raw_samples]
             warnings = list(self._warnings)
             dropped = self._dropped_samples
-        aggregates = _aggregate_samples(raw)
+            stats_copy = dict(self._aggregate_stats)
+        aggregates = _aggregate_from_stats(stats_copy)
         return TelemetrySummary(
             sampling_interval_seconds=self._sampling_interval_seconds,
             raw_samples=raw,
@@ -107,6 +109,7 @@ class TelemetryCollector:
             with self._lock:
                 self._warnings.extend(warnings)
                 self._raw_samples.append(snapshot)
+                _update_aggregate_stats(self._aggregate_stats, sample)
                 if len(self._raw_samples) > self._max_raw_samples:
                     self._raw_samples.pop(0)
                     self._dropped_samples += 1
@@ -279,47 +282,79 @@ def _collect_storage_sample(warnings: list[str]) -> dict[str, Any]:
         return {"root_available_bytes": None, "root_total_bytes": None}
 
 
-def _aggregate_samples(raw_samples: list[dict[str, Any]]) -> dict[str, Any]:
-    if not raw_samples:
-        return {}
-    stripped = [dict(item) for item in raw_samples]
-    for item in stripped:
-        item.pop("elapsed_seconds", None)
-        item.pop("missing_metrics", None)
-    return _aggregate_node(stripped)
+def _update_aggregate_stats(
+    aggregate_stats: dict[tuple[object, ...], dict[str, float]],
+    sample: dict[str, Any],
+) -> None:
+    for path, value in _iter_numeric_values(sample, prefix=()):
+        entry = aggregate_stats.setdefault(
+            path,
+            {"min": value, "max": value, "sum": 0.0, "count": 0.0},
+        )
+        entry["min"] = min(entry["min"], value)
+        entry["max"] = max(entry["max"], value)
+        entry["sum"] += value
+        entry["count"] += 1.0
 
 
-def _aggregate_node(node: Any) -> Any:
+def _iter_numeric_values(node: Any, prefix: tuple[object, ...]) -> list[tuple[tuple[object, ...], float]]:
+    results: list[tuple[tuple[object, ...], float]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            results.extend(_iter_numeric_values(value, prefix + (key,)))
+        return results
     if isinstance(node, list):
-        if not node:
-            return {}
-        if all(isinstance(item, dict) for item in node):
-            keys: set[str] = set()
-            for item in node:
-                keys.update(item.keys())
-            output: dict[str, Any] = {}
-            for key in sorted(keys):
-                values = [item.get(key) for item in node]
-                aggregated = _aggregate_node(values)
-                if aggregated not in ({}, None):
-                    output[key] = aggregated
-            return output
-        numeric_values = [float(item) for item in node if isinstance(item, (int, float)) and not isinstance(item, bool)]
-        if numeric_values:
-            count = len(numeric_values)
-            return {
-                "min": min(numeric_values),
-                "avg": sum(numeric_values) / count,
-                "max": max(numeric_values),
-                "count": count,
-            }
-        if all(item is None for item in node):
-            return None
-        if all(isinstance(item, list) for item in node):
-            max_len = max(len(item) for item in node)
-            return [_aggregate_node([item[index] if index < len(item) else None for item in node]) for index in range(max_len)]
-        return {}
-    return None
+        for index, value in enumerate(node):
+            results.extend(_iter_numeric_values(value, prefix + (index,)))
+        return results
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
+        results.append((prefix, float(node)))
+    return results
+
+
+def _aggregate_from_stats(stats: dict[tuple[object, ...], dict[str, float]]) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    for path, entry in stats.items():
+        if not path:
+            continue
+        count = int(entry.get("count", 0.0))
+        if count <= 0:
+            continue
+        value = {
+            "min": entry["min"],
+            "avg": entry["sum"] / float(count),
+            "max": entry["max"],
+            "count": count,
+        }
+        _set_nested(root, path, value)
+    return root
+
+
+def _set_nested(root: dict[str, Any], path: tuple[object, ...], value: dict[str, Any]) -> None:
+    current: Any = root
+    for index, token in enumerate(path):
+        is_last = index == len(path) - 1
+        next_token = None if is_last else path[index + 1]
+        if isinstance(token, str):
+            if is_last:
+                current[token] = value
+                return
+            if token not in current or not isinstance(current[token], (dict, list)):
+                current[token] = [] if isinstance(next_token, int) else {}
+            current = current[token]
+            continue
+        if isinstance(token, int):
+            if not isinstance(current, list):
+                return
+            while len(current) <= token:
+                current.append(None)
+            if is_last:
+                current[token] = value
+                return
+            if current[token] is None or not isinstance(current[token], (dict, list)):
+                current[token] = [] if isinstance(next_token, int) else {}
+            current = current[token]
+            continue
 
 
 def _collect_missing_metrics(sample: dict[str, Any]) -> list[str]:
