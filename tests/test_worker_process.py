@@ -94,6 +94,13 @@ def test_write_report_includes_v2_schema_and_comparison_context(tmp_path: Path) 
         software={"runtime": {"python_version": "3.12.0"}},
         environment={"containerized": True, "sensitive_identifiers_included": False},
         collection_warnings=["gpu_inventory_unavailable: sample"],
+        telemetry={
+            "sampling_interval_seconds": 5.0,
+            "raw_samples": [{"elapsed_seconds": 0.0, "cpu": {"usage_percent": None}}],
+            "aggregates": {"cpu": {"usage_percent": {"min": 10.0, "avg": 10.0, "max": 10.0, "count": 1}}},
+            "dropped_samples": 0,
+            "max_raw_samples": 10000,
+        },
     )
 
     write_report(report_path, report)
@@ -103,8 +110,9 @@ def test_write_report_includes_v2_schema_and_comparison_context(tmp_path: Path) 
     assert payload["processing_context"]["resolutions"]["source"] == {"width": 640, "height": 480}
     assert payload["processing_context"]["resolutions"]["effective_after_preprocessing"] == {"width": 628, "height": 408}
     assert payload["processing_context"]["resolutions"]["target_canvas"] == {"width": 1920, "height": 1080}
-    assert payload["telemetry"]["raw_samples"] == []
-    assert payload["telemetry"]["aggregates"] == {}
+    assert payload["telemetry"]["raw_samples"] == [{"elapsed_seconds": 0.0, "cpu": {"usage_percent": None}}]
+    assert payload["telemetry"]["aggregates"]["cpu"]["usage_percent"]["count"] == 1
+    assert payload["telemetry"]["max_raw_samples"] == 10000
     assert payload["instance_metadata"]["sensitive_identifiers_included"] is False
     assert payload["hardware"]["gpu"]["container_visible"]["count"] == 1
     assert payload["software"]["runtime"]["python_version"] == "3.12.0"
@@ -176,6 +184,8 @@ def test_main_failure_after_processing_preserves_frames_and_cleans_temp(tmp_path
         models_dir=str(tmp_path),
         min_free_gb=0.0,
         preprocessing_plan=None,
+        telemetry_interval_seconds=5.0,
+        telemetry_max_samples=10000,
     )
     monkeypatch.setattr("worker.process.parse_args", lambda: args)
     monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
@@ -255,6 +265,8 @@ def test_main_with_valid_preprocessing_contract_only_validates(monkeypatch, tmp_
         models_dir=str(tmp_path),
         min_free_gb=0.0,
         preprocessing_plan=str(plan_path),
+        telemetry_interval_seconds=5.0,
+        telemetry_max_samples=10000,
     )
     monkeypatch.setattr("worker.process.parse_args", lambda: args)
     monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
@@ -336,6 +348,8 @@ def test_main_with_empty_preprocessing_contract_keeps_historical_dimensions(monk
         models_dir=str(tmp_path),
         min_free_gb=0.0,
         preprocessing_plan=str(plan_path),
+        telemetry_interval_seconds=5.0,
+        telemetry_max_samples=10000,
     )
     monkeypatch.setattr("worker.process.parse_args", lambda: args)
     monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
@@ -409,6 +423,8 @@ def test_main_with_invalid_preprocessing_contract_fails_before_streaming(monkeyp
         models_dir=str(tmp_path),
         min_free_gb=0.0,
         preprocessing_plan=str(plan_path),
+        telemetry_interval_seconds=5.0,
+        telemetry_max_samples=10000,
     )
     monkeypatch.setattr("worker.process.parse_args", lambda: args)
     monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)
@@ -461,6 +477,8 @@ def test_main_with_deinterlace_requested_fails_before_streaming(monkeypatch, tmp
         models_dir=str(tmp_path),
         min_free_gb=0.0,
         preprocessing_plan=str(plan_path),
+        telemetry_interval_seconds=5.0,
+        telemetry_max_samples=10000,
     )
     monkeypatch.setattr("worker.process.parse_args", lambda: args)
     monkeypatch.setattr("worker.process._ensure_disk_space", lambda *_a, **_k: None)

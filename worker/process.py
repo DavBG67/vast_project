@@ -21,6 +21,7 @@ try:
     )
     from .video_probe import ProbeError, probe_video
     from .system_inventory import StaticInventory, collect_static_inventory
+    from .system_telemetry import TelemetryCollector, TelemetrySummary
 except ImportError:
     from models import ProfileNotSupportedError, select_model
     from pipelines.realesrgan import (
@@ -30,6 +31,7 @@ except ImportError:
     )
     from video_probe import ProbeError, probe_video
     from system_inventory import StaticInventory, collect_static_inventory
+    from system_telemetry import TelemetryCollector, TelemetrySummary
 
 
 class WorkerError(RuntimeError):
@@ -70,6 +72,7 @@ class ProcessingReport:
     software: dict | None = None
     environment: dict | None = None
     collection_warnings: list[str] | None = None
+    telemetry: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +156,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", default=None, help="JSON report path")
     parser.add_argument("--min-free-gb", type=float, default=2.0)
     parser.add_argument("--preprocessing-plan", default=None, help="Remote preprocessing contract JSON path")
+    parser.add_argument("--telemetry-interval-seconds", type=float, default=5.0)
+    parser.add_argument("--telemetry-max-samples", type=int, default=10_000)
     return parser.parse_args()
 
 
@@ -171,6 +176,14 @@ def main() -> int:
     preprocessing_plan_summary: dict | None = None
     frames_processed = 0
     staged_output: Path | None = None
+    telemetry_summary = TelemetrySummary(
+        sampling_interval_seconds=max(0.2, float(args.telemetry_interval_seconds)),
+        raw_samples=[],
+        aggregates={},
+        dropped_samples=0,
+        max_raw_samples=max(1, int(args.telemetry_max_samples)),
+        warnings=[],
+    )
     try:
         static_inventory = collect_static_inventory()
     except Exception as exc:  # noqa: BLE001
@@ -245,20 +258,29 @@ def main() -> int:
             encoded_video = temp_dir_path / "video_only.mkv"
             staged_output = _build_staged_output_path(output_path)
 
-            frames_processed = run_streaming_upscale(
-                input_path=input_path,
-                encoded_video_path=encoded_video,
-                source_width=source_width_for_upscale,
-                source_height=source_height_for_upscale,
-                source_fps=source.fps,
-                target_width=target_width,
-                target_height=target_height,
-                upscaler=upscaler,
-                crf=args.video_crf,
-                decode_filter=preprocessing_config.decode_filter,
-                progress=progress,
-                frames_total=frames_total,
+            telemetry_collector = TelemetryCollector(
+                sampling_interval_seconds=max(0.2, float(args.telemetry_interval_seconds)),
+                max_raw_samples=max(1, int(args.telemetry_max_samples)),
             )
+            telemetry_collector.start()
+            try:
+                frames_processed = run_streaming_upscale(
+                    input_path=input_path,
+                    encoded_video_path=encoded_video,
+                    source_width=source_width_for_upscale,
+                    source_height=source_height_for_upscale,
+                    source_fps=source.fps,
+                    target_width=target_width,
+                    target_height=target_height,
+                    upscaler=upscaler,
+                    crf=args.video_crf,
+                    decode_filter=preprocessing_config.decode_filter,
+                    progress=progress,
+                    frames_total=frames_total,
+                )
+            finally:
+                telemetry_collector.stop()
+                telemetry_summary = telemetry_collector.summary()
             if preprocessing_plan_summary is not None and preprocessing_config.crop_rect is not None:
                 preprocessing_plan_summary["applied_operations"] = ["crop"]
 
@@ -313,7 +335,14 @@ def main() -> int:
                 hardware=static_inventory.hardware,
                 software=static_inventory.software,
                 environment=static_inventory.environment,
-                collection_warnings=static_inventory.warnings,
+                collection_warnings=list(static_inventory.warnings) + list(telemetry_summary.warnings),
+                telemetry={
+                    "sampling_interval_seconds": telemetry_summary.sampling_interval_seconds,
+                    "raw_samples": telemetry_summary.raw_samples,
+                    "aggregates": telemetry_summary.aggregates,
+                    "dropped_samples": telemetry_summary.dropped_samples,
+                    "max_raw_samples": telemetry_summary.max_raw_samples,
+                },
             )
             write_report(report_path, report)
             progress.emit(stage="completed", frames_done=frames_processed, frames_total=frames_total, force=True)
@@ -334,7 +363,14 @@ def main() -> int:
             hardware=static_inventory.hardware,
             software=static_inventory.software,
             environment=static_inventory.environment,
-            collection_warnings=static_inventory.warnings,
+            collection_warnings=list(static_inventory.warnings) + list(telemetry_summary.warnings),
+            telemetry={
+                "sampling_interval_seconds": telemetry_summary.sampling_interval_seconds,
+                "raw_samples": telemetry_summary.raw_samples,
+                "aggregates": telemetry_summary.aggregates,
+                "dropped_samples": telemetry_summary.dropped_samples,
+                "max_raw_samples": telemetry_summary.max_raw_samples,
+            },
         )
     except ProcessingStageError as exc:
         _cleanup_staged_output(staged_output)
@@ -350,7 +386,14 @@ def main() -> int:
             hardware=static_inventory.hardware,
             software=static_inventory.software,
             environment=static_inventory.environment,
-            collection_warnings=static_inventory.warnings,
+            collection_warnings=list(static_inventory.warnings) + list(telemetry_summary.warnings),
+            telemetry={
+                "sampling_interval_seconds": telemetry_summary.sampling_interval_seconds,
+                "raw_samples": telemetry_summary.raw_samples,
+                "aggregates": telemetry_summary.aggregates,
+                "dropped_samples": telemetry_summary.dropped_samples,
+                "max_raw_samples": telemetry_summary.max_raw_samples,
+            },
         )
     except (WorkerError, ProbeError, RealesrganError) as exc:
         _cleanup_staged_output(staged_output)
@@ -365,7 +408,14 @@ def main() -> int:
             hardware=static_inventory.hardware,
             software=static_inventory.software,
             environment=static_inventory.environment,
-            collection_warnings=static_inventory.warnings,
+            collection_warnings=list(static_inventory.warnings) + list(telemetry_summary.warnings),
+            telemetry={
+                "sampling_interval_seconds": telemetry_summary.sampling_interval_seconds,
+                "raw_samples": telemetry_summary.raw_samples,
+                "aggregates": telemetry_summary.aggregates,
+                "dropped_samples": telemetry_summary.dropped_samples,
+                "max_raw_samples": telemetry_summary.max_raw_samples,
+            },
         )
     except Exception as exc:  # noqa: BLE001
         _cleanup_staged_output(staged_output)
@@ -380,7 +430,14 @@ def main() -> int:
             hardware=static_inventory.hardware,
             software=static_inventory.software,
             environment=static_inventory.environment,
-            collection_warnings=static_inventory.warnings,
+            collection_warnings=list(static_inventory.warnings) + list(telemetry_summary.warnings),
+            telemetry={
+                "sampling_interval_seconds": telemetry_summary.sampling_interval_seconds,
+                "raw_samples": telemetry_summary.raw_samples,
+                "aggregates": telemetry_summary.aggregates,
+                "dropped_samples": telemetry_summary.dropped_samples,
+                "max_raw_samples": telemetry_summary.max_raw_samples,
+            },
         )
 
 
@@ -670,10 +727,12 @@ def write_report(path: Path, report: ProcessingReport) -> None:
     payload["hardware"] = report.hardware or {}
     payload["software"] = report.software or {}
     payload["environment"] = report.environment or {}
-    payload["telemetry"] = {
+    payload["telemetry"] = report.telemetry or {
         "sampling_interval_seconds": None,
         "raw_samples": [],
         "aggregates": {},
+        "dropped_samples": 0,
+        "max_raw_samples": None,
     }
     payload["transfer_metrics"] = {
         "upload": {"duration_seconds": None, "bytes_transferred": None, "average_bytes_per_second": None},
@@ -708,6 +767,7 @@ def write_report(path: Path, report: ProcessingReport) -> None:
             "hardware": "Observed from inside the worker container; host physical values may be unavailable.",
             "software": "Runtime and toolchain observed in container at processing time.",
             "environment": "Containerization and cgroup context observed from procfs/sysfs.",
+            "telemetry": "Dynamic samples are monotonic-time snapshots from inside container scope; missing values remain null.",
         },
     }
     payload["collection_warnings"] = list(report.collection_warnings or [])
@@ -726,6 +786,7 @@ def _fail(
     software: dict | None = None,
     environment: dict | None = None,
     collection_warnings: list[str] | None = None,
+    telemetry: dict | None = None,
 ) -> int:
     elapsed = time.perf_counter() - started
     report = ProcessingReport(
@@ -744,6 +805,7 @@ def _fail(
         software=software,
         environment=environment,
         collection_warnings=collection_warnings,
+        telemetry=telemetry,
     )
     write_report(report_path, report)
     for note in notes:
