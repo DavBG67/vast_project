@@ -1,7 +1,10 @@
-FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+FROM pytorch/pytorch:2.14.1-cuda13.0-cudnn9-runtime
 
 ARG REALESRGAN_X4PLUS_URL=https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 ARG REALESRGAN_X4PLUS_SHA256=4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1
+ARG EXPECTED_TORCH_VERSION=2.14.1
+ARG EXPECTED_TORCHVISION_VERSION=0.29.1
+ARG EXPECTED_CUDA_VERSION=13.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -24,8 +27,8 @@ RUN pip install --upgrade pip \
     && grep -v -E '^(realesrgan|basicsr|torch|torchvision)==' requirements.txt > requirements.core.txt \
     && pip install --prefer-binary -r requirements.core.txt \
     # Ensure runtime torch version and compiled CUDA version expected by this image.
-    && python -c "import importlib.util, torch; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; assert Version(torch.__version__).release == (2, 4, 1), f'unexpected torch public version: {torch.__version__}'; assert str(torch.version.cuda) == '12.1', f'unexpected compiled cuda version: {torch.version.cuda}'" \
-    && pip install --no-deps torchvision==0.19.1 \
+    && python -c "import importlib.util, torch; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; expected=Version('${EXPECTED_TORCH_VERSION}').release; assert Version(torch.__version__).release == expected, f'unexpected torch public version: {torch.__version__}'; assert str(torch.version.cuda) == '${EXPECTED_CUDA_VERSION}', f'unexpected compiled cuda version: {torch.version.cuda}'" \
+    && pip install --no-deps torchvision==${EXPECTED_TORCHVISION_VERSION} \
     # Install BasicSR runtime deps explicitly (excluding torch/torchvision managed above).
     && pip install --prefer-binary addict future lmdb Pillow requests scikit-image scipy tb-nightly tqdm yapf \
     # Install basicsr without build isolation and without dependency resolution.

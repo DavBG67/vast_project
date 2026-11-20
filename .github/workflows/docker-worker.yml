@@ -22,17 +22,22 @@ on:
         description: "Expected public torch version in image"
         required: true
         type: string
-        default: "2.4.1"
+        default: "2.14.1"
       expected_torchvision_version:
         description: "Expected public torchvision version in image"
         required: true
         type: string
-        default: "0.19.1"
+        default: "0.29.1"
       expected_cuda_version:
         description: "Expected torch compiled CUDA version in image"
         required: true
         type: string
-        default: "12.1"
+        default: "13.0"
+      expected_arch_token:
+        description: "Expected torch CUDA arch token (for example sm_120)"
+        required: true
+        type: string
+        default: "sm_120"
       publish_tag:
         description: "Optional additional GHCR tag (e.g. blackwell-test)"
         required: false
@@ -74,9 +79,10 @@ jobs:
       IMAGE_NAME: vast-video-upscaler-worker:ci-smoke
       MIN_FREE_GB: "30"
       DOCKERFILE_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.dockerfile || 'worker/Dockerfile' }}
-      EXPECTED_TORCH_VERSION: ${{ github.event_name == 'workflow_dispatch' && (inputs.dockerfile == 'worker/Dockerfile.blackwell' && inputs.expected_torch_version == '2.4.1' && '2.14.1' || inputs.expected_torch_version) || '2.4.1' }}
-      EXPECTED_TORCHVISION_VERSION: ${{ github.event_name == 'workflow_dispatch' && (inputs.dockerfile == 'worker/Dockerfile.blackwell' && inputs.expected_torchvision_version == '0.19.1' && '0.29.1' || inputs.expected_torchvision_version) || '0.19.1' }}
-      EXPECTED_CUDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && (inputs.dockerfile == 'worker/Dockerfile.blackwell' && inputs.expected_cuda_version == '12.1' && '13.0' || inputs.expected_cuda_version) || '12.1' }}
+      EXPECTED_TORCH_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_torch_version || '2.14.1' }}
+      EXPECTED_TORCHVISION_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_torchvision_version || '0.29.1' }}
+      EXPECTED_CUDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_cuda_version || '13.0' }}
+      EXPECTED_ARCH_TOKEN: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_arch_token || 'sm_120' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -168,6 +174,10 @@ jobs:
         run: |
           docker run --rm --entrypoint python $IMAGE_NAME -c "import importlib.util, torch, torchvision; assert importlib.util.find_spec('packaging') is not None, 'packaging is required for version checks'; from packaging.version import Version; expected_torch_release = Version('${EXPECTED_TORCH_VERSION}').release; detected_torch_release = Version(torch.__version__).release; expected_torchvision_release = Version('${EXPECTED_TORCHVISION_VERSION}').release; detected_torchvision_release = Version(torchvision.__version__).release; expected_cuda = '${EXPECTED_CUDA_VERSION}'; detected_cuda = str(torch.version.cuda); print(f'[compat] torch expected={expected_torch_release} detected={detected_torch_release} ({torch.__version__})'); print(f'[compat] torchvision expected={expected_torchvision_release} detected={detected_torchvision_release} ({torchvision.__version__})'); print(f'[compat] cuda expected={expected_cuda} detected={detected_cuda}'); assert detected_torch_release == expected_torch_release, f'unexpected torch public version: expected {expected_torch_release}, detected {detected_torch_release} ({torch.__version__})'; assert detected_torchvision_release == expected_torchvision_release, f'unexpected torchvision public version: expected {expected_torchvision_release}, detected {detected_torchvision_release} ({torchvision.__version__})'; assert detected_cuda == expected_cuda, f'unexpected compiled cuda version: expected {expected_cuda}, detected {detected_cuda}'"
 
+      - name: Verify compiled CUDA arch token support
+        run: |
+          docker run --rm --entrypoint python $IMAGE_NAME -c "import torch; expected='${EXPECTED_ARCH_TOKEN}'.strip(); arch=[str(item) for item in torch.cuda.get_arch_list()]; print(f'[compat] expected_arch_token={expected} arch_list={arch}'); alt='compute_' + expected[3:] if expected.startswith('sm_') else None; assert (expected in arch) or (alt is not None and alt in arch), f'expected arch token {expected} not present in torch arch list {arch}'"
+
       - name: Verify model file integrity in image
         run: |
           docker run --rm --entrypoint bash $IMAGE_NAME -lc "set -euo pipefail; echo '4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1  /opt/models/RealESRGAN_x4plus.pth' | sha256sum -c -"
@@ -204,6 +214,7 @@ jobs:
             echo "- CPU ffmpeg short encode + ffprobe: passed";
             echo "- Runtime versions:";
             sed 's/^/  - /' runtime-info.txt;
+            echo "- CUDA arch token check: ${EXPECTED_ARCH_TOKEN} present in torch.cuda.get_arch_list()";
             echo "- Model SHA256 check: passed";
             echo "- Image size: ${{ steps.image-size.outputs.size_mb }} MB (${{ steps.image-size.outputs.size_bytes }} bytes)";
             echo "- Note: GPU runtime compatibility and CUDA inference are NOT validated by this workflow.";

@@ -58,10 +58,24 @@ Build worker image:
 docker build -f worker/Dockerfile -t vast-video-upscaler-worker:dev .
 ```
 
+Current pinned GPU stack in `worker/Dockerfile`:
+
+- PyTorch `2.14.1`
+- TorchVision `0.29.1`
+- CUDA `13.0` (compiled runtime)
+- Blackwell-compatible arch token required in diagnostics: `sm_120`
+
 Smoke test (no GPU required):
 
 ```powershell
 docker run --rm vast-video-upscaler-worker:dev --help
+```
+
+Short GPU smoke test procedure (manual, do not auto-run in CI):
+
+```powershell
+docker run --rm --gpus all --entrypoint python vast-video-upscaler-worker:dev -c "import torch; print('cuda_available=', torch.cuda.is_available()); print('gpu=', torch.cuda.get_device_name(0)); x=torch.randn(256,256,device='cuda'); y=(x@x).mean(); print('cuda_op_ok=', float(y)); print('arch_list=', torch.cuda.get_arch_list())"
+docker run --rm --gpus all --entrypoint python vast-video-upscaler-worker:dev -c "from worker.models import resolve_profile; from worker.pipelines.realesrgan import RealesrganConfig, RealesrganUpscaler; c=resolve_profile('balanced'); u=RealesrganUpscaler(RealesrganConfig(model_name=c.model_name,tile=c.tile,tile_pad=c.tile_pad,pre_pad=c.pre_pad,models_dir='/opt/models')); import numpy as np; img=np.zeros((64,64,3),dtype=np.uint8); out=u.upscale_frame(img); print('realesrgan_inference_ok=', out.shape)"
 ```
 
 Expected GPU run command:
