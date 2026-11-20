@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from vast_upscaler.local_preprocessing import LocalExecutionReport
@@ -15,6 +16,7 @@ from vast_upscaler.webapp import (
     WorkflowExecutionResult,
     _default_auto_runner,
     _default_manual_runner,
+    _resolve_remote_preprocessing_contract,
     create_app,
 )
 
@@ -64,6 +66,102 @@ def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
     assert "vast_api_key" not in body
     assert "worker_image_latest_known" in body
     assert body["worker_image_latest_known"] != "ghcr.io/acme/worker:test"
+
+
+def test_web_video_sources_listing_filters_outputs_and_non_video(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    (video_dir / "source.mp4").write_bytes(b"x")
+    (video_dir / "clip.MKV").write_bytes(b"x")
+    (video_dir / "source-upscaled.mp4").write_bytes(b"x")
+    (video_dir / "source-cropped.mp4").write_bytes(b"x")
+    (video_dir / "source-upscaled.mp4.report.json").write_text("{}", encoding="utf-8")
+    (video_dir / "notes.txt").write_text("ignore", encoding="utf-8")
+
+    monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.get("/api/video/sources")
+    assert response.status_code == 200
+    payload = response.json()
+    names = [item["name"] for item in payload["sources"]]
+    assert "source.mp4" in names
+    assert "clip.MKV" in names
+    assert "source-upscaled.mp4" not in names
+    assert "source-cropped.mp4" not in names
+    assert all(not name.endswith(".report.json") for name in names)
+
+
+def test_web_video_analyze_by_source_name(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    video_path = video_dir / "sample.mp4"
+    video_path.write_bytes(b"x")
+
+    monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def _fake_analyze(path: Path) -> SourceVideoAnalysis:
+        captured["path"] = path
+        return SourceVideoAnalysis(
+            file_path=str(path),
+            width=1920,
+            height=1080,
+            frame_rate_fps=24.0,
+            audio_tracks=[],
+            subtitle_tracks=[],
+            interlace=InterlaceInfo(
+                field_order=None,
+                interlaced=None,
+                confidence="uncertain",
+                note="ffprobe did not provide field_order.",
+            ),
+        )
+
+    monkeypatch.setattr("vast_upscaler.webapp.analyze_source_video", _fake_analyze)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post("/api/video/analyze", json={"source_name": "sample.mp4"})
+    assert response.status_code == 200
+    assert Path(str(captured["path"])).resolve() == video_path.resolve()
+
+
+def test_web_video_analyze_rejects_source_traversal(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    (tmp_path / "video").mkdir()
+    monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post("/api/video/analyze", json={"source_name": "../secret.mp4"})
+    assert response.status_code == 400
+    assert "path separators" in response.json()["detail"]
+
+
+def test_web_video_analyze_rejects_symlink_outside_video_directory(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"x")
+    link = video_dir / "link.mp4"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is not permitted in this environment")
+
+    monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post("/api/video/analyze", json={"source_name": "link.mp4"})
+    assert response.status_code == 400
+    assert "outside the allowed directory" in response.json()["detail"]
 
 
 def test_web_video_analyze_endpoint(tmp_path: Path, monkeypatch) -> None:
@@ -285,6 +383,67 @@ def test_web_preprocessing_execution_preview_endpoint(tmp_path: Path, monkeypatc
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "dry_run"
+
+
+def test_web_job_start_accepts_source_name_without_manual_path(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    source = video_dir / "input.mp4"
+    source.write_bytes(b"x")
+    monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
+
+    def _auto_runner(_request: StartJobRequest, _settings, _callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        return WorkflowExecutionResult(
+            mode="automatic",
+            session_id="sess-test",
+            state="COMPLETED",
+            output_path=None,
+            report_path=None,
+            duration_seconds=0.1,
+            estimated_total_usd=0.1,
+            instance_id=None,
+            instance_state="DESTROYED",
+            cleanup_verified=True,
+            cleanup_warning=None,
+        )
+
+    app = create_app(config_path=config_path, auto_runner=_auto_runner)
+    client = TestClient(app)
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "source_name": "input.mp4",
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_web_job_start_rejects_source_name_plus_input_path(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    source = video_dir / "input.mp4"
+    source.write_bytes(b"x")
+    manual = tmp_path / "manual.mp4"
+    manual.write_bytes(b"x")
+    monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "source_name": "input.mp4",
+            "input_path": str(manual),
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+        },
+    )
+    assert response.status_code == 400
+    assert "either source_name or input_path" in response.json()["detail"]
 
 
 def test_web_job_prompt_and_completion(tmp_path: Path) -> None:
@@ -655,6 +814,109 @@ def test_web_auto_and_manual_use_identical_preprocessing_contract(tmp_path: Path
 
     assert captured_auto["contract"] == captured_manual["contract"]
     assert captured_auto["contract"] == {
+        "version": "1.0",
+        "operations": [{"id": "crop", "params": {"x": 0, "y": 0, "width": 640, "height": 360}}],
+    }
+
+
+def test_manual_plan_path_overrides_generated_plan_payload_for_contract_resolution(tmp_path: Path) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+    plan = tmp_path / "plan.json"
+    plan.write_text(
+        """
+{
+  "version": "1.0",
+  "source_summary": {
+    "file_path": "input.mp4",
+    "width": 640,
+    "height": 360,
+    "frame_rate_fps": 24.0,
+    "duration_seconds": 5.0,
+    "video_codec": "h264",
+    "interlace_metadata": {},
+    "diagnostics_available": false
+  },
+  "recommendations": [],
+  "user_choices": {
+    "crop_mode": "custom_crop",
+    "custom_crop_margins": {"top": 0, "bottom": 0, "left": 0, "right": 0},
+    "deinterlace_mode": "preserve",
+    "denoise_mode": "preserve",
+    "deblock_mode": "preserve"
+  },
+  "operations": [
+    {
+      "operation_id": "crop",
+      "kind": "crop",
+      "enabled": true,
+      "recommended": false,
+      "confidence": "high",
+      "parameters": {
+        "mode": "custom_crop",
+        "crop_rect": {"x": 0, "y": 0, "width": 640, "height": 360},
+        "preserve_aspect_ratio": true,
+        "allow_stretch": false,
+        "fit_policy_after_crop": "letterbox_or_pad"
+      },
+      "justification": "manual",
+      "risk_notes": []
+    }
+  ],
+  "warnings": [],
+  "estimated_impact": {
+    "cpu_cost": "low",
+    "gpu_gain": "unknown",
+    "quality_risk": "low",
+    "note": "n/a"
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    request = StartJobRequest(
+        mode="automatic",
+        input_path=str(source),
+        preprocessing_plan_path=str(plan),
+        preprocessing_plan_payload={
+            "version": "1.0",
+            "source_summary": {
+                "file_path": "input.mp4",
+                "width": 640,
+                "height": 360,
+                "frame_rate_fps": 24.0,
+                "duration_seconds": 5.0,
+                "video_codec": "h264",
+                "interlace_metadata": {},
+                "diagnostics_available": False,
+            },
+            "recommendations": [],
+            "user_choices": {
+                "crop_mode": "preserve",
+                "custom_crop_margins": None,
+                "deinterlace_mode": "preserve",
+                "denoise_mode": "enable",
+                "deblock_mode": "preserve",
+            },
+            "operations": [
+                {
+                    "operation_id": "denoise",
+                    "kind": "denoise",
+                    "enabled": True,
+                    "recommended": False,
+                    "confidence": "low",
+                    "parameters": {"mode": "enable"},
+                    "justification": "manual",
+                    "risk_notes": [],
+                }
+            ],
+            "warnings": [],
+            "estimated_impact": {"cpu_cost": "medium", "gpu_gain": "unknown", "quality_risk": "high", "note": "n/a"},
+        },
+        worker_image="ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-compat",
+    )
+    contract = _resolve_remote_preprocessing_contract(request=request)
+    assert contract == {
         "version": "1.0",
         "operations": [{"id": "crop", "params": {"x": 0, "y": 0, "width": 640, "height": 360}}],
     }

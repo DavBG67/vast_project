@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -72,6 +72,18 @@ _WORKER_IMAGE_PLACEHOLDERS = {
     "<image>",
     "example/image:tag",
 }
+_VIDEO_SOURCE_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".wmv",
+}
+_VIDEO_SOURCE_EXCLUDED_SUFFIXES = ("-upscaled", "-cropped")
 
 
 class WebWorkflowCancelled(RuntimeError):
@@ -80,7 +92,8 @@ class WebWorkflowCancelled(RuntimeError):
 
 class StartJobRequest(BaseModel):
     mode: RunMode
-    input_path: str
+    input_path: str | None = None
+    source_name: str | None = None
     output_path: str | None = None
     report_path: str | None = None
     target_width: int | None = Field(default=None, ge=1)
@@ -92,6 +105,7 @@ class StartJobRequest(BaseModel):
     processing_fps: float | None = Field(default=None, gt=0)
     instance_id: int | None = None
     preprocessing_plan_path: str | None = None
+    preprocessing_plan_payload: dict[str, Any] | None = None
     ssh_bootstrap_mode: SshBootstrapMode = "tofu"
 
 
@@ -101,7 +115,8 @@ class PromptReplyRequest(BaseModel):
 
 
 class SourceAnalysisRequest(BaseModel):
-    input_path: str
+    input_path: str | None = None
+    source_name: str | None = None
     include_visual_diagnostics: bool = False
     diagnostic_options: VisualDiagnosticsOptions | None = None
 
@@ -242,7 +257,8 @@ class WebTaskManager:
             "configuration",
             {
                 "mode": request.mode,
-                "input_path": request.input_path,
+                "input_path": str(_resolve_input_video_path(request=request)),
+                "source_name": request.source_name,
                 "output_path": str(_resolve_output_path(request=request)),
                 "report_path": str(_resolve_report_path(request=request, output_path=_resolve_output_path(request=request))),
                 "target_width": request.target_width,
@@ -494,7 +510,14 @@ class WebTaskManager:
 
     @staticmethod
     def _validate_paths(*, request: StartJobRequest) -> None:
-        input_path = Path(request.input_path)
+        source_name = (request.source_name or "").strip()
+        input_path_raw = (request.input_path or "").strip()
+        if source_name and input_path_raw:
+            raise HTTPException(status_code=400, detail="Provide either source_name or input_path, not both.")
+        if not source_name and not input_path_raw:
+            raise HTTPException(status_code=400, detail="Either source_name or input_path is required.")
+
+        input_path = _resolve_input_video_path(request=request)
         if not input_path.exists() or not input_path.is_file():
             raise HTTPException(status_code=400, detail="Input path must be an existing file.")
         output_path = _resolve_output_path(request=request)
@@ -516,6 +539,8 @@ class WebTaskManager:
                     status_code=400,
                     detail=f"Preprocessing plan path must be an existing file: {plan_path}",
                 )
+        if request.preprocessing_plan_payload is not None and not isinstance(request.preprocessing_plan_payload, dict):
+            raise HTTPException(status_code=400, detail="preprocessing_plan_payload must be a JSON object.")
         if request.mode == "automatic":
             image = (request.worker_image or _load_latest_known_worker_image()).strip()
             if not image:
@@ -535,6 +560,7 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
 
     output_path = _resolve_output_path(request=request)
     report_path = _resolve_report_path(request=request, output_path=output_path)
+    input_path = _resolve_input_video_path(request=request)
     preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
     worker_image = (request.worker_image or _load_latest_known_worker_image()).strip()
     if not worker_image:
@@ -562,7 +588,7 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
             summary = run_upscale_workflow(
                 settings=effective_settings,
                 options=OrchestrationOptions(
-                    input_path=Path(request.input_path),
+                    input_path=input_path,
                     output_path=output_path,
                     report_path=report_path,
                     worker_image=worker_image,
@@ -612,6 +638,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
 
     output_path = _resolve_output_path(request=request)
     report_path = _resolve_report_path(request=request, output_path=output_path)
+    input_path = _resolve_input_video_path(request=request)
     preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
 
     transport = OpenSshTransport()
@@ -648,7 +675,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             private_key_path=_resolve_private_key(
                 settings=settings,
                 options=OrchestrationOptions(
-                    input_path=Path(request.input_path),
+                    input_path=input_path,
                     output_path=output_path,
                     report_path=report_path,
                     worker_image=request.worker_image or _load_latest_known_worker_image(),
@@ -679,7 +706,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             connection=connection,
             request=RemoteWorkerRequest(
                 session_id=f"manual-{uuid4().hex[:12]}",
-                local_input_path=Path(request.input_path),
+                local_input_path=input_path,
                 local_output_path=output_path,
                 local_report_path=report_path,
                 target_width=request.target_width or settings.video.target_width,
@@ -724,7 +751,7 @@ def _build_write_client(settings: Settings) -> VastWriteClient:
 def _resolve_output_path(*, request: StartJobRequest) -> Path:
     if request.output_path:
         return Path(request.output_path)
-    source = Path(request.input_path)
+    source = _resolve_input_video_path(request=request)
     suffix = source.suffix or ".mkv"
     return source.with_name(f"{source.stem}-upscaled{suffix}")
 
@@ -736,15 +763,112 @@ def _resolve_report_path(*, request: StartJobRequest, output_path: Path) -> Path
 
 
 def _resolve_remote_preprocessing_contract(*, request: StartJobRequest) -> dict[str, Any] | None:
-    if request.preprocessing_plan_path is None:
-        return None
-    plan_path = Path(request.preprocessing_plan_path)
     try:
-        payload = load_preprocessing_plan_payload(plan_path)
-        contract = build_remote_preprocessing_contract_from_plan_payload(payload)
+        if request.preprocessing_plan_path is not None:
+            plan_path = Path(request.preprocessing_plan_path)
+            payload = load_preprocessing_plan_payload(plan_path)
+            contract = build_remote_preprocessing_contract_from_plan_payload(payload)
+            return dump_remote_preprocessing_contract_payload(contract)
+        if request.preprocessing_plan_payload is not None:
+            contract = build_remote_preprocessing_contract_from_plan_payload(request.preprocessing_plan_payload)
+            return dump_remote_preprocessing_contract_payload(contract)
     except (RemotePreprocessingContractError, RemotePreprocessingContractValidationError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid preprocessing plan for remote transport: {exc}") from exc
-    return dump_remote_preprocessing_contract_payload(contract)
+    return None
+
+
+def _project_root_path() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _video_sources_dir() -> Path:
+    return _project_root_path() / "video"
+
+
+def _normalize_source_name(source_name: str) -> str:
+    value = source_name.strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="Video source name must be non-empty.")
+    if "\\" in value or "/" in value:
+        raise HTTPException(status_code=400, detail="Video source name must not include path separators.")
+    if PurePath(value).name != value:
+        raise HTTPException(status_code=400, detail="Video source name is invalid.")
+    return value
+
+
+def _is_excluded_generated_source(name: str) -> bool:
+    lower_name = name.lower()
+    if lower_name.endswith(".report.json"):
+        return True
+    stem = Path(lower_name).stem
+    return stem.endswith(_VIDEO_SOURCE_EXCLUDED_SUFFIXES)
+
+
+def _resolve_video_source_path(*, source_name: str) -> Path:
+    normalized_name = _normalize_source_name(source_name)
+    suffix = Path(normalized_name).suffix.lower()
+    if suffix not in _VIDEO_SOURCE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported video extension for source '{normalized_name}'.")
+    if _is_excluded_generated_source(normalized_name):
+        raise HTTPException(status_code=400, detail=f"Source '{normalized_name}' is excluded from selectable inputs.")
+
+    sources_dir = _video_sources_dir()
+    candidate = sources_dir / normalized_name
+    try:
+        resolved_sources = sources_dir.resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Video sources directory is unavailable: {sources_dir}") from exc
+    try:
+        resolved_candidate = candidate.resolve(strict=True)
+    except OSError:
+        raise HTTPException(status_code=404, detail=f"Video source not found: {normalized_name}") from None
+    if not resolved_candidate.is_file():
+        raise HTTPException(status_code=400, detail=f"Video source is not a file: {normalized_name}")
+    try:
+        resolved_candidate.relative_to(resolved_sources)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Video source resolves outside the allowed directory.") from None
+    return resolved_candidate
+
+
+def _resolve_input_video_path(*, request: StartJobRequest) -> Path:
+    source_name = (request.source_name or "").strip()
+    input_path = (request.input_path or "").strip()
+    if source_name:
+        return _resolve_video_source_path(source_name=source_name)
+    if not input_path:
+        raise HTTPException(status_code=400, detail="Either source_name or input_path must be provided.")
+    return Path(input_path)
+
+
+def _list_video_sources_payload() -> dict[str, Any]:
+    sources_dir = _video_sources_dir()
+    sources: list[dict[str, Any]] = []
+    if not sources_dir.exists():
+        return {"directory": str(sources_dir), "sources": sources}
+    if not sources_dir.is_dir():
+        raise HTTPException(status_code=500, detail=f"Video sources path is not a directory: {sources_dir}")
+
+    for entry in sorted(sources_dir.iterdir(), key=lambda item: item.name.lower()):
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() not in _VIDEO_SOURCE_EXTENSIONS:
+            continue
+        if _is_excluded_generated_source(entry.name):
+            continue
+        try:
+            resolved = _resolve_video_source_path(source_name=entry.name)
+        except HTTPException:
+            continue
+        stat = resolved.stat()
+        sources.append(
+            {
+                "name": entry.name,
+                "size_bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+            }
+        )
+    return {"directory": str(sources_dir), "sources": sources}
 
 
 def _load_latest_known_worker_image() -> str:
@@ -796,14 +920,25 @@ def create_app(
     def api_config() -> dict[str, Any]:
         return manager.defaults()
 
+    @app.get("/api/video/sources")
+    def api_video_sources() -> dict[str, Any]:
+        return _list_video_sources_payload()
+
     @app.post("/api/video/analyze")
     def api_video_analyze(request: SourceAnalysisRequest) -> dict[str, Any]:
+        source_count = sum(value is not None and value != "" for value in (request.input_path, request.source_name))
+        if source_count != 1:
+            raise HTTPException(status_code=400, detail="Provide exactly one source: input_path or source_name.")
         try:
+            if request.source_name:
+                video_path = _resolve_video_source_path(source_name=request.source_name)
+            else:
+                video_path = Path(request.input_path or "")
             if not request.include_visual_diagnostics:
-                analysis = analyze_source_video(Path(request.input_path))
+                analysis = analyze_source_video(video_path)
                 return analysis.model_dump(mode="json")
             return analyze_source_video_report(
-                video_path=Path(request.input_path),
+                video_path=video_path,
                 include_visual_diagnostics=True,
                 diagnostics_options=request.diagnostic_options,
             )
@@ -896,11 +1031,21 @@ _INDEX_HTML = """
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     fieldset { margin-bottom: 14px; }
+    details { margin-top: 10px; }
     label { display: block; margin-top: 8px; }
     input, select { width: 100%; padding: 6px; margin-top: 2px; }
-    button { padding: 8px 12px; margin-right: 8px; }
+    button { padding: 8px 12px; margin-right: 8px; margin-top: 8px; }
     #events { background: #111; color: #ddd; padding: 10px; white-space: pre-wrap; height: 300px; overflow: auto; }
     .warn { color: #9a6700; font-weight: bold; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+    .chip { background: #f3f3f3; border-radius: 12px; padding: 2px 8px; font-size: 12px; }
+    .muted { color: #555; font-size: 13px; }
+    .status-line { margin-top: 6px; font-weight: bold; }
+    .hidden { display: none; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: top; }
+    code { white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
@@ -908,23 +1053,82 @@ _INDEX_HTML = """
   <p class="warn">Runs only on 127.0.0.1. API keys are never sent to the browser.</p>
   <form id="job-form">
     <fieldset>
-      <legend>Configuration</legend>
+      <legend>1) Choose video</legend>
+      <label>Source video (project video/ folder)
+        <select id="source_name">
+          <option value="">-- Select a video --</option>
+        </select>
+      </label>
+      <div class="chips">
+        <button type="button" id="refresh-sources-btn">Refresh</button>
+      </div>
+      <div id="video-sources-dir" class="muted"></div>
+      <div id="selected-source-meta" class="muted"></div>
+      <details>
+        <summary>Advanced options</summary>
+        <label>Input video path (manual override)
+          <input id="input_path" placeholder="C:\\\\path\\\\to\\\\video.mp4" />
+        </label>
+      </details>
+    </fieldset>
+
+    <fieldset>
+      <legend>2) Analyze</legend>
+      <div class="chips">
+        <button type="button" id="analyze-btn">Analyze selected video</button>
+      </div>
+      <div id="analysis-status" class="status-line">idle</div>
+      <div id="analysis-summary" class="muted"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>3) Validate preprocessing</legend>
+      <h3>Recommended preprocessing</h3>
+      <div id="recommendation-status" class="muted">Run analysis to get recommendations.</div>
+      <table id="recommendations-table" class="hidden">
+        <thead>
+          <tr>
+            <th>Operation</th>
+            <th>Diagnostic</th>
+            <th>Recommendation</th>
+            <th>Confidence</th>
+            <th>Explanation</th>
+            <th>Validation / tweak command</th>
+          </tr>
+        </thead>
+        <tbody id="recommendations-body"></tbody>
+      </table>
+      <h3>Crop configuration</h3>
+      <label><input type="radio" name="crop_mode" value="preserve" checked /> Keep original frame</label>
+      <label><input type="radio" name="crop_mode" value="auto_crop" /> Apply recommended crop (if reliable)</label>
+      <label><input type="radio" name="crop_mode" value="custom_crop" /> Manual margins</label>
+      <div class="row">
+        <label>Top margin (px) <input id="crop_top" type="number" min="0" value="0" /></label>
+        <label>Bottom margin (px) <input id="crop_bottom" type="number" min="0" value="0" /></label>
+      </div>
+      <div class="row">
+        <label>Left margin (px) <input id="crop_left" type="number" min="0" value="0" /></label>
+        <label>Right margin (px) <input id="crop_right" type="number" min="0" value="0" /></label>
+      </div>
+      <div id="crop-dimensions" class="muted"></div>
+      <div id="preprocessing-plan-status" class="status-line">No plan generated yet.</div>
+      <div class="muted">Unsupported remote operations are displayed as disabled (deinterlace/denoise/deblock in this phase).</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>4) Configure and launch upscale</legend>
       <label>Mode
         <select id="mode">
           <option value="automatic">Automatic (create + cleanup)</option>
           <option value="manual">Manual (existing instance, no auto-destroy)</option>
         </select>
       </label>
-      <label>Input video path <input id="input_path" required /></label>
-      <label>Output path (optional) <input id="output_path" /></label>
-      <label>Report path (optional) <input id="report_path" /></label>
-      <label>Preprocessing plan path (optional) <input id="preprocessing_plan_path" /></label>
-      <label>Target width <input id="target_width" type="number" min="1" /></label>
-      <label>Target height <input id="target_height" type="number" min="1" /></label>
-      <label>GPU model
-        <select id="gpu_model"></select>
-      </label>
+      <div class="row">
+        <label>Target width <input id="target_width" type="number" min="1" /></label>
+        <label>Target height <input id="target_height" type="number" min="1" /></label>
+      </div>
       <label>Worker image tag <input id="worker_image" /></label>
+      <label>GPU model <select id="gpu_model"></select></label>
       <label>Sort offers by
         <select id="sort_by">
           <option value="price">price</option>
@@ -932,14 +1136,20 @@ _INDEX_HTML = """
           <option value="performance">performance</option>
         </select>
       </label>
-      <label>Offer ID (automatic mode optional) <input id="offer_id" type="number" /></label>
       <label>Instance ID (manual mode required) <input id="instance_id" type="number" /></label>
-      <label>SSH bootstrap mode
-        <select id="ssh_bootstrap_mode">
-          <option value="tofu">tofu</option>
-          <option value="strict">strict</option>
-        </select>
-      </label>
+      <details>
+        <summary>Advanced options</summary>
+        <label>Output path (optional) <input id="output_path" /></label>
+        <label>Report path (optional) <input id="report_path" /></label>
+        <label>Preprocessing plan path (manual override, optional) <input id="preprocessing_plan_path" /></label>
+        <label>Offer ID (automatic mode optional) <input id="offer_id" type="number" /></label>
+        <label>SSH bootstrap mode
+          <select id="ssh_bootstrap_mode">
+            <option value="tofu">tofu</option>
+            <option value="strict">strict</option>
+          </select>
+        </label>
+      </details>
     </fieldset>
     <button type="submit">Start</button>
     <button type="button" id="cancel-btn">Cancel</button>
@@ -955,12 +1165,249 @@ _INDEX_HTML = """
     let lastEventId = 0;
     let es = null;
     let promptDialogOpen = false;
+    let latestAnalysisPayload = null;
+    let latestPlanPayload = null;
+    let analysisRequestToken = 0;
+    let sourcesIndex = new Map();
     const handledPromptIds = new Set();
+    const unsupportedRemoteOps = new Set(["deinterlace", "denoise", "deblock"]);
 
     function appendEvent(msg) {
       const box = document.getElementById("events");
       box.textContent += msg + "\\n";
       box.scrollTop = box.scrollHeight;
+    }
+
+    function prettyBytes(size) {
+      if (typeof size !== "number" || Number.isNaN(size)) return "n/a";
+      if (size < 1024) return `${size} B`;
+      if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KB`;
+      if (size < 1024 ** 3) return `${(size / (1024 ** 2)).toFixed(1)} MB`;
+      return `${(size / (1024 ** 3)).toFixed(2)} GB`;
+    }
+
+    function readCropMode() {
+      const selected = document.querySelector("input[name='crop_mode']:checked");
+      return selected ? selected.value : "preserve";
+    }
+
+    function cropMarginsFromInputs() {
+      return {
+        top: Number(document.getElementById("crop_top").value || 0),
+        bottom: Number(document.getElementById("crop_bottom").value || 0),
+        left: Number(document.getElementById("crop_left").value || 0),
+        right: Number(document.getElementById("crop_right").value || 0),
+      };
+    }
+
+    function updateCropDimensionsPreview() {
+      const info = document.getElementById("crop-dimensions");
+      if (!latestAnalysisPayload || !latestAnalysisPayload.width || !latestAnalysisPayload.height) {
+        info.textContent = "Resulting dimensions: n/a";
+        return;
+      }
+      const srcW = Number(latestAnalysisPayload.width);
+      const srcH = Number(latestAnalysisPayload.height);
+      const mode = readCropMode();
+      if (mode !== "custom_crop") {
+        info.textContent = `Resulting dimensions: ${srcW} x ${srcH} (manual margins are ignored in this mode)`;
+        return;
+      }
+      const m = cropMarginsFromInputs();
+      const outW = srcW - m.left - m.right;
+      const outH = srcH - m.top - m.bottom;
+      info.textContent = `Resulting dimensions: ${outW} x ${outH} (source: ${srcW} x ${srcH})`;
+    }
+
+    function commandHintFor(opKey, planCropRect) {
+      if (opKey === "crop") {
+        if (!planCropRect) return "ffmpeg -i <input> -vf \\"crop=w:h:x:y\\" -f null -";
+        return `ffmpeg -i <input> -vf "crop=${planCropRect.width}:${planCropRect.height}:${planCropRect.x}:${planCropRect.y}" -f null -`;
+      }
+      if (opKey === "deinterlace") {
+        return "ffmpeg -i <input> -vf \\"idet,bwdif=mode=send_frame:parity=auto:deint=all\\" -f null -";
+      }
+      if (opKey === "denoise") {
+        return "ffmpeg -i <input> -vf \\"hqdn3d=1.5:1.5:6:6\\" -f null -";
+      }
+      if (opKey === "deblock") {
+        return "ffmpeg -i <input> -vf \\"deblock=filter=strong:block=4\\" -f null -";
+      }
+      return "n/a";
+    }
+
+    function diagnosticSummaryFor(opKey, analysis) {
+      const visual = analysis?.analysis_report?.visual_diagnostics || {};
+      if (opKey === "crop") {
+        const crop = visual.cropdetect || {};
+        const margins = crop.probable_margins;
+        if (margins) {
+          return `cropdetect: status=${crop.status || "unknown"}, margins T${margins.top || 0}/B${margins.bottom || 0}/L${margins.left || 0}/R${margins.right || 0}`;
+        }
+        return `cropdetect: status=${crop.status || "unknown"}`;
+      }
+      if (opKey === "deinterlace") {
+        const idet = visual.idet || {};
+        return `idet: classification=${idet.classification || "indeterminate"}, status=${idet.status || "unknown"}`;
+      }
+      if (opKey === "denoise" || opKey === "deblock") {
+        const noise = visual.noise_artifacts || {};
+        return `noise/artifacts: noise=${noise.likely_noise || "unknown"}, compression=${noise.likely_compression_artifacts || "unknown"}, status=${noise.status || "unknown"}`;
+      }
+      return "n/a";
+    }
+
+    function setRecommendationTableVisible(visible) {
+      document.getElementById("recommendations-table").classList.toggle("hidden", !visible);
+    }
+
+    function renderRecommendations(plan, analysis) {
+      const body = document.getElementById("recommendations-body");
+      body.innerHTML = "";
+      const byKey = new Map((plan.operations || []).map(op => [op.operation_id, op]));
+      const cropOp = byKey.get("crop");
+      const cropRect = cropOp?.parameters?.crop_rect || null;
+      const labels = {
+        crop: "Black-bar crop",
+        deinterlace: "Deinterlace",
+        denoise: "Noise reduction",
+        deblock: "Compression artifact reduction",
+      };
+
+      for (const rec of plan.recommendations || []) {
+        const op = byKey.get(rec.key);
+        const tr = document.createElement("tr");
+        const disabledNote = unsupportedRemoteOps.has(rec.key)
+          ? "Disabled in this phase (worker does not execute it remotely)."
+          : "Executable remotely.";
+        tr.innerHTML = `
+          <td><strong>${labels[rec.key] || rec.key}</strong><div class="muted">${disabledNote}</div></td>
+          <td>${diagnosticSummaryFor(rec.key, analysis)}</td>
+          <td>${rec.recommended_action || "unknown"}</td>
+          <td>${rec.confidence || "unknown"}</td>
+          <td>${rec.reason || ""}</td>
+          <td><code>${commandHintFor(rec.key, cropRect)}</code></td>
+        `;
+        body.appendChild(tr);
+      }
+      setRecommendationTableVisible((plan.recommendations || []).length > 0);
+      const warnings = (plan.warnings || []).join(" | ");
+      document.getElementById("recommendation-status").textContent = warnings
+        ? `Recommendations ready. Warnings: ${warnings}`
+        : "Recommendations ready.";
+    }
+
+    function currentUserChoices() {
+      const mode = readCropMode();
+      const choices = {
+        crop_mode: mode,
+        custom_crop_margins: null,
+        deinterlace_mode: "preserve",
+        denoise_mode: "preserve",
+        deblock_mode: "preserve",
+      };
+      if (mode === "custom_crop") {
+        choices.custom_crop_margins = cropMarginsFromInputs();
+      }
+      return choices;
+    }
+
+    async function loadVideoSources() {
+      const res = await fetch("/api/video/sources");
+      const data = await res.json();
+      if (!res.ok) {
+        appendEvent("Failed to list video sources: " + (data.detail || JSON.stringify(data)));
+        return;
+      }
+      const select = document.getElementById("source_name");
+      select.innerHTML = '<option value="">-- Select a video --</option>';
+      sourcesIndex = new Map();
+      for (const item of data.sources || []) {
+        const opt = document.createElement("option");
+        opt.value = item.name;
+        const modified = item.modified_at ? new Date(item.modified_at).toLocaleString() : "n/a";
+        opt.textContent = `${item.name} (${prettyBytes(item.size_bytes)}, ${modified})`;
+        select.appendChild(opt);
+        sourcesIndex.set(item.name, item);
+      }
+      document.getElementById("video-sources-dir").textContent = `Sources directory: ${data.directory}`;
+      appendEvent(`Video sources refreshed: ${(data.sources || []).length} selectable file(s).`);
+    }
+
+    async function rebuildPlanFromCurrentAnalysis(token) {
+      if (!latestAnalysisPayload) return;
+      const planStatus = document.getElementById("preprocessing-plan-status");
+      planStatus.textContent = "Building preprocessing plan...";
+      const response = await fetch("/api/video/preprocessing-plan", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          analysis_payload: latestAnalysisPayload,
+          user_choices: currentUserChoices(),
+        }),
+      });
+      const payload = await response.json();
+      if (token !== analysisRequestToken) return;
+      if (!response.ok) {
+        latestPlanPayload = null;
+        planStatus.textContent = "Preprocessing plan error: " + (payload.detail || JSON.stringify(payload));
+        setRecommendationTableVisible(false);
+        return;
+      }
+      latestPlanPayload = payload;
+      renderRecommendations(payload, latestAnalysisPayload);
+      const enabled = (payload.operations || []).filter(op => op.enabled).map(op => op.operation_id);
+      planStatus.textContent = enabled.length
+        ? `Plan ready. Enabled operations: ${enabled.join(", ")}`
+        : "Plan ready. No operation is enabled (legacy behavior on launch).";
+    }
+
+    async function analyzeSelectedSource() {
+      const sourceName = document.getElementById("source_name").value;
+      if (!sourceName) {
+        document.getElementById("analysis-status").textContent = "No source selected.";
+        return;
+      }
+      const token = ++analysisRequestToken;
+      latestAnalysisPayload = null;
+      latestPlanPayload = null;
+      setRecommendationTableVisible(false);
+      document.getElementById("analysis-status").textContent = "Analysis running...";
+      document.getElementById("analysis-summary").textContent = "";
+      document.getElementById("recommendation-status").textContent = "Waiting for analysis...";
+      const response = await fetch("/api/video/analyze", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          source_name: sourceName,
+          include_visual_diagnostics: true,
+        }),
+      });
+      const payload = await response.json();
+      if (token !== analysisRequestToken) return;
+      if (!response.ok) {
+        document.getElementById("analysis-status").textContent = "Analysis failed.";
+        document.getElementById("analysis-summary").textContent = payload.detail || JSON.stringify(payload);
+        return;
+      }
+      latestAnalysisPayload = payload;
+      const dims = payload.width && payload.height ? `${payload.width} x ${payload.height}` : "unknown size";
+      document.getElementById("analysis-status").textContent = "Analysis completed.";
+      document.getElementById("analysis-summary").textContent = `Codec: ${payload.video_codec || "unknown"}, ${dims}, fps: ${payload.frame_rate_fps || "unknown"}`;
+      updateCropDimensionsPreview();
+      await rebuildPlanFromCurrentAnalysis(token);
+    }
+
+    function selectedSourceChanged() {
+      const selected = document.getElementById("source_name").value;
+      const meta = sourcesIndex.get(selected);
+      if (!selected || !meta) {
+        document.getElementById("selected-source-meta").textContent = "";
+        return;
+      }
+      const modified = meta.modified_at ? new Date(meta.modified_at).toLocaleString() : "n/a";
+      document.getElementById("selected-source-meta").textContent = `Selected: ${meta.name} | ${prettyBytes(meta.size_bytes)} | modified ${modified}`;
+      analyzeSelectedSource();
     }
 
     async function loadDefaults() {
@@ -1034,12 +1481,24 @@ _INDEX_HTML = """
 
     document.getElementById("job-form").addEventListener("submit", async (event) => {
       event.preventDefault();
+      const sourceName = document.getElementById("source_name").value || null;
+      const manualInput = document.getElementById("input_path").value.trim();
+      if (!sourceName && !manualInput) {
+        appendEvent("Start failed: choose a source from video/ or provide a manual input path in advanced options.");
+        return;
+      }
+      const manualPlanPath = document.getElementById("preprocessing_plan_path").value.trim() || null;
+      const enabledRemoteCapable = (latestPlanPayload?.operations || []).some(
+        (op) => op.enabled && !unsupportedRemoteOps.has(op.operation_id)
+      );
       const payload = {
         mode: document.getElementById("mode").value,
-        input_path: document.getElementById("input_path").value,
+        source_name: sourceName,
+        input_path: sourceName ? null : manualInput,
         output_path: document.getElementById("output_path").value || null,
         report_path: document.getElementById("report_path").value || null,
-        preprocessing_plan_path: document.getElementById("preprocessing_plan_path").value || null,
+        preprocessing_plan_path: manualPlanPath,
+        preprocessing_plan_payload: manualPlanPath ? null : (enabledRemoteCapable ? latestPlanPayload : null),
         target_width: Number(document.getElementById("target_width").value),
         target_height: Number(document.getElementById("target_height").value),
         gpu_model: document.getElementById("gpu_model").value || null,
@@ -1059,6 +1518,9 @@ _INDEX_HTML = """
         appendEvent("Start failed: " + (data.detail || JSON.stringify(data)));
         return;
       }
+      if (manualPlanPath && latestPlanPayload) {
+        appendEvent("Manual preprocessing plan path is set: it overrides UI-generated preprocessing choices.");
+      }
       currentJobId = data.job_id;
       lastEventId = 0;
       handledPromptIds.clear();
@@ -1074,7 +1536,27 @@ _INDEX_HTML = """
       appendEvent("Cancel requested.");
     });
 
+    document.getElementById("refresh-sources-btn").addEventListener("click", loadVideoSources);
+    document.getElementById("source_name").addEventListener("change", selectedSourceChanged);
+    document.getElementById("analyze-btn").addEventListener("click", analyzeSelectedSource);
+    for (const radio of document.querySelectorAll("input[name='crop_mode']")) {
+      radio.addEventListener("change", async () => {
+        updateCropDimensionsPreview();
+        const token = ++analysisRequestToken;
+        await rebuildPlanFromCurrentAnalysis(token);
+      });
+    }
+    for (const id of ["crop_top", "crop_bottom", "crop_left", "crop_right"]) {
+      document.getElementById(id).addEventListener("input", async () => {
+        updateCropDimensionsPreview();
+        if (readCropMode() !== "custom_crop") return;
+        const token = ++analysisRequestToken;
+        await rebuildPlanFromCurrentAnalysis(token);
+      });
+    }
+
     loadDefaults();
+    loadVideoSources();
   </script>
 </body>
 </html>

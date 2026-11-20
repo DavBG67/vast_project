@@ -206,6 +206,18 @@ V1 behavior:
 - Automatic mode rejects placeholder Docker tags (for example `ghcr.io/acme/worker:test`); if no known real tag exists, enter one explicitly.
 - No secrets are exposed to browser payloads.
 - Existing output/report files are never overwritten.
+- Main workflow is now organized in 4 steps:
+  1. Choose video (from `<project-root>/video/`)
+  2. Analyze locally (FFprobe + visual diagnostics such as cropdetect/idet)
+  3. Validate preprocessing choices
+  4. Configure and launch upscale
+- Video sources are listed from `<project-root>/video/` (project-root derived from package location, not process CWD).
+- Explicit source exclusion rule in video listing: files ending with `-upscaled.<ext>`, `-cropped.<ext>`, and `*.report.json` are hidden from source selection.
+- Path safety for source selection: no path traversal, no path separators in source names, and no resolved path outside the allowed `video/` directory.
+- Manual input path remains available under Advanced options for compatibility/troubleshooting.
+- `Preprocessing plan path (optional)` remains available under Advanced options.
+- If both a generated in-UI preprocessing plan and a manual preprocessing plan path are provided, the manual path takes precedence.
+- In this phase, only crop is executed remotely; other recommendations (deinterlace/denoise/deblock) are displayed as disabled/advisory in UI.
 
 Produced files and local state:
 
