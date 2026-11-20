@@ -243,6 +243,14 @@ Produced files and local state:
   - Phase 5G.2 enriches static worker inventory in `hardware`, `software`, and `environment` (best-effort, sensitive identifiers excluded by default).
   - Phase 5G.3 adds dynamic `telemetry.raw_samples` and `telemetry.aggregates` (GPU/CPU/RAM/storage best-effort, monotonic elapsed time, bounded memory with explicit `dropped_samples`).
   - Phase 5G.4 enriches `transfer_metrics` and `timings` with monotonic upload/remote execution/download/total durations and effective transfer throughput (MiB/s, job-scoped measurement only).
+  - Phase 5G.5 enriches `instance_metadata` and `cost_estimate` with Vast.ai declared metadata (instance id/status, declared GPU/CPU/RAM/storage/network/location, requested/effective worker image, declared hourly price when available) and estimated costs derived from measured durations.
+  - Provenance in v2:
+    - `observed`: metric measured by worker/orchestrator.
+    - `declared`: value provided by Vast.ai API/offer payload.
+    - `estimated`: value computed from measured + declared inputs.
+    - `unavailable`: information not accessible at report generation time.
+  - Sensitive identifiers (hostname, IP, machine_id, GPU UUID) are excluded from report payload by default.
+  - Cost estimates are informational only and may differ from actual provider billing. In manual mode, total rental cost can exceed measured job-window estimates.
 - Session store: `%USERPROFILE%\.vast_upscaler\sessions.json`
 - Provisioning history store: `%USERPROFILE%\.vast_upscaler\provisioning_history.json`
 - Workflow lock: `%USERPROFILE%\.vast_upscaler\workflow.lock`
@@ -255,6 +263,19 @@ Common errors and actions:
 - `SSH trust bootstrap required`: validate fingerprint manually, update known_hosts, then retry.
 - `Destroy requested but disappearance not verified`: run `upscaler instances`, then `upscaler destroy <id> --yes`, then `upscaler session cleanup`.
 - `Cancelled before paid operation`: rerun and confirm only if estimate/risk is acceptable.
+
+## Phase 5G real-instance validation checklist (manual execution)
+
+Run this checklist on a real Vast.ai instance only when explicitly approved:
+
+1. Run one job in automatic mode and one in manual mode (same source/profile when possible).
+2. Confirm report keeps legacy top-level fields and includes v2 sections (`telemetry`, `transfer_metrics`, `timings`, `instance_metadata`, `cost_estimate`, `metric_schema`).
+3. Check `instance_metadata.declared` values match available Vast.ai instance/offer data (without expecting unavailable fields).
+4. Verify sensitive identifiers are not present (no hostname/IP/machine_id/GPU UUID in report).
+5. Check `timings.processing_seconds` vs `timings.remote_execution_seconds` and `timings.total_job_seconds` are coherent.
+6. Confirm upload/download bytes, durations, and MiB/s are populated when transfers complete.
+7. If hourly price is available, confirm `processing_cost_estimate_usd` and `job_cost_estimate_usd` are computed; otherwise remain null with warnings.
+8. Validate `collection_warnings` documents missing metrics/API gaps instead of failing the job.
 
 Offline mode (no Vast API call):
 

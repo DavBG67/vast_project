@@ -86,6 +86,18 @@ class InstanceSummary:
     gpu_name: str | None = None
     machine_id: str | None = None
     status_message: str | None = None
+    num_gpus: int | None = None
+    gpu_ram_mb: int | None = None
+    cpu_name: str | None = None
+    cpu_cores_effective: int | None = None
+    cpu_threads: int | None = None
+    cpu_ram_mb: int | None = None
+    disk_space_gb: float | None = None
+    inet_up_mbps: float | None = None
+    inet_down_mbps: float | None = None
+    location: str | None = None
+    hourly_price_usd: float | None = None
+    image_name: str | None = None
 
 
 class VastWriteClient:
@@ -163,6 +175,18 @@ class VastWriteClient:
             gpu_name=_as_optional_str(raw.get("gpu_name")),
             machine_id=_as_optional_str(raw.get("machine_id")),
             status_message=_status_message(raw),
+            num_gpus=_as_optional_int(raw.get("num_gpus")),
+            gpu_ram_mb=_as_optional_int(raw.get("gpu_ram") if raw.get("gpu_ram") is not None else raw.get("gpu_ram_mb")),
+            cpu_name=_as_optional_str(raw.get("cpu_name")),
+            cpu_cores_effective=_as_optional_int(raw.get("cpu_cores_effective")),
+            cpu_threads=_as_optional_int(raw.get("cpu_threads")),
+            cpu_ram_mb=_as_optional_int(raw.get("cpu_ram")),
+            disk_space_gb=_as_optional_float(raw.get("disk_space")),
+            inet_up_mbps=_as_optional_float(raw.get("inet_up")),
+            inet_down_mbps=_as_optional_float(raw.get("inet_down")),
+            location=_as_optional_str(raw.get("geolocation") if raw.get("geolocation") is not None else raw.get("geoloc")),
+            hourly_price_usd=_as_optional_float(raw.get("dph_total")),
+            image_name=_as_optional_str(raw.get("image")),
         )
 
     def list_instances(self, *, limit: int = 25, select_filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -317,7 +341,31 @@ def _as_optional_str(value: Any) -> str | None:
 
 
 def _as_optional_int(value: Any) -> int | None:
-    return value if isinstance(value, int) else None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+    return None
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _status_message(raw: dict[str, Any]) -> str | None:

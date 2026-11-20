@@ -33,6 +33,7 @@ from vast_upscaler.provisioning_history import (
     ProvisioningHistoryStore,
     ProvisioningOutcome,
 )
+from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.remote_worker import (
     RemoteWorkerAmbiguousStateError,
     RemoteWorkerRequest,
@@ -266,6 +267,7 @@ def run_upscale_workflow(
     processing_succeeded = False
     cleanup_warning: str | None = None
     cleanup_verified = False
+    instance_summary: InstanceSummary | None = None
 
     try:
         first_status_reported = False
@@ -299,6 +301,7 @@ def run_upscale_workflow(
             ),
             on_status=_on_instance_status,
         )
+        instance_summary = summary
         session.transition_to("INSTANCE_READY", reason="Instance ready for SSH")
         tracker.mark_instance_ready(summary)
         provisioning_succeeded = True
@@ -390,6 +393,16 @@ def run_upscale_workflow(
             max_wait_seconds=options.max_destroy_wait_seconds,
             poll_interval_seconds=options.poll_interval_seconds,
         )
+
+    _safe_enrich_local_report(
+        report_path=options.report_path,
+        mode="automatic",
+        requested_worker_image=options.worker_image,
+        instance=instance_summary,
+        offer=offer,
+        session=session,
+        session_store=session_store,
+    )
 
     if primary_error is not None:
         if cleanup_warning:
@@ -872,6 +885,29 @@ def _create_session(options: OrchestrationOptions) -> SessionRecord:
         input_path=str(options.input_path),
         output_path=str(options.output_path),
     )
+
+
+def _safe_enrich_local_report(
+    *,
+    report_path: Path,
+    mode: str,
+    requested_worker_image: str | None,
+    instance: InstanceSummary | None,
+    offer: OfferCandidate | None,
+    session: SessionRecord,
+    session_store: SessionStore,
+) -> None:
+    try:
+        enrich_local_report_with_vast_metadata(
+            report_path=report_path,
+            mode=mode,
+            requested_worker_image=requested_worker_image,
+            instance=instance,
+            offer=offer,
+        )
+    except Exception as exc:  # noqa: BLE001
+        session.notes.append(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} report-enrichment-warning: {exc}")
+        session_store.save(session)
 
 
 def _resume_options() -> OrchestrationOptions:

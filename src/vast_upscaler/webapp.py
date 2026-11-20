@@ -44,6 +44,7 @@ from vast_upscaler.preprocessing_planner import (
     build_preprocessing_plan,
     load_analysis_payload_from_file,
 )
+from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.provisioning_history import ProvisioningAttemptTracker
 from vast_upscaler.remote_worker import (
     RemoteWorkerRequest,
@@ -58,7 +59,7 @@ from vast_upscaler.source_analysis import (
 )
 from vast_upscaler.transfer import OpenSshTransport
 from vast_upscaler.vast_client import VastClient, VastClientConfig
-from vast_upscaler.vast_write_client import VastWriteClient
+from vast_upscaler.vast_write_client import InstanceSummary, VastWriteClient
 
 RunMode = Literal["automatic", "manual"]
 SortBy = Literal["price", "reliability", "performance"]
@@ -644,6 +645,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
     transport = OpenSshTransport()
     write_client = _build_write_client(settings)
     started = time.perf_counter()
+    instance: InstanceSummary | None = None
     callbacks.report_provisioning_status(
         {
             "phase": "worker-image",
@@ -716,6 +718,13 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             ),
             progress_callback=lambda payload: callbacks.report_worker_progress(payload),
         )
+        enrich_local_report_with_vast_metadata(
+            report_path=worker_result.local_report_path,
+            mode="manual",
+            requested_worker_image=request.worker_image,
+            instance=instance,
+            offer=None,
+        )
         elapsed = time.perf_counter() - started
         return WorkflowExecutionResult(
             mode="manual",
@@ -730,6 +739,15 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             cleanup_verified=False,
             cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
         )
+    except Exception:
+        enrich_local_report_with_vast_metadata(
+            report_path=report_path,
+            mode="manual",
+            requested_worker_image=request.worker_image,
+            instance=instance,
+            offer=None,
+        )
+        raise
     finally:
         write_client.close()
 
