@@ -32,6 +32,17 @@ Pour chaque exécution, il:
 - DiT par défaut: `seedvr2_ema_3b_fp8_e4m3fn.safetensors`
 - VAE attendu: `ema_vae_fp16.safetensors`
 
+Identité vérifiée contre le commit SeedVR2 épinglé:
+
+- `seedvr2_ema_3b_fp8_e4m3fn.safetensors`
+  - repo: `numz/SeedVR2_comfyUI`
+  - SHA256: `3bf1e43ebedd570e7e7a0b1b60d6a02e105978f505c8128a241cde99a8240cff`
+  - URL: `https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors`
+- `ema_vae_fp16.safetensors`
+  - repo: `numz/SeedVR2_comfyUI`
+  - SHA256: `20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1`
+  - URL: `https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/ema_vae_fp16.safetensors`
+
 Le commit de code SeedVR2 utilisé dans l'image est figé via:
 
 - `ARG NUMZ_REPO_REF=4490bd1f482e026674543386bb2a4d176da245b9`
@@ -45,6 +56,17 @@ Le commit de code SeedVR2 utilisé dans l'image est figé via:
   - `torch.version.cuda==13.0`
 - Contraintes pip figées:
   - `prototype/seedvr2/requirements.constraints.txt`
+- Vérification build additionnelle:
+  - `python /opt/seedvr2/inference_cli.py --help`
+  - présence des options critiques (`--dit_model`, `--attention_mode`, `--blocks_to_swap`, `--vae_encode_tiled`).
+
+## Préflight GPU au démarrage
+
+Avant extraction/inférence, le runner exécute un préflight CUDA:
+
+- journalise `torch.__version__`, `torch.version.cuda`, `torch.cuda.get_arch_list()`, nom GPU et capacité détectée;
+- échoue explicitement si CUDA est indisponible;
+- échoue explicitement si `sm_120` n'est pas présent dans la liste d'architectures compilées PyTorch.
 
 ## Build local (validation statique)
 
@@ -140,4 +162,17 @@ Go technique minimal:
 8. Rapatrier `run.log` + `prototype-report.json` + MP4.
 9. Détruire immédiatement l'instance.
 10. Décider go/no-go d'intégration applicative à partir des résultats réels.
+
+Commande de référence (instance Vast.ai Linux, image déjà buildée localement):
+
+```bash
+docker run --rm --gpus all \
+  -v /workspace/video:/workspace/input \
+  -v /workspace/data/seedvr2-output:/workspace/output \
+  -v /workspace/data/seedvr2-cache:/workspace/cache/seedvr2 \
+  -v /workspace/data/seedvr2-tmp:/workspace/tmp \
+  vast-seedvr2-proto:exp-6a2-v1 \
+  --input-video /workspace/input/RS_Negociate_360p.mkv \
+  --profile smoke
+```
 

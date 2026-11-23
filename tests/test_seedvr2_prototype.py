@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from vast_upscaler.seedvr2_prototype import (
     PROFILE_REFERENCE,
     PROFILE_SMOKE,
     PROFILES,
+    _build_cuda_preflight_command,
+    _build_seedvr2_command,
+    _model_identity_payload,
     detect_oom_failure,
     parse_timecode_to_seconds,
 )
@@ -36,4 +41,41 @@ def test_detect_oom_failure_matches_common_cuda_errors() -> None:
     assert detect_oom_failure("RuntimeError: CUDA out of memory while allocating tensor")
     assert detect_oom_failure("CUBLAS_STATUS_ALLOC_FAILED")
     assert not detect_oom_failure("Completed successfully")
+
+
+def test_seedvr2_command_uses_expected_cli_flags() -> None:
+    command = _build_seedvr2_command(
+        excerpt_path=Path("/tmp/in.mkv"),
+        raw_output_path=Path("/tmp/out.mp4"),
+        profile=PROFILE_SMOKE,
+        cache_dir=Path("/tmp/cache"),
+        dit_model="seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+        attention_mode="sdpa",
+    )
+    rendered = " ".join(command)
+    assert "--output_format mp4" in rendered
+    assert "--video_backend ffmpeg" in rendered
+    assert "--attention_mode sdpa" in rendered
+    assert "--blocks_to_swap 32" in rendered
+    assert "--vae_encode_tiled" in rendered
+    assert "--vae_decode_tiled" in rendered
+
+
+def test_model_identity_payload_matches_pinned_checkpoint_metadata() -> None:
+    dit_metadata = _model_identity_payload("seedvr2_ema_3b_fp8_e4m3fn.safetensors")
+    assert dit_metadata["repo"] == "numz/SeedVR2_comfyUI"
+    assert (
+        dit_metadata["download_url"]
+        == "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+    )
+    assert (
+        dit_metadata["sha256"]
+        == "3bf1e43ebedd570e7e7a0b1b60d6a02e105978f505c8128a241cde99a8240cff"
+    )
+
+
+def test_cuda_preflight_checks_sm_120_arch() -> None:
+    command = _build_cuda_preflight_command()
+    assert command[0:2] == ["python", "-c"]
+    assert "Missing sm_120 in torch CUDA arch list" in command[2]
 

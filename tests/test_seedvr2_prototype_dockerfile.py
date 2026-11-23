@@ -21,6 +21,8 @@ def test_seedvr2_prototype_dockerfile_pins_runtime_and_seedvr2_source_ref() -> N
     assert "EXPECTED_TORCH_VERSION=2.14.1" in content
     assert "EXPECTED_TORCHVISION_VERSION=0.29.1" in content
     assert "EXPECTED_CUDA_VERSION=13.0" in content
+    assert "python /opt/seedvr2/inference_cli.py --help > /tmp/seedvr2-help.txt" in content
+    assert "grep -q -- '--dit_model' /tmp/seedvr2-help.txt" in content
 
 
 def test_seedvr2_prototype_constraints_lock_direct_dependencies() -> None:

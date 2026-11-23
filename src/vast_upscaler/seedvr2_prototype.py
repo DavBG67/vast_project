@@ -13,6 +13,17 @@ from pathlib import Path
 
 DEFAULT_DIT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 DEFAULT_VAE_MODEL = "ema_vae_fp16.safetensors"
+_HF_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
+_MODEL_METADATA = {
+    "seedvr2_ema_3b_fp8_e4m3fn.safetensors": {
+        "repo": "numz/SeedVR2_comfyUI",
+        "sha256": "3bf1e43ebedd570e7e7a0b1b60d6a02e105978f505c8128a241cde99a8240cff",
+    },
+    "ema_vae_fp16.safetensors": {
+        "repo": "numz/SeedVR2_comfyUI",
+        "sha256": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -90,6 +101,48 @@ def parse_timecode_to_seconds(value: str) -> float:
 def detect_oom_failure(log_output: str) -> bool:
     lowered = log_output.lower()
     return any(pattern in lowered for pattern in _OOM_PATTERNS)
+
+
+def _model_identity_payload(filename: str) -> dict[str, str | None]:
+    metadata = _MODEL_METADATA.get(filename)
+    if not metadata:
+        return {
+            "filename": filename,
+            "repo": None,
+            "sha256": None,
+            "download_url": None,
+        }
+    repo = str(metadata["repo"])
+    return {
+        "filename": filename,
+        "repo": repo,
+        "sha256": str(metadata["sha256"]),
+        "download_url": _HF_BASE_URL.format(repo=repo, filename=filename),
+    }
+
+
+def _build_cuda_preflight_command(required_arch_token: str = "sm_120") -> list[str]:
+    preflight_script = f"""
+import json
+import torch
+
+payload = {{
+    "torch_version": torch.__version__,
+    "compiled_cuda_version": str(torch.version.cuda),
+    "cuda_available": bool(torch.cuda.is_available()),
+}}
+if not payload["cuda_available"]:
+    raise SystemExit("CUDA unavailable in container")
+
+arch_list = list(getattr(torch.cuda, "get_arch_list", lambda: [])())
+payload["torch_cuda_arch_list"] = arch_list
+payload["gpu_name"] = torch.cuda.get_device_name(0)
+payload["gpu_capability"] = list(torch.cuda.get_device_capability(0))
+print(json.dumps(payload))
+if "{required_arch_token}" not in arch_list:
+    raise SystemExit("Missing {required_arch_token} in torch CUDA arch list")
+"""
+    return ["python", "-c", preflight_script]
 
 
 def _build_extract_command(
@@ -295,17 +348,49 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    start_timecode = args.start_timecode or profile.excerpt_start
-    start_seconds = parse_timecode_to_seconds(start_timecode)
-    duration_seconds = float(args.duration_seconds or profile.excerpt_duration_seconds)
-
     excerpt_path = work_dir / "input_excerpt.mkv"
     raw_output_path = work_dir / "seedvr2_raw.mp4"
     final_output_path = run_dir / "upscaled_h264_aac.mp4"
     log_path = run_dir / "run.log"
     report_path = run_dir / "prototype-report.json"
 
+    start_timecode = args.start_timecode or profile.excerpt_start
+
+    report_payload = {
+        "status": "pending",
+        "profile": profile.name,
+        "input_video": str(input_video),
+        "run_directory": str(run_dir),
+        "work_directory": str(work_dir),
+        "cache_directory": str(cache_dir),
+        "checkpoints": {
+            "dit_model": _model_identity_payload(args.dit_model),
+            "vae_model": _model_identity_payload(DEFAULT_VAE_MODEL),
+        },
+        "attention_mode": args.attention_mode,
+        "parameters": {
+            "profile": asdict(profile),
+            "start_timecode": start_timecode,
+            "duration_seconds": float(args.duration_seconds or profile.excerpt_duration_seconds),
+        },
+        "log_file": str(log_path),
+        "output_file": str(final_output_path),
+        "oom_detected": False,
+    }
+
+    _write_report(report_path, report_payload)
+    try:
+        start_seconds = parse_timecode_to_seconds(start_timecode)
+        duration_seconds = float(args.duration_seconds or profile.excerpt_duration_seconds)
+    except ValueError as exc:
+        report_payload["status"] = "failed"
+        report_payload["error"] = str(exc)
+        _write_report(report_path, report_payload)
+        print(str(exc), file=sys.stderr)
+        return 1
+
     commands = {
+        "cuda_preflight": _build_cuda_preflight_command(),
         "extract_excerpt": _build_extract_command(
             input_video=input_video,
             excerpt_path=excerpt_path,
@@ -327,29 +412,10 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         ),
     }
 
-    report_payload = {
-        "status": "pending",
-        "profile": profile.name,
-        "input_video": str(input_video),
-        "run_directory": str(run_dir),
-        "work_directory": str(work_dir),
-        "cache_directory": str(cache_dir),
-        "checkpoints": {
-            "dit_model": args.dit_model,
-            "vae_model": DEFAULT_VAE_MODEL,
-        },
-        "attention_mode": args.attention_mode,
-        "parameters": {
-            "profile": asdict(profile),
-            "start_timecode": start_timecode,
-            "start_seconds": start_seconds,
-            "duration_seconds": duration_seconds,
-        },
-        "commands": {key: _format_command(value) for key, value in commands.items()},
-        "log_file": str(log_path),
-        "output_file": str(final_output_path),
-        "oom_detected": False,
-    }
+    report_payload["parameters"]["start_seconds"] = start_seconds
+    report_payload["parameters"]["duration_seconds"] = duration_seconds
+    report_payload["commands"] = {key: _format_command(value) for key, value in commands.items()}
+    _write_report(report_path, report_payload)
 
     if not input_video.exists():
         report_payload["status"] = "failed"
