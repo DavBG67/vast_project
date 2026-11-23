@@ -10,6 +10,7 @@ def test_seedvr2_prototype_dockerfile_isolated_from_stable_worker() -> None:
     content = DOCKERFILE_PATH.read_text(encoding="utf-8")
     assert "COPY worker/" not in content
     assert "worker/process.py" not in content
+    assert "python3-venv" in content
     assert "COPY src/vast_upscaler/seedvr2_prototype.py" in content
     assert 'ENTRYPOINT ["python", "/opt/prototype/seedvr2_prototype.py"]' in content
     assert "ARG VENV_PATH=/opt/seedvr2-venv" in content

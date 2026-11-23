@@ -16,7 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ffmpeg git ca-certificates; \
+    apt-get install -y --no-install-recommends ffmpeg git ca-certificates python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
 RUN git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git /opt/seedvr2 \
