@@ -928,10 +928,15 @@ def test_web_rejects_parallel_jobs(tmp_path: Path, monkeypatch) -> None:
 
     app = create_app(config_path=config_path, auto_runner=_auto_runner)
     client = TestClient(app)
+    request_payload = {
+        "mode": "automatic",
+        "input_path": str(source),
+        "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-testparallel",
+    }
 
-    first = client.post("/api/jobs/start", json={"mode": "automatic", "input_path": str(source)})
+    first = client.post("/api/jobs/start", json=request_payload)
     assert first.status_code == 200
-    second = client.post("/api/jobs/start", json={"mode": "automatic", "input_path": str(source)})
+    second = client.post("/api/jobs/start", json=request_payload)
     assert second.status_code == 409
 
     cancel = client.post(f"/api/jobs/{first.json()['job_id']}/cancel")
