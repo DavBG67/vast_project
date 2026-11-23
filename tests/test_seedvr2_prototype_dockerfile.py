@@ -38,5 +38,6 @@ def test_seedvr2_prototype_constraints_lock_direct_dependencies() -> None:
     assert "torchvision==0.29.1" in content
     assert "numpy==2.2.6" in content
     assert "diffusers==0.33.1" in content
+    assert "transformers==4.57.1" in content
     assert "gguf==0.17.1" in content
 
