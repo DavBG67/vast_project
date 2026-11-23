@@ -56,8 +56,13 @@ Le commit de code SeedVR2 utilisé dans l'image est figé via:
   - `torch.version.cuda==13.0`
 - Contraintes pip figées:
   - `prototype/seedvr2/requirements.constraints.txt`
+- Installation Python isolée:
+  - venv dédié: `/opt/seedvr2-venv`
+  - `VENV_PATH` + `PATH` pointent vers le venv
+  - `python` à l'exécution résout vers `/opt/seedvr2-venv/bin/python`
+  - les dépendances `torch`/`torchvision` du `requirements.txt` amont sont filtrées à l'installation pour éviter toute réinstallation involontaire.
 - Vérification build additionnelle:
-  - `python /opt/seedvr2/inference_cli.py --help`
+  - `python /opt/seedvr2/inference_cli.py --help` (depuis le venv)
   - présence des options critiques (`--dit_model`, `--attention_mode`, `--blocks_to_swap`, `--vae_encode_tiled`).
 
 ## Préflight GPU au démarrage
@@ -74,14 +79,20 @@ Avant extraction/inférence, le runner exécute un préflight CUDA:
 docker build -f prototype/seedvr2/Dockerfile -t vast-seedvr2-proto:exp-6a2-v1 .
 ```
 
-## Build CI manuel (GitHub Actions, sans push)
+## Build CI GitHub Actions (sans push GHCR)
 
 Workflow dédié: `.github/workflows/seedvr2-docker.yml`
 
-- déclenchement: `workflow_dispatch` uniquement;
+- déclenchement:
+  - automatique sur push des branches `seedvr2/**` (avec filtres de chemins SeedVR2) ;
+  - manuel via `workflow_dispatch` conservé ;
 - construit exclusivement `prototype/seedvr2/Dockerfile`;
 - n'effectue aucun push GHCR;
-- n'exécute aucune inférence GPU.
+- n'exécute aucune inférence GPU;
+- vérifie après build:
+  - présence de l'image locale;
+  - démarrage de la CLI prototype via `--help`;
+  - exécutable Python du venv + versions `torch` / `torchvision` / CUDA compilée.
 
 Déclenchement depuis GitHub:
 
