@@ -1,0 +1,63 @@
+name: seedvr2-docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: "Prototype Dockerfile path"
+        required: true
+        type: string
+        default: "prototype/seedvr2/Dockerfile"
+      image_name:
+        description: "Local image tag built in CI runner"
+        required: true
+        type: string
+        default: "vast-seedvr2-proto:ci-smoke"
+
+permissions:
+  contents: read
+
+jobs:
+  build-prototype:
+    runs-on: ubuntu-latest
+    env:
+      DOCKERFILE_PATH: ${{ inputs.dockerfile }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Dockerfile path
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$DOCKERFILE_PATH" != "prototype/seedvr2/Dockerfile" ]; then
+            echo "Only prototype/seedvr2/Dockerfile is allowed in this workflow." >&2
+            exit 1
+          fi
+          test -f "$DOCKERFILE_PATH"
+
+      - name: Build SeedVR2 prototype image (no push)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --file "$DOCKERFILE_PATH" --tag "$IMAGE_NAME" .
+
+      - name: Smoke check image exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGE_NAME" >/dev/null
+
+      - name: Workflow summary
+        shell: bash
+        run: |
+          {
+            echo "## SeedVR2 Docker build";
+            echo "- Workflow trigger: manual (workflow_dispatch)";
+            echo "- Dockerfile: \`$DOCKERFILE_PATH\`";
+            echo "- Image tag: \`$IMAGE_NAME\`";
+            echo "- Build: passed";
+            echo "- Push to GHCR: not performed";
+            echo "- GPU inference: not executed";
+          } >> "$GITHUB_STEP_SUMMARY"

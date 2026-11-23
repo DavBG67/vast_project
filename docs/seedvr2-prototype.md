@@ -74,6 +74,31 @@ Avant extraction/inférence, le runner exécute un préflight CUDA:
 docker build -f prototype/seedvr2/Dockerfile -t vast-seedvr2-proto:exp-6a2-v1 .
 ```
 
+## Build CI manuel (GitHub Actions, sans push)
+
+Workflow dédié: `.github/workflows/seedvr2-docker.yml`
+
+- déclenchement: `workflow_dispatch` uniquement;
+- construit exclusivement `prototype/seedvr2/Dockerfile`;
+- n'effectue aucun push GHCR;
+- n'exécute aucune inférence GPU.
+
+Déclenchement depuis GitHub:
+
+1. Ouvrir **Actions**.
+2. Sélectionner **seedvr2-docker**.
+3. Cliquer **Run workflow**.
+4. Laisser les valeurs par défaut:
+   - `dockerfile=prototype/seedvr2/Dockerfile`
+   - `image_name=vast-seedvr2-proto:ci-smoke`
+5. Lancer.
+
+Le workflow échoue explicitement si:
+
+- le chemin Dockerfile n'est pas celui du prototype;
+- le build Docker échoue;
+- l'image construite est introuvable après build.
+
 ## Cache persistant des poids
 
 Utiliser un volume hôte monté dans `/workspace/cache/seedvr2`:
