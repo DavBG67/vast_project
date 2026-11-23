@@ -73,6 +73,9 @@ def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
     assert "vast_api_key" not in body
     assert "worker_image_latest_known" in body
     assert body["worker_image_latest_known"] != "ghcr.io/acme/worker:test"
+    assert body["default_engine"] == "realesrgan"
+    assert set(body["engines"]) == {"realesrgan", "seedvr2"}
+    assert set(body["seedvr2_profiles"]) == {"smoke", "reference"}
 
 
 def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -> None:
@@ -111,6 +114,8 @@ def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) ->
         "crop_bottom",
         "crop_left",
         "crop_right",
+        "engine",
+        "seedvr2_profile",
         "mode",
         "worker_image",
         "status",
@@ -965,6 +970,49 @@ def test_web_rejects_placeholder_worker_image_for_automatic_mode(tmp_path: Path,
     assert "placeholder worker image" in response.json()["detail"]
 
 
+def test_web_rejects_seedvr2_in_automatic_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "automatic",
+            "engine": "seedvr2",
+            "input_path": str(source),
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-1234",
+        },
+    )
+    assert response.status_code == 400
+    assert "manual mode only" in response.json()["detail"]
+
+
+def test_web_rejects_worker_image_repo_mismatch_for_selected_engine(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/jobs/start",
+        json={
+            "mode": "manual",
+            "engine": "seedvr2",
+            "input_path": str(source),
+            "instance_id": 123,
+            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-1",
+        },
+    )
+    assert response.status_code == 400
+    assert "repository mismatch" in response.json()["detail"]
+
+
 def test_manual_mode_keeps_instance_on_failure(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
@@ -1153,6 +1201,7 @@ def test_web_auto_and_manual_use_identical_preprocessing_contract(tmp_path: Path
     monkeypatch.setattr("vast_upscaler.webapp._build_trusted_connection", lambda **_kwargs: object())
     monkeypatch.setattr("vast_upscaler.webapp._resolve_private_key", lambda **_kwargs: Path("C:/keys/id_ed25519"))
     monkeypatch.setattr("vast_upscaler.webapp.OpenSshTransport.check_ssh_ready", lambda *_a, **_k: None)
+    monkeypatch.setattr("vast_upscaler.webapp._run_manual_engine_preflight", lambda **_kwargs: None)
 
     def _fake_execute_remote_worker(**kwargs):
         captured_manual["contract"] = kwargs["request"].preprocessing_contract

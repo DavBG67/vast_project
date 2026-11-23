@@ -13,6 +13,7 @@ from vast_upscaler.seedvr2_prototype import (
     _model_identity_payload,
     detect_oom_failure,
     parse_timecode_to_seconds,
+    run_cli,
 )
 
 
@@ -78,4 +79,40 @@ def test_cuda_preflight_checks_sm_120_arch() -> None:
     command = _build_cuda_preflight_command()
     assert command[0:2] == ["python", "-c"]
     assert "Missing sm_120 in torch CUDA arch list" in command[2]
+
+
+def test_run_cli_input_is_excerpt_skips_internal_extract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"video")
+    output_root = tmp_path / "out"
+    work_root = tmp_path / "work"
+    cache_dir = tmp_path / "cache"
+    executed_stages: list[str] = []
+
+    def _fake_run_command(command, *, log_file, stage_name):
+        executed_stages.append(stage_name)
+        if stage_name == "mux_h264_aac":
+            for idx, token in enumerate(command):
+                if token == "-y" and idx + 1 < len(command):
+                    Path(command[idx + 1]).write_bytes(b"ok")
+        return (0, "ok", 0.01)
+
+    monkeypatch.setattr("vast_upscaler.seedvr2_prototype._run_command", _fake_run_command)
+    exit_code = run_cli(
+        [
+            "--input-video",
+            str(source),
+            "--profile",
+            "smoke",
+            "--output-root",
+            str(output_root),
+            "--work-root",
+            str(work_root),
+            "--cache-dir",
+            str(cache_dir),
+            "--input-is-excerpt",
+        ]
+    )
+    assert exit_code == 0
+    assert "extract_excerpt" not in executed_stages
 

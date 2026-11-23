@@ -4,18 +4,20 @@
 
 Valider la **faisabilité technique** de SeedVR2 3B FP8 sur GPU 16 Go (RTX 5080 visée) sans modifier le pipeline stable Real-ESRGAN.
 
-Ce prototype est isolé:
+Ce prototype reste isolé côté image/runner:
 
 - Dockerfile dédié: `prototype/seedvr2/Dockerfile`
 - Runner dédié: `scripts/seedvr2_prototype.py`
 - Module dédié: `src/vast_upscaler/seedvr2_prototype.py`
-- Aucune modification de l'orchestrateur/FastAPI/worker stable.
+- Intégration web multi-moteur ajoutée en phase 6A.3:
+  - Real-ESRGAN conserve son comportement existant (auto + manuel),
+  - SeedVR2 est exposé en **manuel uniquement** avec validation API explicite.
 
 ## Ce que fait le runner prototype
 
 Pour chaque exécution, il:
 
-1. extrait un segment local (`ffmpeg`) ;
+1. extrait un segment local (`ffmpeg`) **ou utilise directement l'entrée fournie avec `--input-is-excerpt`** ;
 2. lance l'inférence SeedVR2 CLI (`/opt/seedvr2/inference_cli.py`) avec réglages low‑VRAM:
    - `attention_mode=sdpa`
    - offload CPU (DiT + VAE + tenseurs)
@@ -26,6 +28,8 @@ Pour chaque exécution, il:
 4. produit:
    - log texte exploitable (`run.log`)
    - rapport JSON structuré (`prototype-report.json`) avec paramètres/checkpoints/commandes/stades/erreurs/OOM.
+
+Dans l'intégration web 6A.3, l'extrait est préparé localement côté API puis transmis au runner avec `--input-is-excerpt` pour éviter une seconde extraction SeedVR2 et tout décalage temporel inutile.
 
 ## Checkpoints utilisés
 

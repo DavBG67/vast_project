@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 import time
@@ -50,6 +51,10 @@ from vast_upscaler.remote_worker import (
     RemoteWorkerRequest,
     execute_remote_worker,
 )
+from vast_upscaler.remote_seedvr2_worker import (
+    Seedvr2RemoteRequest,
+    execute_remote_seedvr2_worker,
+)
 from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.session_store import SessionStore
 from vast_upscaler.source_analysis import (
@@ -58,7 +63,7 @@ from vast_upscaler.source_analysis import (
     analyze_source_video,
     analyze_source_video_report,
 )
-from vast_upscaler.transfer import OpenSshTransport
+from vast_upscaler.transfer import OpenSshTransport, SshConnectionInfo
 from vast_upscaler.vast_client import VastClient, VastClientConfig
 from vast_upscaler.vast_write_client import InstanceSummary, VastWriteClient
 from vast_upscaler.video import VideoProbeError, inspect_video
@@ -72,9 +77,18 @@ from vast_upscaler.video_excerpt import (
 RunMode = Literal["automatic", "manual"]
 SortBy = Literal["price", "reliability", "performance"]
 SshBootstrapMode = Literal["tofu", "strict"]
+EngineName = Literal["realesrgan", "seedvr2"]
+Seedvr2Profile = Literal["smoke", "reference"]
 
 _DEFAULT_WORKER_IMAGE = ""
 _WORKER_IMAGE_HISTORY_PATH = Path.home() / ".vast_upscaler" / "web_worker_images.json"
+_DEFAULT_ENGINE: EngineName = "realesrgan"
+_SUPPORTED_ENGINES: tuple[EngineName, ...] = ("realesrgan", "seedvr2")
+_SEEDVR2_PROFILES: tuple[Seedvr2Profile, ...] = ("smoke", "reference")
+_WORKER_IMAGE_REPO_BY_ENGINE: dict[EngineName, str] = {
+    "realesrgan": "ghcr.io/davbg67/vast-video-upscaler-worker",
+    "seedvr2": "ghcr.io/davbg67/vast-video-upscaler-seedvr2",
+}
 _WORKER_IMAGE_PLACEHOLDERS = {
     "ghcr.io/acme/worker:test",
     "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>",
@@ -102,6 +116,8 @@ class WebWorkflowCancelled(RuntimeError):
 
 class StartJobRequest(BaseModel):
     mode: RunMode
+    engine: EngineName = _DEFAULT_ENGINE
+    seedvr2_profile: Seedvr2Profile = "smoke"
     input_path: str | None = None
     source_name: str | None = None
     output_path: str | None = None
@@ -240,12 +256,20 @@ class WebTaskManager:
 
     def defaults(self) -> dict[str, Any]:
         settings = load_config(self._config_path)
-        latest_worker_image = _load_latest_known_worker_image()
+        latest_worker_image = _load_latest_known_worker_image(engine=_DEFAULT_ENGINE)
+        latest_worker_image_seedvr2 = _load_latest_known_worker_image(engine="seedvr2")
         return {
+            "default_engine": _DEFAULT_ENGINE,
+            "engines": list(_SUPPORTED_ENGINES),
+            "seedvr2_profiles": list(_SEEDVR2_PROFILES),
             "target_width": settings.video.target_width,
             "target_height": settings.video.target_height,
             "gpu_models": settings.vast.gpu_models,
             "worker_image_latest_known": latest_worker_image,
+            "worker_image_latest_by_engine": {
+                _DEFAULT_ENGINE: latest_worker_image,
+                "seedvr2": latest_worker_image_seedvr2,
+            },
             "worker_image_source": "history" if latest_worker_image else "none",
             "worker_image_required": latest_worker_image == "",
             "ssh_bootstrap_mode": "tofu",
@@ -281,6 +305,8 @@ class WebTaskManager:
             "configuration",
             {
                 "mode": request.mode,
+                "engine": _normalize_engine(request.engine),
+                "seedvr2_profile": _normalize_seedvr2_profile(request.seedvr2_profile),
                 "input_path": str(_resolve_input_video_path(request=request)),
                 "source_name": request.source_name,
                 "output_path": str(_resolve_output_path(request=request)),
@@ -409,7 +435,16 @@ class WebTaskManager:
             job.result = result
             job.status = "completed"
             if job.request.worker_image:
-                _store_latest_worker_image(job.request.worker_image)
+                try:
+                    _store_latest_worker_image(job.request.worker_image, engine=_normalize_engine(job.request.engine))
+                except Exception as exc:
+                    job.append_event(
+                        "status",
+                        {
+                            "state": "warning",
+                            "message": f"Could not persist latest worker image suggestion: {exc}",
+                        },
+                    )
             job.append_event(
                 "result",
                 {
@@ -508,6 +543,8 @@ class WebTaskManager:
             "job_id": job.job_id,
             "status": job.status,
             "mode": job.request.mode,
+            "engine": _normalize_engine(job.request.engine),
+            "seedvr2_profile": _normalize_seedvr2_profile(job.request.seedvr2_profile),
             "created_at": job.created_at,
             "updated_at": job.updated_at,
             "error": job.error,
@@ -577,7 +614,9 @@ class WebTaskManager:
         if request.preprocessing_plan_payload is not None and not isinstance(request.preprocessing_plan_payload, dict):
             raise HTTPException(status_code=400, detail="preprocessing_plan_payload must be a JSON object.")
         if request.mode == "automatic":
-            image = (request.worker_image or _load_latest_known_worker_image()).strip()
+            if _normalize_engine(request.engine) == "seedvr2":
+                raise HTTPException(status_code=400, detail="SeedVR2 is available in manual mode only.")
+            image = (request.worker_image or _load_latest_known_worker_image(engine=_normalize_engine(request.engine))).strip()
             if not image:
                 raise HTTPException(
                     status_code=400,
@@ -585,10 +624,19 @@ class WebTaskManager:
                 )
             if image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
                 raise HTTPException(status_code=400, detail=f"Refusing placeholder worker image tag: {image}")
+        engine = _normalize_engine(request.engine)
+        _normalize_seedvr2_profile(request.seedvr2_profile)
+        if engine == "seedvr2" and request.mode != "manual":
+            raise HTTPException(status_code=400, detail="SeedVR2 is available in manual mode only.")
+        if request.worker_image:
+            _ensure_image_repository_matches_engine(image=request.worker_image, engine=engine)
 
 
 def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
     callbacks.raise_if_cancelled()
+    engine = _normalize_engine(request.engine)
+    if engine != "realesrgan":
+        raise OrchestrationError("Automatic mode currently supports Real-ESRGAN only.")
     effective_settings = settings.model_copy(deep=True)
     if request.gpu_model:
         effective_settings.vast.gpu_models = [request.gpu_model]
@@ -599,11 +647,12 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
     effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
     input_path = effective_input.input_path
     preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
-    worker_image = (request.worker_image or _load_latest_known_worker_image()).strip()
+    worker_image = (request.worker_image or _load_latest_known_worker_image(engine=engine)).strip()
     if not worker_image:
         raise OrchestrationError("Worker image tag is required.")
     if worker_image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
         raise OrchestrationError(f"Refusing placeholder worker image tag: {worker_image}")
+    _ensure_image_repository_matches_engine(image=worker_image, engine=engine)
     callbacks.report_provisioning_status(
         {
             "phase": "worker-image",
@@ -686,6 +735,11 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
     callbacks.raise_if_cancelled()
     if request.instance_id is None:
         raise OrchestrationError("Manual mode requires an existing Vast instance id.")
+    engine = _normalize_engine(request.engine)
+    seedvr2_profile = _normalize_seedvr2_profile(request.seedvr2_profile)
+    effective_worker_image = (request.worker_image or _load_latest_known_worker_image(engine=engine)).strip() or None
+    if effective_worker_image:
+        _ensure_image_repository_matches_engine(image=effective_worker_image, engine=engine)
 
     output_path = _resolve_output_path(request=request)
     report_path = _resolve_report_path(request=request, output_path=output_path)
@@ -732,7 +786,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                     input_path=input_path,
                     output_path=output_path,
                     report_path=report_path,
-                    worker_image=request.worker_image or _load_latest_known_worker_image(),
+                    worker_image=effective_worker_image or "",
                     profile=settings.video.default_profile,
                     target_width=request.target_width or settings.video.target_width,
                     target_height=request.target_height or settings.video.target_height,
@@ -745,6 +799,18 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             request_verified_fingerprint=lambda message: callbacks.request_verified_fingerprint(message),
         )
         transport.check_ssh_ready(connection, timeout_seconds=30.0)
+        _run_manual_engine_preflight(
+            transport=transport,
+            connection=connection,
+            engine=engine,
+        )
+        _check_manual_instance_image_compatibility(
+            instance=instance,
+            requested_image=request.worker_image,
+            effective_worker_image=effective_worker_image,
+            engine=engine,
+            callbacks=callbacks,
+        )
         callbacks.report_provisioning_status(
             {
                 "phase": "manual-warning",
@@ -755,30 +821,66 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                 "status_message": "Manual mode does not destroy the instance automatically. Billing continues.",
             }
         )
-        worker_result = execute_remote_worker(
-            transport=transport,
-            connection=connection,
-            request=RemoteWorkerRequest(
-                session_id=f"manual-{uuid4().hex[:12]}",
-                local_input_path=input_path,
-                local_output_path=output_path,
-                local_report_path=report_path,
-                target_width=request.target_width or settings.video.target_width,
-                target_height=request.target_height or settings.video.target_height,
-                profile=settings.video.default_profile,
-                preprocessing_contract=preprocessing_contract,
-            ),
-            progress_callback=lambda payload: callbacks.report_worker_progress(payload),
-        )
+        if engine == "seedvr2":
+            callbacks.report_worker_progress(
+                {
+                    "phase": "seedvr2-prepared",
+                    "progress": 0.05,
+                    "message": f"SeedVR2 profile '{seedvr2_profile}' selected (input excerpt prepared locally).",
+                }
+            )
+            worker_result = execute_remote_seedvr2_worker(
+                transport=transport,
+                connection=connection,
+                request=Seedvr2RemoteRequest(
+                    session_id=f"manual-{uuid4().hex[:12]}",
+                    local_input_path=input_path,
+                    local_output_path=output_path,
+                    local_report_path=report_path,
+                    profile=seedvr2_profile,
+                ),
+            )
+            final_report_path = worker_result.local_report_path
+        else:
+            worker_result = execute_remote_worker(
+                transport=transport,
+                connection=connection,
+                request=RemoteWorkerRequest(
+                    session_id=f"manual-{uuid4().hex[:12]}",
+                    local_input_path=input_path,
+                    local_output_path=output_path,
+                    local_report_path=report_path,
+                    target_width=request.target_width or settings.video.target_width,
+                    target_height=request.target_height or settings.video.target_height,
+                    profile=settings.video.default_profile,
+                    preprocessing_contract=preprocessing_contract,
+                ),
+                progress_callback=lambda payload: callbacks.report_worker_progress(payload),
+            )
+            final_report_path = worker_result.local_report_path
         enrich_local_report_with_vast_metadata(
-            report_path=worker_result.local_report_path,
+            report_path=final_report_path,
             mode="manual",
             requested_worker_image=request.worker_image,
             instance=instance,
             offer=None,
         )
         _safe_merge_report_metadata(
-            report_path=worker_result.local_report_path,
+            report_path=final_report_path,
+            metadata={
+                "engine": {
+                    "requested": request.engine,
+                    "effective": engine,
+                    "seedvr2_profile": seedvr2_profile if engine == "seedvr2" else None,
+                },
+                "worker_image": {
+                    "requested": (request.worker_image or "").strip() or None,
+                    "effective": effective_worker_image,
+                },
+            },
+        )
+        _safe_merge_report_metadata(
+            report_path=final_report_path,
             metadata=_build_excerpt_report_metadata(effective_input=effective_input),
         )
         elapsed = time.perf_counter() - started
@@ -787,7 +889,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             session_id=None,
             state="COMPLETED",
             output_path=str(worker_result.local_output_path),
-            report_path=str(worker_result.local_report_path),
+            report_path=str(final_report_path),
             duration_seconds=elapsed,
             estimated_total_usd=None,
             instance_id=instance.instance_id,
@@ -802,6 +904,20 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             requested_worker_image=request.worker_image,
             instance=instance,
             offer=None,
+        )
+        _safe_merge_report_metadata(
+            report_path=report_path,
+            metadata={
+                "engine": {
+                    "requested": request.engine,
+                    "effective": engine,
+                    "seedvr2_profile": seedvr2_profile if engine == "seedvr2" else None,
+                },
+                "worker_image": {
+                    "requested": (request.worker_image or "").strip() or None,
+                    "effective": effective_worker_image,
+                },
+            },
         )
         _safe_merge_report_metadata(
             report_path=report_path,
@@ -1135,15 +1251,67 @@ def _preview_dimensions_from_plan_payload(plan_payload: dict[str, Any]) -> dict[
     return {"width": out_width, "height": out_height}
 
 
-def _load_latest_known_worker_image() -> str:
+def _normalize_engine(value: str | None) -> EngineName:
+    candidate = (value or _DEFAULT_ENGINE).strip().lower()
+    if candidate in _SUPPORTED_ENGINES:
+        return candidate  # type: ignore[return-value]
+    raise HTTPException(status_code=400, detail=f"Unsupported engine: {value}")
+
+
+def _normalize_seedvr2_profile(value: str | None) -> Seedvr2Profile:
+    candidate = (value or "smoke").strip().lower()
+    if candidate in _SEEDVR2_PROFILES:
+        return candidate  # type: ignore[return-value]
+    raise HTTPException(status_code=400, detail=f"Unsupported SeedVR2 profile: {value}")
+
+
+def _parse_image_repository(image: str) -> str | None:
+    text = image.strip()
+    if not text or text.lower() in _WORKER_IMAGE_PLACEHOLDERS:
+        return None
+    repository = text.split("@", 1)[0].split(":", 1)[0].strip()
+    if not repository:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", repository):
+        return None
+    return repository.lower()
+
+
+def _ensure_image_repository_matches_engine(*, image: str, engine: EngineName) -> None:
+    parsed_repo = _parse_image_repository(image)
+    if parsed_repo is None:
+        raise HTTPException(status_code=400, detail=f"Invalid worker image reference: {image}")
+    expected_repo = _WORKER_IMAGE_REPO_BY_ENGINE[engine]
+    if parsed_repo != expected_repo:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Worker image repository mismatch for engine '{engine}': expected {expected_repo}, got {parsed_repo}.",
+        )
+
+
+def _read_worker_image_history_payload() -> dict[str, Any]:
     try:
         payload = json.loads(_WORKER_IMAGE_HISTORY_PATH.read_text(encoding="utf-8"))
     except OSError:
-        return _DEFAULT_WORKER_IMAGE
+        return {}
     except json.JSONDecodeError:
-        return _DEFAULT_WORKER_IMAGE
+        return {}
     if not isinstance(payload, dict):
-        return _DEFAULT_WORKER_IMAGE
+        return {}
+    return payload
+
+
+def _load_latest_known_worker_image(*, engine: EngineName = _DEFAULT_ENGINE) -> str:
+    payload = _read_worker_image_history_payload()
+    engines = payload.get("engines")
+    if isinstance(engines, dict):
+        entry = engines.get(engine)
+        if isinstance(entry, dict):
+            value = entry.get("latest")
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized and normalized.lower() not in _WORKER_IMAGE_PLACEHOLDERS:
+                    return normalized
     value = payload.get("latest")
     if isinstance(value, str):
         normalized = value.strip()
@@ -1152,14 +1320,108 @@ def _load_latest_known_worker_image() -> str:
     return _DEFAULT_WORKER_IMAGE
 
 
-def _store_latest_worker_image(value: str) -> None:
+def _store_latest_worker_image(value: str, *, engine: EngineName = _DEFAULT_ENGINE) -> None:
     image = value.strip()
     if not image:
         return
     if image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
         return
+    _ensure_image_repository_matches_engine(image=image, engine=engine)
+    payload = _read_worker_image_history_payload()
+    engines = payload.get("engines")
+    if not isinstance(engines, dict):
+        engines = {}
+    engine_entry = engines.get(engine)
+    if not isinstance(engine_entry, dict):
+        engine_entry = {}
+    engine_entry["latest"] = image
+    engines[engine] = engine_entry
+    payload["engines"] = engines
+    if engine == _DEFAULT_ENGINE:
+        payload["latest"] = image
     _WORKER_IMAGE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _WORKER_IMAGE_HISTORY_PATH.write_text(json.dumps({"latest": image}, indent=2), encoding="utf-8")
+    _WORKER_IMAGE_HISTORY_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _run_manual_engine_preflight(
+    *,
+    transport: OpenSshTransport,
+    connection: SshConnectionInfo,
+    engine: EngineName,
+) -> None:
+    if engine == "seedvr2":
+        command: list[str] = ["python", "/opt/prototype/seedvr2_prototype.py", "--help"]
+    else:
+        command = ["python", "-c", "import torch; from app.worker.process import run_pipeline; print(torch.__version__)"]
+    try:
+        transport.run_remote_command(
+            connection,
+            command=command,
+            timeout_seconds=30.0,
+            check=True,
+        )
+    except Exception as exc:
+        raise OrchestrationError(f"Engine preflight failed for {engine}: {exc}") from exc
+
+
+def _check_manual_instance_image_compatibility(
+    *,
+    instance: InstanceSummary,
+    requested_image: str | None,
+    effective_worker_image: str | None,
+    engine: EngineName,
+    callbacks: RunCallbacks,
+) -> None:
+    instance_id = getattr(instance, "instance_id", "n/a")
+    gpu_name = getattr(instance, "gpu_name", None) or "unknown"
+    ssh_host = getattr(instance, "ssh_host", None) or "unknown"
+    actual_image = (getattr(instance, "image_name", None) or "").strip() or None
+    expected_repo = _WORKER_IMAGE_REPO_BY_ENGINE[engine]
+    if actual_image is None:
+        callbacks.report_provisioning_status(
+            {
+                "phase": "image-compatibility",
+                "instance_id": str(instance_id),
+                "gpu": gpu_name,
+                "host": ssh_host,
+                "status": "unverified",
+                "status_message": f"Instance image metadata unavailable; expected repository: {expected_repo}.",
+            }
+        )
+        return
+    parsed_repo = _parse_image_repository(actual_image)
+    if parsed_repo is None:
+        callbacks.report_provisioning_status(
+            {
+                "phase": "image-compatibility",
+                "instance_id": str(instance_id),
+                "gpu": gpu_name,
+                "host": ssh_host,
+                "status": "unverified",
+                "status_message": f"Could not parse instance image metadata '{actual_image}'.",
+            }
+        )
+        return
+    if parsed_repo != expected_repo:
+        raise OrchestrationError(
+            f"Selected engine '{engine}' is incompatible with instance image '{actual_image}' (repo={parsed_repo}). "
+            f"Expected repository: {expected_repo}."
+        )
+    expected_image = (requested_image or "").strip() or effective_worker_image
+    if expected_image and actual_image != expected_image:
+        callbacks.report_provisioning_status(
+            {
+                "phase": "image-compatibility",
+                "instance_id": str(instance_id),
+                "gpu": gpu_name,
+                "host": ssh_host,
+                "status": "repo-match-tag-unverified",
+                "status_message": (
+                    f"Instance repository matches {expected_repo}, but exact tag differs "
+                    f"(expected {expected_image}, actual {actual_image})."
+                ),
+            }
+        )
 
 
 def create_app(
@@ -1744,6 +2006,18 @@ _INDEX_HTML = """
 
     <fieldset>
       <legend><span class="step-badge">4</span>Configurer et lancer l’upscale</legend>
+      <label for="engine">Moteur
+        <select id="engine">
+          <option value="realesrgan">Real-ESRGAN (stable)</option>
+          <option value="seedvr2">SeedVR2 (expérimental, manuel)</option>
+        </select>
+      </label>
+      <label for="seedvr2_profile">Profil SeedVR2
+        <select id="seedvr2_profile">
+          <option value="smoke">smoke</option>
+          <option value="reference">reference</option>
+        </select>
+      </label>
       <label for="mode">Mode Vast.ai
         <select id="mode">
           <option value="automatic">Automatique (recherche, création, traitement, nettoyage)</option>
@@ -1760,7 +2034,7 @@ _INDEX_HTML = """
       <label for="worker_image">Image Docker worker (tag/version)
         <input id="worker_image" />
       </label>
-      <div class="muted">Le tag proposé est le dernier connu localement. En mode manuel, changer ce champ ne modifie pas l’image d’une instance déjà démarrée.</div>
+      <div class="muted">Le tag proposé est le dernier connu pour le moteur sélectionné. Le dépôt doit correspondre au moteur choisi. En mode manuel, changer ce champ ne modifie pas l’image d’une instance déjà démarrée.</div>
       <label for="gpu_model">Modèle GPU <select id="gpu_model"></select></label>
       <label for="sort_by">Tri des offres (mode automatique)
         <select id="sort_by">
@@ -1826,6 +2100,7 @@ _INDEX_HTML = """
     let latestAnalysisPayload = null;
     let latestPlanPayload = null;
     let analysisRequestToken = 0;
+    let latestWorkerImageByEngine = { realesrgan: "", seedvr2: "" };
     let sourcesIndex = new Map();
     let currentJobStartedAt = null;
     const handledPromptIds = new Set();
@@ -1866,12 +2141,32 @@ _INDEX_HTML = """
     }
 
     function setModeHelp() {
-      const mode = document.getElementById("mode").value;
+      const modeSelect = document.getElementById("mode");
+      const mode = modeSelect.value;
+      const engine = document.getElementById("engine").value;
       const box = document.getElementById("mode-help");
-      if (mode === "manual") {
+      if (engine === "seedvr2" && mode !== "manual") {
+        modeSelect.value = "manual";
+      }
+      if (engine === "seedvr2") {
+        box.textContent = "SeedVR2 est disponible en mode manuel uniquement. L’extrait est préparé localement puis exécuté sur l’instance sélectionnée.";
+      } else if (modeSelect.value === "manual") {
         box.textContent = "Mode manuel : vous louez et gérez l’instance vous-même. L’application ne crée ni ne détruit automatiquement l’instance.";
       } else {
         box.textContent = "Mode automatique : l’application recherche une offre, crée l’instance, exécute le traitement puis applique la logique de nettoyage existante.";
+      }
+      document.getElementById("seedvr2_profile").disabled = engine !== "seedvr2";
+      const automaticOption = document.querySelector("#mode option[value='automatic']");
+      if (automaticOption) {
+        automaticOption.disabled = engine === "seedvr2";
+      }
+    }
+
+    function syncWorkerImageForEngine() {
+      const engine = document.getElementById("engine").value;
+      const workerImage = document.getElementById("worker_image");
+      if (!workerImage.value.trim()) {
+        workerImage.value = latestWorkerImageByEngine[engine] || "";
       }
     }
 
@@ -2317,8 +2612,27 @@ _INDEX_HTML = """
     async function loadDefaults() {
       const res = await fetch("/api/config");
       const cfg = await res.json();
+      latestWorkerImageByEngine = cfg.worker_image_latest_by_engine || latestWorkerImageByEngine;
       document.getElementById("target_width").value = cfg.target_width;
       document.getElementById("target_height").value = cfg.target_height;
+      const engineSelect = document.getElementById("engine");
+      engineSelect.innerHTML = "";
+      for (const engine of (cfg.engines || ["realesrgan", "seedvr2"])) {
+        const opt = document.createElement("option");
+        opt.value = engine;
+        opt.textContent = engine === "seedvr2" ? "SeedVR2 (expérimental, manuel)" : "Real-ESRGAN (stable)";
+        engineSelect.appendChild(opt);
+      }
+      engineSelect.value = cfg.default_engine || "realesrgan";
+      const seedvr2Profile = document.getElementById("seedvr2_profile");
+      seedvr2Profile.innerHTML = "";
+      for (const profile of (cfg.seedvr2_profiles || ["smoke", "reference"])) {
+        const opt = document.createElement("option");
+        opt.value = profile;
+        opt.textContent = profile;
+        seedvr2Profile.appendChild(opt);
+      }
+      seedvr2Profile.value = "smoke";
       document.getElementById("worker_image").value = cfg.worker_image_latest_known;
       if (cfg.worker_image_required) {
         appendEvent("Aucun tag worker fiable par défaut n’est connu. Renseignez un tag explicite en mode automatique.");
@@ -2331,7 +2645,10 @@ _INDEX_HTML = """
         opt.textContent = model;
         gpu.appendChild(opt);
       }
-      appendEvent("Tag worker par défaut (dernier connu) : " + cfg.worker_image_latest_known);
+      appendEvent("Tag worker par défaut Real-ESRGAN : " + (latestWorkerImageByEngine.realesrgan || "n/a"));
+      appendEvent("Tag worker par défaut SeedVR2 : " + (latestWorkerImageByEngine.seedvr2 || "n/a"));
+      syncWorkerImageForEngine();
+      setModeHelp();
     }
 
     async function answerPrompt(jobId, prompt) {
@@ -2450,6 +2767,8 @@ _INDEX_HTML = """
       );
       const payload = {
         mode: document.getElementById("mode").value,
+        engine: document.getElementById("engine").value,
+        seedvr2_profile: document.getElementById("seedvr2_profile").value,
         source_name: sourceName,
         input_path: sourceName ? null : manualInput,
         output_path: document.getElementById("output_path").value || null,
@@ -2505,6 +2824,10 @@ _INDEX_HTML = """
     });
 
     document.getElementById("mode").addEventListener("change", setModeHelp);
+    document.getElementById("engine").addEventListener("change", () => {
+      syncWorkerImageForEngine();
+      setModeHelp();
+    });
     document.getElementById("refresh-sources-btn").addEventListener("click", loadVideoSources);
     document.getElementById("source_name").addEventListener("change", selectedSourceChanged);
     document.getElementById("analyze-btn").addEventListener("click", analyzeSelectedSource);
