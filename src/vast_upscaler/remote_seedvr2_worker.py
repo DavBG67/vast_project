@@ -215,12 +215,9 @@ def _prepare_remote_dirs(
     connection: SshConnectionInfo,
     paths: Seedvr2RemotePaths,
 ) -> None:
-    cmd = "mkdir -p {input_dir} {output_dir} {work_dir} {cache_dir} {logs_dir}".format(
-        input_dir=shlex.quote(paths.input_dir),
-        output_dir=shlex.quote(paths.output_dir),
-        work_dir=shlex.quote(paths.work_dir),
-        cache_dir=shlex.quote(paths.cache_dir),
-        logs_dir=shlex.quote(paths.logs_dir),
+    cmd = (
+        f"mkdir -p {shlex.quote(paths.input_dir)} {shlex.quote(paths.output_dir)} "
+        f"{shlex.quote(paths.work_dir)} {shlex.quote(paths.cache_dir)} {shlex.quote(paths.logs_dir)}"
     )
     try:
         transport.run_remote_command(

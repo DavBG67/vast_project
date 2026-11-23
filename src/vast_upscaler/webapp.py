@@ -47,13 +47,13 @@ from vast_upscaler.preprocessing_planner import (
     load_analysis_payload_from_file,
 )
 from vast_upscaler.provisioning_history import ProvisioningAttemptTracker
-from vast_upscaler.remote_worker import (
-    RemoteWorkerRequest,
-    execute_remote_worker,
-)
 from vast_upscaler.remote_seedvr2_worker import (
     Seedvr2RemoteRequest,
     execute_remote_seedvr2_worker,
+)
+from vast_upscaler.remote_worker import (
+    RemoteWorkerRequest,
+    execute_remote_worker,
 )
 from vast_upscaler.report_enrichment import enrich_local_report_with_vast_metadata
 from vast_upscaler.session_store import SessionStore
@@ -437,7 +437,7 @@ class WebTaskManager:
             if job.request.worker_image:
                 try:
                     _store_latest_worker_image(job.request.worker_image, engine=_normalize_engine(job.request.engine))
-                except Exception as exc:
+                except (HTTPException, OSError, TypeError, ValueError) as exc:
                     job.append_event(
                         "status",
                         {
