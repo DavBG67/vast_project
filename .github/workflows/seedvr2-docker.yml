@@ -1,6 +1,17 @@
 name: seedvr2-docker
 
 on:
+  push:
+    branches:
+      - "seedvr2/**"
+    paths:
+      - "prototype/seedvr2/**"
+      - "scripts/seedvr2_prototype.py"
+      - "src/vast_upscaler/seedvr2_prototype.py"
+      - "tests/test_seedvr2_prototype.py"
+      - "tests/test_seedvr2_prototype_dockerfile.py"
+      - "tests/test_seedvr2_docker_workflow.py"
+      - ".github/workflows/seedvr2-docker.yml"
   workflow_dispatch:
     inputs:
       dockerfile:
@@ -21,8 +32,8 @@ jobs:
   build-prototype:
     runs-on: ubuntu-latest
     env:
-      DOCKERFILE_PATH: ${{ inputs.dockerfile }}
-      IMAGE_NAME: ${{ inputs.image_name }}
+      DOCKERFILE_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.dockerfile || 'prototype/seedvr2/Dockerfile' }}
+      IMAGE_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.image_name || 'vast-seedvr2-proto:ci-smoke' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,15 +60,29 @@ jobs:
           set -euo pipefail
           docker image inspect "$IMAGE_NAME" >/dev/null
 
+      - name: Smoke run SeedVR2 prototype CLI help
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMAGE_NAME" --help
+
+      - name: Verify venv python and torch/cuda runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python "$IMAGE_NAME" -c "import os, sys, torch, torchvision; venv = os.environ.get('VENV_PATH', ''); print('python=' + sys.executable); print('venv=' + venv); print('torch=' + torch.__version__); print('torchvision=' + torchvision.__version__); print('cuda=' + str(torch.version.cuda)); assert venv, 'VENV_PATH is missing'; assert sys.executable.startswith(venv), f'unexpected python executable: {sys.executable}'"
+
       - name: Workflow summary
         shell: bash
         run: |
           {
             echo "## SeedVR2 Docker build";
-            echo "- Workflow trigger: manual (workflow_dispatch)";
+            echo "- Workflow trigger: ${{ github.event_name }}";
             echo "- Dockerfile: \`$DOCKERFILE_PATH\`";
             echo "- Image tag: \`$IMAGE_NAME\`";
             echo "- Build: passed";
+            echo "- CLI --help smoke run: passed";
+            echo "- Venv Python smoke check: passed";
             echo "- Push to GHCR: not performed";
             echo "- GPU inference: not executed";
           } >> "$GITHUB_STEP_SUMMARY"
