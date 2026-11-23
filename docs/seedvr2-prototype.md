@@ -110,6 +110,40 @@ Le workflow échoue explicitement si:
 - le build Docker échoue;
 - l'image construite est introuvable après build.
 
+## Publication GHCR expérimentale (manuelle uniquement)
+
+Workflow dédié: `.github/workflows/seedvr2-ghcr-publish.yml`
+
+- déclenchement: `workflow_dispatch` uniquement;
+- Dockerfile imposé: `prototype/seedvr2/Dockerfile`;
+- dépôt d'image imposé: `ghcr.io/davbg67/vast-video-upscaler-seedvr2`;
+- tag immuable: `exp-6a2-<SHA complet du commit>`;
+- publication sous `latest` interdite;
+- publication vers l'image stable Real-ESRGAN interdite;
+- authentification GHCR via `${{ secrets.GITHUB_TOKEN }}`;
+- permissions minimales: `contents: read`, `packages: write`;
+- build + smoke CLI (`--help`) validés avant push;
+- vérification post-push de la présence distante de l'image + affichage du tag exact dans le résumé.
+
+### Procédure de publication
+
+1. Ouvrir **Actions**.
+2. Sélectionner **seedvr2-ghcr-publish**.
+3. Cliquer **Run workflow** (aucun paramètre requis).
+4. Vérifier dans le résumé:
+   - la référence publiée complète (`ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-...`);
+   - l'absence de publication `latest`;
+   - l'absence de publication vers le dépôt stable Real-ESRGAN.
+
+### Procédure de récupération de l'image publiée
+
+Récupérer la référence exacte affichée dans le résumé du workflow, puis:
+
+```bash
+docker pull ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-<sha-commit>
+docker run --rm ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-<sha-commit> --help
+```
+
 ## Cache persistant des poids
 
 Utiliser un volume hôte monté dans `/workspace/cache/seedvr2`:
