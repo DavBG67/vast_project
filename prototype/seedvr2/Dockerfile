@@ -28,6 +28,7 @@ RUN python -m venv --system-site-packages "${VENV_PATH}" \
     && "${VENV_PATH}/bin/python" -m pip install --upgrade pip \
     && grep -Ev '^(torch|torchvision)([[:space:]]|[<>=!~]).*$|^(torch|torchvision)$' /opt/seedvr2/requirements.txt > /tmp/requirements.seedvr2.txt \
     && "${VENV_PATH}/bin/python" -m pip install --prefer-binary -c /tmp/requirements.constraints.txt -r /tmp/requirements.seedvr2.txt \
+    && "${VENV_PATH}/bin/python" -m pip install pydantic==2.9.2 \
     && "${VENV_PATH}/bin/python" -c "import os, sys, torch, torchvision; assert sys.executable.startswith(os.environ['VENV_PATH']), sys.executable; assert torch.__version__.startswith('${EXPECTED_TORCH_VERSION}'), torch.__version__; assert torchvision.__version__.startswith('${EXPECTED_TORCHVISION_VERSION}'), torchvision.__version__; assert str(torch.version.cuda).startswith('${EXPECTED_CUDA_VERSION}'), torch.version.cuda" \
     && "${VENV_PATH}/bin/python" /opt/seedvr2/inference_cli.py --help > /tmp/seedvr2-help.txt \
     && grep -q -- '--dit_model' /tmp/seedvr2-help.txt \
