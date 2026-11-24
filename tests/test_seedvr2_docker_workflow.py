@@ -20,6 +20,7 @@ def test_seedvr2_docker_workflow_uses_dispatch_inputs_only_when_available() -> N
 def test_seedvr2_docker_workflow_runs_cli_and_venv_smokes() -> None:
     content = WORKFLOW_PATH.read_text(encoding="utf-8")
     assert "Smoke run SeedVR2 prototype CLI help" in content
-    assert 'docker run --rm "$IMAGE_NAME" --help' in content
+    assert 'docker run --rm "$IMAGE_NAME" --help | tee /tmp/seedvr2-runner-help.txt' in content
+    assert "grep -q -- '--input-is-excerpt' /tmp/seedvr2-runner-help.txt" in content
     assert "Verify venv python and torch/cuda runtime" in content
     assert 'docker run --rm --entrypoint python "$IMAGE_NAME" -c "import os, sys, torch, torchvision;' in content

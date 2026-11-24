@@ -34,6 +34,8 @@ def test_seedvr2_ghcr_publish_workflow_verifies_build_and_published_image() -> N
     assert 'docker image inspect "${{ steps.prepare.outputs.image_ref }}" >/dev/null' in content
     assert "Push experimental image" in content
     assert 'docker push "${{ steps.prepare.outputs.image_ref }}"' in content
+    assert 'docker run --rm "${{ steps.prepare.outputs.image_ref }}" --help | tee /tmp/seedvr2-runner-help.txt' in content
+    assert "grep -q -- '--input-is-excerpt' /tmp/seedvr2-runner-help.txt" in content
     assert "Verify published image exists" in content
     assert 'docker buildx imagetools inspect "${{ steps.prepare.outputs.image_ref }}"' in content
     assert 'echo "- Published image: \\`${{ steps.prepare.outputs.image_ref }}\\`";' in content

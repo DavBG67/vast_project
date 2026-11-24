@@ -11,6 +11,8 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from vast_upscaler.video import VideoProbeError, inspect_video
+
 DEFAULT_DIT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 DEFAULT_VAE_MODEL = "ema_vae_fp16.safetensors"
 _HF_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
@@ -326,6 +328,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-seconds", type=float, default=None, help="Override profile excerpt duration")
     parser.add_argument("--dit-model", default=DEFAULT_DIT_MODEL)
     parser.add_argument("--attention-mode", default="sdpa", choices=("sdpa",))
+    parser.add_argument(
+        "--input-is-excerpt",
+        action="store_true",
+        help="Treat --input-video as the already-trimmed segment and skip internal excerpt extraction.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -354,7 +361,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     log_path = run_dir / "run.log"
     report_path = run_dir / "prototype-report.json"
 
-    start_timecode = args.start_timecode or profile.excerpt_start
+    profile_start_timecode = args.start_timecode or profile.excerpt_start
+    effective_start_timecode = profile_start_timecode
 
     report_payload = {
         "status": "pending",
@@ -370,8 +378,10 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         "attention_mode": args.attention_mode,
         "parameters": {
             "profile": asdict(profile),
-            "start_timecode": start_timecode,
+            "start_timecode": effective_start_timecode,
+            "profile_default_start_timecode": profile_start_timecode,
             "duration_seconds": float(args.duration_seconds or profile.excerpt_duration_seconds),
+            "input_is_excerpt": bool(args.input_is_excerpt),
         },
         "log_file": str(log_path),
         "output_file": str(final_output_path),
@@ -379,38 +389,54 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     }
 
     _write_report(report_path, report_payload)
-    try:
-        start_seconds = parse_timecode_to_seconds(start_timecode)
-        duration_seconds = float(args.duration_seconds or profile.excerpt_duration_seconds)
-    except ValueError as exc:
-        report_payload["status"] = "failed"
-        report_payload["error"] = str(exc)
-        _write_report(report_path, report_payload)
-        print(str(exc), file=sys.stderr)
-        return 1
+    if args.input_is_excerpt:
+        start_seconds = 0.0
+        effective_start_timecode = "00:00"
+        report_payload["parameters"]["start_timecode"] = effective_start_timecode
+        try:
+            info = inspect_video(input_video)
+            duration_seconds = float(info.duration_seconds)
+            if duration_seconds <= 0:
+                raise ValueError(f"Invalid non-positive excerpt duration reported for input: {duration_seconds}")
+        except (VideoProbeError, ValueError) as exc:
+            report_payload["status"] = "failed"
+            report_payload["error"] = f"Could not inspect input excerpt duration: {exc}"
+            _write_report(report_path, report_payload)
+            print(report_payload["error"], file=sys.stderr)
+            return 1
+        excerpt_path = input_video
+    else:
+        try:
+            start_seconds = parse_timecode_to_seconds(profile_start_timecode)
+            duration_seconds = float(args.duration_seconds or profile.excerpt_duration_seconds)
+        except ValueError as exc:
+            report_payload["status"] = "failed"
+            report_payload["error"] = str(exc)
+            _write_report(report_path, report_payload)
+            print(str(exc), file=sys.stderr)
+            return 1
 
-    commands = {
-        "cuda_preflight": _build_cuda_preflight_command(),
-        "extract_excerpt": _build_extract_command(
+    commands = {"cuda_preflight": _build_cuda_preflight_command()}
+    if not args.input_is_excerpt:
+        commands["extract_excerpt"] = _build_extract_command(
             input_video=input_video,
             excerpt_path=excerpt_path,
             start_seconds=start_seconds,
             duration_seconds=duration_seconds,
-        ),
-        "seedvr2_inference": _build_seedvr2_command(
-            excerpt_path=excerpt_path,
-            raw_output_path=raw_output_path,
-            profile=profile,
-            cache_dir=cache_dir,
-            dit_model=args.dit_model,
-            attention_mode=args.attention_mode,
-        ),
-        "mux_h264_aac": _build_mux_command(
-            raw_output_path=raw_output_path,
-            excerpt_path=excerpt_path,
-            final_output_path=final_output_path,
-        ),
-    }
+        )
+    commands["seedvr2_inference"] = _build_seedvr2_command(
+        excerpt_path=excerpt_path,
+        raw_output_path=raw_output_path,
+        profile=profile,
+        cache_dir=cache_dir,
+        dit_model=args.dit_model,
+        attention_mode=args.attention_mode,
+    )
+    commands["mux_h264_aac"] = _build_mux_command(
+        raw_output_path=raw_output_path,
+        excerpt_path=excerpt_path,
+        final_output_path=final_output_path,
+    )
 
     report_payload["parameters"]["start_seconds"] = start_seconds
     report_payload["parameters"]["duration_seconds"] = duration_seconds
