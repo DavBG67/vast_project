@@ -11,6 +11,8 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from vast_upscaler.video import VideoProbeError, inspect_video
+
 DEFAULT_DIT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 DEFAULT_VAE_MODEL = "ema_vae_fp16.safetensors"
 _HF_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
@@ -359,7 +361,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     log_path = run_dir / "run.log"
     report_path = run_dir / "prototype-report.json"
 
-    start_timecode = args.start_timecode or profile.excerpt_start
+    profile_start_timecode = args.start_timecode or profile.excerpt_start
+    effective_start_timecode = profile_start_timecode
 
     report_payload = {
         "status": "pending",
@@ -375,7 +378,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         "attention_mode": args.attention_mode,
         "parameters": {
             "profile": asdict(profile),
-            "start_timecode": start_timecode,
+            "start_timecode": effective_start_timecode,
+            "profile_default_start_timecode": profile_start_timecode,
             "duration_seconds": float(args.duration_seconds or profile.excerpt_duration_seconds),
             "input_is_excerpt": bool(args.input_is_excerpt),
         },
@@ -387,11 +391,23 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     _write_report(report_path, report_payload)
     if args.input_is_excerpt:
         start_seconds = 0.0
-        duration_seconds = float(args.duration_seconds or profile.excerpt_duration_seconds)
+        effective_start_timecode = "00:00"
+        report_payload["parameters"]["start_timecode"] = effective_start_timecode
+        try:
+            info = inspect_video(input_video)
+            duration_seconds = float(info.duration_seconds)
+            if duration_seconds <= 0:
+                raise ValueError(f"Invalid non-positive excerpt duration reported for input: {duration_seconds}")
+        except (VideoProbeError, ValueError) as exc:
+            report_payload["status"] = "failed"
+            report_payload["error"] = f"Could not inspect input excerpt duration: {exc}"
+            _write_report(report_path, report_payload)
+            print(report_payload["error"], file=sys.stderr)
+            return 1
         excerpt_path = input_video
     else:
         try:
-            start_seconds = parse_timecode_to_seconds(start_timecode)
+            start_seconds = parse_timecode_to_seconds(profile_start_timecode)
             duration_seconds = float(args.duration_seconds or profile.excerpt_duration_seconds)
         except ValueError as exc:
             report_payload["status"] = "failed"

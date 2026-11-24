@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+import vast_upscaler.webapp as webapp_module
 from vast_upscaler.local_preprocessing import LocalExecutionReport
 from vast_upscaler.orchestrator import OrchestrationError
 from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
@@ -20,6 +21,7 @@ from vast_upscaler.webapp import (
     WorkflowExecutionResult,
     _default_auto_runner,
     _default_manual_runner,
+    _load_latest_known_worker_image,
     _preview_dimensions_from_plan_payload,
     _resolve_output_path,
     _resolve_remote_preprocessing_contract,
@@ -90,6 +92,8 @@ def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -
     assert "latestPlanPayload?.preview_dimensions" in html
     assert "issues du plan validé" in html
     assert "en attente du plan validé ou recadrage non fiable" in html
+    assert "currentRepo !== expectedRepo" in html
+    assert "workerImage.value = suggested;" in html
 
 
 def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) -> None:
@@ -1015,6 +1019,60 @@ def test_web_rejects_worker_image_repo_mismatch_for_selected_engine(tmp_path: Pa
     assert "repository mismatch" in response.json()["detail"]
 
 
+def test_load_latest_worker_image_legacy_global_history_for_realesrgan(tmp_path: Path, monkeypatch) -> None:
+    history_path = tmp_path / "history.json"
+    history_path.write_text(
+        json.dumps({"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-legacy"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
+    assert _load_latest_known_worker_image(engine="realesrgan") == "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-legacy"
+
+
+def test_load_latest_worker_image_legacy_global_history_not_used_for_seedvr2(tmp_path: Path, monkeypatch) -> None:
+    history_path = tmp_path / "history.json"
+    history_path.write_text(
+        json.dumps({"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-legacy"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
+    assert _load_latest_known_worker_image(engine="seedvr2") == ""
+
+
+def test_load_latest_worker_image_per_engine_history_isolated(tmp_path: Path, monkeypatch) -> None:
+    history_path = tmp_path / "history.json"
+    history_path.write_text(
+        json.dumps(
+            {
+                "engines": {
+                    "realesrgan": {"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-r"},
+                    "seedvr2": {"latest": "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-x"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
+    assert _load_latest_known_worker_image(engine="realesrgan").endswith(":dev-sha-r")
+    assert _load_latest_known_worker_image(engine="seedvr2").endswith(":exp-6a2-x")
+
+
+def test_load_latest_worker_image_rejects_incoherent_history_entry(tmp_path: Path, monkeypatch) -> None:
+    history_path = tmp_path / "history.json"
+    history_path.write_text(
+        json.dumps(
+            {
+                "engines": {
+                    "seedvr2": {"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-r"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
+    assert _load_latest_known_worker_image(engine="seedvr2") == ""
+
+
 def test_run_manual_engine_preflight_rejects_old_seedvr2_runner(monkeypatch) -> None:
     class _FakeTransport:
         def run_remote_command(self, _connection, *, command, **_kwargs):
@@ -1416,6 +1474,10 @@ def test_default_manual_seedvr2_runner_preserves_excerpt_window_and_uses_excerpt
     assert payload["excerpt_start_seconds"] == 39.0
     assert payload["excerpt_requested_duration_seconds"] == 10.0
     assert payload["excerpt_actual_duration_seconds"] == 10.0
+    assert payload["worker_image"]["requested"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
+    assert payload["worker_image"]["suggested_or_expected"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
+    assert payload["worker_image"]["instance_declared"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
+    assert payload["worker_image"]["verification_level"] == "exact-match"
 
 
 def test_manual_plan_path_overrides_generated_plan_payload_for_contract_resolution(tmp_path: Path) -> None:

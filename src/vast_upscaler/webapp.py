@@ -756,6 +756,13 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
     write_client = _build_write_client(settings)
     started = time.perf_counter()
     instance: InstanceSummary | None = None
+    worker_image_identity: dict[str, Any] = {
+        "requested": (request.worker_image or "").strip() or None,
+        "suggested_or_expected": effective_worker_image,
+        "instance_declared": None,
+        "expected_repository": _WORKER_IMAGE_REPO_BY_ENGINE[engine],
+        "verification_level": "not-checked",
+    }
     callbacks.report_provisioning_status(
         {
             "phase": "worker-image",
@@ -808,7 +815,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             connection=connection,
             engine=engine,
         )
-        _check_manual_instance_image_compatibility(
+        worker_image_identity = _check_manual_instance_image_compatibility(
             instance=instance,
             requested_image=request.worker_image,
             effective_worker_image=effective_worker_image,
@@ -878,8 +885,11 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                     "seedvr2_profile": seedvr2_profile if engine == "seedvr2" else None,
                 },
                 "worker_image": {
-                    "requested": (request.worker_image or "").strip() or None,
-                    "effective": effective_worker_image,
+                    "requested": worker_image_identity["requested"],
+                    "suggested_or_expected": worker_image_identity["suggested_or_expected"],
+                    "instance_declared": worker_image_identity["instance_declared"],
+                    "expected_repository": worker_image_identity["expected_repository"],
+                    "verification_level": worker_image_identity["verification_level"],
                 },
             },
         )
@@ -918,8 +928,11 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                     "seedvr2_profile": seedvr2_profile if engine == "seedvr2" else None,
                 },
                 "worker_image": {
-                    "requested": (request.worker_image or "").strip() or None,
-                    "effective": effective_worker_image,
+                    "requested": worker_image_identity["requested"],
+                    "suggested_or_expected": worker_image_identity["suggested_or_expected"],
+                    "instance_declared": worker_image_identity["instance_declared"],
+                    "expected_repository": worker_image_identity["expected_repository"],
+                    "verification_level": worker_image_identity["verification_level"],
                 },
             },
         )
@@ -1307,20 +1320,30 @@ def _read_worker_image_history_payload() -> dict[str, Any]:
 
 def _load_latest_known_worker_image(*, engine: EngineName = _DEFAULT_ENGINE) -> str:
     payload = _read_worker_image_history_payload()
+    expected_repo = _WORKER_IMAGE_REPO_BY_ENGINE[engine]
+
+    def _normalized_if_compatible(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized or normalized.lower() in _WORKER_IMAGE_PLACEHOLDERS:
+            return None
+        repository = _parse_image_repository(normalized)
+        if repository != expected_repo:
+            return None
+        return normalized
+
     engines = payload.get("engines")
     if isinstance(engines, dict):
         entry = engines.get(engine)
         if isinstance(entry, dict):
-            value = entry.get("latest")
-            if isinstance(value, str):
-                normalized = value.strip()
-                if normalized and normalized.lower() not in _WORKER_IMAGE_PLACEHOLDERS:
-                    return normalized
-    value = payload.get("latest")
-    if isinstance(value, str):
-        normalized = value.strip()
-        if normalized and normalized.lower() not in _WORKER_IMAGE_PLACEHOLDERS:
-            return normalized
+            compatible = _normalized_if_compatible(entry.get("latest"))
+            if compatible is not None:
+                return compatible
+    if engine == _DEFAULT_ENGINE:
+        compatible = _normalized_if_compatible(payload.get("latest"))
+        if compatible is not None:
+            return compatible
     return _DEFAULT_WORKER_IMAGE
 
 
@@ -1380,12 +1403,20 @@ def _check_manual_instance_image_compatibility(
     effective_worker_image: str | None,
     engine: EngineName,
     callbacks: RunCallbacks,
-) -> None:
+) -> dict[str, Any]:
     instance_id = getattr(instance, "instance_id", "n/a")
     gpu_name = getattr(instance, "gpu_name", None) or "unknown"
     ssh_host = getattr(instance, "ssh_host", None) or "unknown"
     actual_image = (getattr(instance, "image_name", None) or "").strip() or None
     expected_repo = _WORKER_IMAGE_REPO_BY_ENGINE[engine]
+    expected_image = (requested_image or "").strip() or effective_worker_image
+    metadata: dict[str, Any] = {
+        "requested": (requested_image or "").strip() or None,
+        "suggested_or_expected": expected_image,
+        "instance_declared": actual_image,
+        "expected_repository": expected_repo,
+        "verification_level": "unverified",
+    }
     if actual_image is None:
         callbacks.report_provisioning_status(
             {
@@ -1397,7 +1428,7 @@ def _check_manual_instance_image_compatibility(
                 "status_message": f"Instance image metadata unavailable; expected repository: {expected_repo}.",
             }
         )
-        return
+        return metadata
     parsed_repo = _parse_image_repository(actual_image)
     if parsed_repo is None:
         callbacks.report_provisioning_status(
@@ -1410,13 +1441,13 @@ def _check_manual_instance_image_compatibility(
                 "status_message": f"Could not parse instance image metadata '{actual_image}'.",
             }
         )
-        return
+        return metadata
     if parsed_repo != expected_repo:
         raise OrchestrationError(
             f"Selected engine '{engine}' is incompatible with instance image '{actual_image}' (repo={parsed_repo}). "
             f"Expected repository: {expected_repo}."
         )
-    expected_image = (requested_image or "").strip() or effective_worker_image
+    metadata["verification_level"] = "repository-match"
     if expected_image and actual_image != expected_image:
         callbacks.report_provisioning_status(
             {
@@ -1431,6 +1462,10 @@ def _check_manual_instance_image_compatibility(
                 ),
             }
         )
+        metadata["verification_level"] = "repository-match-tag-different"
+    elif expected_image and actual_image == expected_image:
+        metadata["verification_level"] = "exact-match"
+    return metadata
 
 
 def create_app(
@@ -2110,6 +2145,10 @@ _INDEX_HTML = """
     let latestPlanPayload = null;
     let analysisRequestToken = 0;
     let latestWorkerImageByEngine = { realesrgan: "", seedvr2: "" };
+    const expectedWorkerRepoByEngine = {
+      realesrgan: "ghcr.io/davbg67/vast-video-upscaler-worker",
+      seedvr2: "ghcr.io/davbg67/vast-video-upscaler-seedvr2",
+    };
     let sourcesIndex = new Map();
     let currentJobStartedAt = null;
     const handledPromptIds = new Set();
@@ -2174,8 +2213,20 @@ _INDEX_HTML = """
     function syncWorkerImageForEngine() {
       const engine = document.getElementById("engine").value;
       const workerImage = document.getElementById("worker_image");
-      if (!workerImage.value.trim()) {
-        workerImage.value = latestWorkerImageByEngine[engine] || "";
+      const expectedRepo = expectedWorkerRepoByEngine[engine] || "";
+      const current = workerImage.value.trim();
+      const suggested = (latestWorkerImageByEngine[engine] || "").trim();
+      const extractRepo = (value) => {
+        if (!value) return "";
+        return value.split("@", 1)[0].split(":", 1)[0].trim().toLowerCase();
+      };
+      const currentRepo = extractRepo(current);
+      if (!current) {
+        workerImage.value = suggested;
+        return;
+      }
+      if (currentRepo && expectedRepo && currentRepo !== expectedRepo) {
+        workerImage.value = suggested;
       }
     }
 

@@ -31,9 +31,13 @@ Pour chaque exécution, il:
 
 Dans l'intégration web 6A.3, l'extrait est préparé localement côté API puis transmis au runner avec `--input-is-excerpt` pour éviter une seconde extraction SeedVR2 et tout décalage temporel inutile.
 
+Quand `--input-is-excerpt` est actif, le runner traite entièrement le fichier reçu, démarre à `00:00` sur ce fichier, et mesure la durée effective par probe vidéo. Les métadonnées de plage d'origine (ex: `00:39` / `10s`) restent conservées côté rapport web via l'enrichissement IHM.
+
 > ⚠️ Compatibilité image (phase 6A.3-C)  
 > Toute image SeedVR2 utilisée par l'IHM 6A.3 doit exposer l'option `--input-is-excerpt` dans `--help` du runner `/opt/prototype/seedvr2_prototype.py`.  
 > Une image plus ancienne construite avant ce paramètre est considérée incompatible avec le contrat IHM actuel.
+
+L'IHM conserve un historique de tags séparé par moteur (`realesrgan` vs `seedvr2`) et ne réutilise pas un tag d'un autre moteur.
 
 ## Checkpoints utilisés
 

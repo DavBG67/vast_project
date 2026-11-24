@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from vast_upscaler.seedvr2_prototype import (
     parse_timecode_to_seconds,
     run_cli,
 )
+from vast_upscaler.video import VideoProbeError
 
 
 def test_seedvr2_profiles_cover_smoke_and_reference() -> None:
@@ -82,29 +84,37 @@ def test_cuda_preflight_checks_sm_120_arch() -> None:
     assert "Missing sm_120 in torch CUDA arch list" in command[2]
 
 
-def test_run_cli_input_is_excerpt_skips_internal_extract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("profile", "duration_seconds"),
+    [
+        ("smoke", 3.0),
+        ("reference", 10.0),
+        ("reference", 7.0),
+        ("smoke", 10.0),
+        ("reference", 30.0),
+    ],
+)
+def test_run_cli_input_is_excerpt_uses_effective_input_duration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    profile: str,
+    duration_seconds: float,
+) -> None:
     source = tmp_path / "input.mp4"
     source.write_bytes(b"video")
     output_root = tmp_path / "out"
     work_root = tmp_path / "work"
     cache_dir = tmp_path / "cache"
-    executed_stages: list[str] = []
-
-    def _fake_run_command(command, *, log_file, stage_name):
-        executed_stages.append(stage_name)
-        if stage_name == "mux_h264_aac":
-            for idx, token in enumerate(command):
-                if token == "-y" and idx + 1 < len(command):
-                    Path(command[idx + 1]).write_bytes(b"ok")
-        return (0, "ok", 0.01)
-
-    monkeypatch.setattr("vast_upscaler.seedvr2_prototype._run_command", _fake_run_command)
+    monkeypatch.setattr(
+        "vast_upscaler.seedvr2_prototype.inspect_video",
+        lambda _path: SimpleNamespace(duration_seconds=duration_seconds),
+    )
     exit_code = run_cli(
         [
             "--input-video",
             str(source),
             "--profile",
-            "smoke",
+            profile,
             "--output-root",
             str(output_root),
             "--work-root",
@@ -112,10 +122,19 @@ def test_run_cli_input_is_excerpt_skips_internal_extract(monkeypatch: pytest.Mon
             "--cache-dir",
             str(cache_dir),
             "--input-is-excerpt",
+            "--dry-run",
         ]
     )
     assert exit_code == 0
-    assert "extract_excerpt" not in executed_stages
+    reports = sorted(output_root.rglob("prototype-report.json"))
+    assert reports, "Expected a report file in output root"
+    payload = json.loads(reports[-1].read_text(encoding="utf-8"))
+    assert payload["parameters"]["input_is_excerpt"] is True
+    assert payload["parameters"]["start_seconds"] == 0.0
+    assert payload["parameters"]["start_timecode"] == "00:00"
+    assert payload["parameters"]["duration_seconds"] == duration_seconds
+    assert "extract_excerpt" not in payload["commands"]
+    assert "seedvr2_inference" in payload["commands"]
 
 
 def test_run_cli_reference_profile_keeps_0039_10s_window_in_report(tmp_path: Path) -> None:
@@ -145,6 +164,40 @@ def test_run_cli_reference_profile_keeps_0039_10s_window_in_report(tmp_path: Pat
     payload = json.loads(reports[-1].read_text(encoding="utf-8"))
     assert payload["parameters"]["start_seconds"] == 39.0
     assert payload["parameters"]["duration_seconds"] == 10.0
+    assert payload["parameters"]["profile_default_start_timecode"] == "00:39"
     assert "extract_excerpt" in payload["commands"]
     assert "-ss 39.000" in payload["commands"]["extract_excerpt"]
+
+
+def test_run_cli_input_is_excerpt_reports_probe_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"video")
+    output_root = tmp_path / "out"
+    work_root = tmp_path / "work"
+    cache_dir = tmp_path / "cache"
+    def _raise_probe_error(_path):
+        raise VideoProbeError("probe failed")
+
+    monkeypatch.setattr("vast_upscaler.seedvr2_prototype.inspect_video", _raise_probe_error)
+    exit_code = run_cli(
+        [
+            "--input-video",
+            str(source),
+            "--profile",
+            "reference",
+            "--output-root",
+            str(output_root),
+            "--work-root",
+            str(work_root),
+            "--cache-dir",
+            str(cache_dir),
+            "--input-is-excerpt",
+        ]
+    )
+    assert exit_code == 1
+    reports = sorted(output_root.rglob("prototype-report.json"))
+    assert reports, "Expected a report file in output root"
+    payload = json.loads(reports[-1].read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert "Could not inspect input excerpt duration" in payload["error"]
 
