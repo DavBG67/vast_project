@@ -4,6 +4,8 @@ import json
 import posixpath
 import re
 import shlex
+import textwrap
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +34,13 @@ class RemoteSeedvr2WorkerReportError(RemoteSeedvr2WorkerError):
     """Raised when SeedVR2 report is missing or invalid."""
 
 
+class RemoteSeedvr2WorkerRecoveryError(RemoteSeedvr2WorkerError):
+    """Raised when inference completed remotely but artifact recovery failed."""
+
+
+ProgressCallback = Callable[[dict[str, object]], None]
+
+
 @dataclass(frozen=True)
 class Seedvr2RemoteRequest:
     session_id: str
@@ -40,6 +49,7 @@ class Seedvr2RemoteRequest:
     local_report_path: Path
     profile: str
     remote_root_base: str = "/workspace/seedvr2-sessions"
+    shared_cache_dir: str = "/workspace/seedvr2-cache"
     upload_timeout_seconds: float = 600.0
     process_timeout_seconds: float = 28_800.0
     download_timeout_seconds: float = 1800.0
@@ -71,6 +81,19 @@ class Seedvr2RemoteResult:
 
 
 _SEEDVR2_PYTHON = "/opt/seedvr2-venv/bin/python"
+_CHECKPOINT_LOCKFILE = ".seedvr2-checkpoints.lock"
+_CHECKPOINT_LOCK_TIMEOUT_SECONDS = 900.0
+_CHECKPOINT_RETRY_DELAY_SECONDS = 0.2
+_CHECKPOINT_METADATA = {
+    "seedvr2_ema_3b_fp8_e4m3fn.safetensors": {
+        "repo": "numz/SeedVR2_comfyUI",
+        "sha256": "3bf1e43ebedd570e7e7a0b1b60d6a02e105978f505c8128a241cde99a8240cff",
+    },
+    "ema_vae_fp16.safetensors": {
+        "repo": "numz/SeedVR2_comfyUI",
+        "sha256": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+    },
+}
 
 
 def execute_remote_seedvr2_worker(
@@ -78,11 +101,14 @@ def execute_remote_seedvr2_worker(
     transport: OpenSshTransport,
     connection: SshConnectionInfo,
     request: Seedvr2RemoteRequest,
+    progress_callback: ProgressCallback | None = None,
 ) -> Seedvr2RemoteResult:
     paths = _build_remote_paths(request)
     _prepare_remote_dirs(transport=transport, connection=connection, paths=paths)
 
     try:
+        if progress_callback is not None:
+            progress_callback({"kind": "transfer", "stage": "upload", "status": "started"})
         remote_input_path = transport.upload_file(
             connection,
             local_path=request.local_input_path,
@@ -92,6 +118,15 @@ def execute_remote_seedvr2_worker(
         )
     except TransferError as exc:
         raise RemoteSeedvr2WorkerTransferError(f"Input upload failed: {exc}") from exc
+    if progress_callback is not None:
+        progress_callback({"kind": "transfer", "stage": "upload", "status": "completed"})
+
+    _ensure_shared_checkpoints(
+        transport=transport,
+        connection=connection,
+        cache_dir=paths.cache_dir,
+        progress_callback=progress_callback,
+    )
 
     command = _build_seedvr2_command(
         input_path=remote_input_path,
@@ -100,14 +135,28 @@ def execute_remote_seedvr2_worker(
         work_root=paths.work_dir,
         cache_dir=paths.cache_dir,
     )
+    process_result = None
     try:
+        if progress_callback is not None:
+            progress_callback({"kind": "worker", "stage": "seedvr2-runner", "status": "started", "determinate": False})
+        progress_state = _Seedvr2ProgressState()
+
+        def _on_stdout_line(line: str) -> None:
+            event = _parse_seedvr2_progress_line(line=line, state=progress_state)
+            if event is not None and progress_callback is not None:
+                progress_callback(event)
+            if progress_callback is not None and _should_emit_log_line(line=line, state=progress_state):
+                progress_callback({"kind": "worker-log", "line": line[-800:]})
+
+        shell_command = _as_shell_command_with_stderr_merge(command)
         process_result = transport.run_remote_command(
             connection,
-            command=command,
+            command=shell_command,
             timeout_seconds=request.process_timeout_seconds,
             retry_policy=RetryPolicy(max_attempts=1),
             idempotent=False,
             check=False,
+            stdout_line_callback=_on_stdout_line,
         )
     except SshTransportError as exc:
         raise RemoteSeedvr2WorkerProcessError(f"Remote SeedVR2 execution failed before completion: {exc}") from exc
@@ -118,70 +167,37 @@ def execute_remote_seedvr2_worker(
             f"stderr: {(process_result.stderr or '').strip()}"
         )
 
-    discovered = _discover_seedvr2_outputs(transport=transport, connection=connection, output_root=paths.output_dir)
-    remote_report_path = discovered["report"]
-    remote_output_path = discovered["output"]
-    remote_log_path = discovered.get("log")
-
-    try:
-        transport.download_file(
-            connection,
-            remote_path=remote_report_path,
-            local_path=request.local_report_path,
-            timeout_seconds=request.download_timeout_seconds,
-            retry_policy=RetryPolicy(max_attempts=1),
-            overwrite=True,
-        )
-    except TransferError as exc:
-        raise RemoteSeedvr2WorkerTransferError(f"Could not download SeedVR2 report: {exc}") from exc
-
-    report_payload = _load_seedvr2_report(request.local_report_path)
-    status = str(report_payload.get("status") or "").lower()
-    if status != "completed":
-        raise RemoteSeedvr2WorkerReportError(f"SeedVR2 report status is not completed: {status or 'missing'}")
-
-    _validate_remote_path_within_root(path=remote_output_path, root=paths.output_dir, label="output")
-    if remote_log_path is not None:
-        _validate_remote_path_within_root(path=remote_log_path, root=paths.output_dir, label="log")
-
-    try:
-        transport.download_file(
-            connection,
-            remote_path=remote_output_path,
-            local_path=request.local_output_path,
-            timeout_seconds=request.download_timeout_seconds,
-            retry_policy=RetryPolicy(max_attempts=1),
-            overwrite=True,
-        )
-    except TransferError as exc:
-        raise RemoteSeedvr2WorkerTransferError(f"Could not download SeedVR2 output video: {exc}") from exc
-
-    local_log_path: Path | None = None
-    if remote_log_path is not None:
-        local_log_path = request.local_report_path.with_suffix(request.local_report_path.suffix + ".run.log")
-        try:
-            transport.download_file(
-                connection,
-                remote_path=remote_log_path,
-                local_path=local_log_path,
-                timeout_seconds=request.download_timeout_seconds,
-                retry_policy=RetryPolicy(max_attempts=1),
-                overwrite=True,
-            )
-        except TransferError:
-            local_log_path = None
-
-    return Seedvr2RemoteResult(
-        session_id=request.session_id,
+    return _download_seedvr2_artifacts(
+        transport=transport,
+        connection=connection,
+        request=request,
+        paths=paths,
         command=command,
-        remote_paths=paths,
         process_returncode=process_result.returncode,
         process_stdout=process_result.stdout,
         process_stderr=process_result.stderr,
-        report_payload=report_payload,
-        local_output_path=request.local_output_path,
-        local_report_path=request.local_report_path,
-        local_log_path=local_log_path,
+        progress_callback=progress_callback,
+    )
+
+
+def recover_remote_seedvr2_results(
+    *,
+    transport: OpenSshTransport,
+    connection: SshConnectionInfo,
+    request: Seedvr2RemoteRequest,
+    progress_callback: ProgressCallback | None = None,
+) -> Seedvr2RemoteResult:
+    paths = _build_remote_paths(request)
+    return _download_seedvr2_artifacts(
+        transport=transport,
+        connection=connection,
+        request=request,
+        paths=paths,
+        command=[],
+        process_returncode=0,
+        process_stdout="",
+        process_stderr="",
+        progress_callback=progress_callback,
     )
 
 
@@ -216,7 +232,7 @@ def _build_remote_paths(request: Seedvr2RemoteRequest) -> Seedvr2RemotePaths:
     input_dir = posixpath.join(root, "input")
     output_dir = posixpath.join(root, "output")
     work_dir = posixpath.join(root, "work")
-    cache_dir = posixpath.join(root, "cache")
+    cache_dir = posixpath.normpath(request.shared_cache_dir)
     logs_dir = posixpath.join(root, "logs")
 
     input_name = request.local_input_path.name
@@ -263,19 +279,7 @@ def _discover_seedvr2_outputs(
     connection: SshConnectionInfo,
     output_root: str,
 ) -> dict[str, str]:
-    script = (
-        "import json; from pathlib import Path; "
-        f"root = Path({output_root!r}); "
-        "reports = sorted([p for p in root.rglob('prototype-report.json') if p.is_file()], key=lambda p: p.stat().st_mtime); "
-        "assert reports, 'No prototype-report.json found under output root'; "
-        "report_path = reports[-1]; "
-        "payload = json.loads(report_path.read_text(encoding='utf-8')); "
-        "output_path = payload.get('output_file'); "
-        "log_path = payload.get('log_file'); "
-        "assert isinstance(output_path, str) and output_path.strip(), 'SeedVR2 report missing output_file'; "
-        "if log_path is not None: assert isinstance(log_path, str) and log_path.strip(), 'SeedVR2 report has invalid log_file'; "
-        "print(json.dumps({'report': str(report_path), 'output': output_path, 'log': log_path}))"
-    )
+    script = _build_seedvr2_discovery_script(output_root=output_root)
     try:
         result = transport.run_remote_command(
             connection,
@@ -310,6 +314,89 @@ def _discover_seedvr2_outputs(
     return result
 
 
+def _download_seedvr2_artifacts(
+    *,
+    transport: OpenSshTransport,
+    connection: SshConnectionInfo,
+    request: Seedvr2RemoteRequest,
+    paths: Seedvr2RemotePaths,
+    command: list[str],
+    process_returncode: int,
+    process_stdout: str,
+    process_stderr: str,
+    progress_callback: ProgressCallback | None,
+) -> Seedvr2RemoteResult:
+    discovered = _discover_seedvr2_outputs(transport=transport, connection=connection, output_root=paths.output_dir)
+    remote_report_path = discovered["report"]
+    remote_output_path = discovered["output"]
+    remote_log_path = discovered.get("log")
+
+    try:
+        if progress_callback is not None:
+            progress_callback({"kind": "transfer", "stage": "download", "status": "started"})
+        transport.download_file(
+            connection,
+            remote_path=remote_report_path,
+            local_path=request.local_report_path,
+            timeout_seconds=request.download_timeout_seconds,
+            retry_policy=RetryPolicy(max_attempts=1),
+            overwrite=True,
+        )
+    except TransferError as exc:
+        raise RemoteSeedvr2WorkerRecoveryError(f"Could not download SeedVR2 report: {exc}") from exc
+
+    report_payload = _load_seedvr2_report(request.local_report_path)
+    status = str(report_payload.get("status") or "").lower()
+    if status != "completed":
+        raise RemoteSeedvr2WorkerReportError(f"SeedVR2 report status is not completed: {status or 'missing'}")
+
+    _validate_remote_path_within_root(path=remote_output_path, root=paths.output_dir, label="output")
+    if remote_log_path is not None:
+        _validate_remote_path_within_root(path=remote_log_path, root=paths.output_dir, label="log")
+
+    try:
+        transport.download_file(
+            connection,
+            remote_path=remote_output_path,
+            local_path=request.local_output_path,
+            timeout_seconds=request.download_timeout_seconds,
+            retry_policy=RetryPolicy(max_attempts=1),
+            overwrite=True,
+        )
+    except TransferError as exc:
+        raise RemoteSeedvr2WorkerRecoveryError(f"Could not download SeedVR2 output video: {exc}") from exc
+
+    local_log_path: Path | None = None
+    if remote_log_path is not None:
+        local_log_path = request.local_report_path.with_suffix(request.local_report_path.suffix + ".run.log")
+        try:
+            transport.download_file(
+                connection,
+                remote_path=remote_log_path,
+                local_path=local_log_path,
+                timeout_seconds=request.download_timeout_seconds,
+                retry_policy=RetryPolicy(max_attempts=1),
+                overwrite=True,
+            )
+        except TransferError:
+            local_log_path = None
+    if progress_callback is not None:
+        progress_callback({"kind": "transfer", "stage": "download", "status": "completed"})
+
+    return Seedvr2RemoteResult(
+        session_id=request.session_id,
+        command=command,
+        remote_paths=paths,
+        process_returncode=process_returncode,
+        process_stdout=process_stdout,
+        process_stderr=process_stderr,
+        report_payload=report_payload,
+        local_output_path=request.local_output_path,
+        local_report_path=request.local_report_path,
+        local_log_path=local_log_path,
+    )
+
+
 def _load_seedvr2_report(report_path: Path) -> dict:
     try:
         payload = json.loads(report_path.read_text(encoding="utf-8"))
@@ -320,6 +407,62 @@ def _load_seedvr2_report(report_path: Path) -> dict:
     if not isinstance(payload, dict):
         raise RemoteSeedvr2WorkerReportError("SeedVR2 report root must be a JSON object.")
     return payload
+
+
+def _build_seedvr2_discovery_script(*, output_root: str) -> str:
+    return textwrap.dedent(
+        f"""
+        import json
+        from pathlib import Path
+
+        root = Path({output_root!r}).resolve()
+        reports = sorted(
+            [p for p in root.rglob("prototype-report.json") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not reports:
+            raise RuntimeError("No prototype-report.json found under output root")
+
+        report_path = reports[-1].resolve(strict=True)
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+        output_path = payload.get("output_file")
+        if not isinstance(output_path, str) or not output_path.strip():
+            raise RuntimeError("SeedVR2 report missing output_file")
+
+        output_resolved = Path(output_path).resolve(strict=True)
+        if not output_resolved.is_file():
+            raise RuntimeError("SeedVR2 output_file does not exist")
+
+        log_path = payload.get("log_file")
+        log_resolved = None
+        if isinstance(log_path, str) and log_path.strip():
+            candidate = Path(log_path).resolve(strict=False)
+            if candidate.exists() and candidate.is_file():
+                log_resolved = candidate.resolve(strict=True)
+
+        for label, candidate in (("report", report_path), ("output", output_resolved)):
+            try:
+                candidate.relative_to(root)
+            except ValueError as exc:
+                raise RuntimeError(f"SeedVR2 {{label}} path is outside output root: {{candidate}}") from exc
+        if log_resolved is not None:
+            try:
+                log_resolved.relative_to(root)
+            except ValueError as exc:
+                raise RuntimeError(f"SeedVR2 log path is outside output root: {{log_resolved}}") from exc
+
+        print(
+            json.dumps(
+                {{
+                    "report": str(report_path),
+                    "output": str(output_resolved),
+                    "log": str(log_resolved) if log_resolved is not None else None,
+                }}
+            )
+        )
+        """
+    ).strip()
 
 
 def _sanitize_session_id(value: str) -> str:
@@ -342,3 +485,167 @@ def _validate_remote_path_within_root(*, path: str, root: str, label: str) -> No
         raise RemoteSeedvr2WorkerReportError(
             f"SeedVR2 {label} path is outside output root: {path} (root: {normalized_root})"
         )
+
+
+def _as_shell_command_with_stderr_merge(command: list[str]) -> str:
+    return f"{' '.join(shlex.quote(item) for item in command)} 2>&1"
+
+
+def _ensure_shared_checkpoints(
+    *,
+    transport: OpenSshTransport,
+    connection: SshConnectionInfo,
+    cache_dir: str,
+    progress_callback: ProgressCallback | None,
+) -> None:
+    if progress_callback is not None:
+        progress_callback({"kind": "worker", "stage": "checkpoint-cache", "status": "started", "determinate": False})
+    script = _build_checkpoint_cache_script(cache_dir=cache_dir)
+    try:
+        transport.run_remote_command(
+            connection,
+            command=[_SEEDVR2_PYTHON, "-c", script],
+            timeout_seconds=_CHECKPOINT_LOCK_TIMEOUT_SECONDS,
+            retry_policy=RetryPolicy(max_attempts=1),
+            idempotent=True,
+            check=True,
+        )
+    except SshTransportError as exc:
+        raise RemoteSeedvr2WorkerRecoveryError(f"SeedVR2 checkpoint cache preparation failed: {exc}") from exc
+    if progress_callback is not None:
+        progress_callback({"kind": "worker", "stage": "checkpoint-cache", "status": "completed", "determinate": False})
+
+
+def _build_checkpoint_cache_script(*, cache_dir: str) -> str:
+    metadata = {
+        filename: {
+            "repo": values["repo"],
+            "sha256": values["sha256"],
+            "url": f"https://huggingface.co/{values['repo']}/resolve/main/{filename}",
+        }
+        for filename, values in _CHECKPOINT_METADATA.items()
+    }
+    return textwrap.dedent(
+        f"""
+        import hashlib
+        import json
+        import os
+        import time
+        import urllib.request
+        from pathlib import Path
+
+        cache = Path({cache_dir!r})
+        cache.mkdir(parents=True, exist_ok=True)
+        lock_path = cache / {_CHECKPOINT_LOCKFILE!r}
+        started = time.time()
+        lock_fd = None
+        while True:
+            try:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                if time.time() - started > {_CHECKPOINT_LOCK_TIMEOUT_SECONDS!r}:
+                    raise RuntimeError("Timeout while waiting for SeedVR2 checkpoint lock")
+                time.sleep({_CHECKPOINT_RETRY_DELAY_SECONDS!r})
+
+        try:
+            meta = {json.dumps(metadata, separators=(",", ":"))}
+            for filename, item in meta.items():
+                target = cache / filename
+                expected_sha = item["sha256"].lower()
+                if target.exists() and target.is_file():
+                    digest = hashlib.sha256(target.read_bytes()).hexdigest().lower()
+                    if digest == expected_sha:
+                        continue
+                    target.unlink()
+
+                tmp = cache / (filename + ".part")
+                if tmp.exists():
+                    tmp.unlink()
+
+                with urllib.request.urlopen(item["url"]) as response, tmp.open("wb") as fh:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+
+                digest = hashlib.sha256(tmp.read_bytes()).hexdigest().lower()
+                if digest != expected_sha:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(f"Checkpoint checksum mismatch for {{filename}}")
+                os.replace(tmp, target)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            if lock_path.exists():
+                lock_path.unlink()
+        """
+    ).strip()
+
+
+class _Seedvr2ProgressState:
+    def __init__(self) -> None:
+        self.last_progress: float = 0.0
+        self.last_log_emit_line: int = 0
+        self.seen_lines: int = 0
+        self.current_stage: str | None = None
+
+
+def _parse_seedvr2_progress_line(*, line: str, state: _Seedvr2ProgressState) -> dict[str, object] | None:
+    state.seen_lines += 1
+    lowered = line.lower()
+
+    stage = None
+    if "vae" in lowered and "encode" in lowered:
+        stage = "vae-encode"
+    elif "dit" in lowered or "upscal" in lowered:
+        stage = "dit-upscale"
+    elif "vae" in lowered and "decode" in lowered:
+        stage = "vae-decode"
+    elif "mux" in lowered or "ffmpeg" in lowered:
+        stage = "final-encode"
+
+    if stage and stage != state.current_stage:
+        state.current_stage = stage
+        return {"kind": "worker", "stage": stage, "determinate": False}
+
+    frame_match = re.search(r"(?:frame|frames)\s*[:=]?\s*(\\d+)(?:\\s*/\\s*(\\d+))?", lowered)
+    if frame_match:
+        done = int(frame_match.group(1))
+        total = frame_match.group(2)
+        payload: dict[str, object] = {"kind": "worker", "stage": state.current_stage or "dit-upscale", "frames_done": done}
+        if total is not None:
+            total_int = int(total)
+            if total_int > 0:
+                progress = max(state.last_progress, min(1.0, done / total_int))
+                state.last_progress = progress
+                payload["frames_total"] = total_int
+                payload["progress"] = progress
+        return payload
+
+    chunk_match = re.search(r"chunk\\s*(\\d+)\\s*/\\s*(\\d+)", lowered)
+    if chunk_match:
+        return {
+            "kind": "worker",
+            "stage": state.current_stage or "dit-upscale",
+            "chunk_done": int(chunk_match.group(1)),
+            "chunk_total": int(chunk_match.group(2)),
+            "determinate": False,
+        }
+
+    return None
+
+
+def _should_emit_log_line(*, line: str, state: _Seedvr2ProgressState) -> bool:
+    if not line.strip():
+        return False
+    important_tokens = ("error", "warning", "traceback", "oom", "cuda", "failed")
+    lowered = line.lower()
+    if any(token in lowered for token in important_tokens):
+        state.last_log_emit_line = state.seen_lines
+        return True
+    if state.seen_lines - state.last_log_emit_line >= 25:
+        state.last_log_emit_line = state.seen_lines
+        return True
+    return False

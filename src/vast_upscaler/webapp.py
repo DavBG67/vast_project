@@ -48,8 +48,11 @@ from vast_upscaler.preprocessing_planner import (
 )
 from vast_upscaler.provisioning_history import ProvisioningAttemptTracker
 from vast_upscaler.remote_seedvr2_worker import (
+    RemoteSeedvr2WorkerProcessError,
+    RemoteSeedvr2WorkerRecoveryError,
     Seedvr2RemoteRequest,
     execute_remote_seedvr2_worker,
+    recover_remote_seedvr2_results,
 )
 from vast_upscaler.remote_worker import (
     RemoteWorkerRequest,
@@ -86,6 +89,7 @@ Seedvr2Profile = Literal["smoke", "reference"]
 
 _DEFAULT_WORKER_IMAGE = ""
 _WORKER_IMAGE_HISTORY_PATH = Path.home() / ".vast_upscaler" / "web_worker_images.json"
+_SEEDVR2_RECOVERY_STATE_PATH = Path.home() / ".vast_upscaler" / "seedvr2_recovery_jobs.json"
 _DEFAULT_ENGINE: EngineName = "realesrgan"
 _SUPPORTED_ENGINES: tuple[EngineName, ...] = ("realesrgan", "seedvr2")
 _SEEDVR2_PROFILES: tuple[Seedvr2Profile, ...] = ("smoke", "reference")
@@ -140,11 +144,17 @@ class StartJobRequest(BaseModel):
     excerpt_enabled: bool = False
     excerpt_start: str | None = None
     excerpt_duration_seconds: float = Field(default=10.0, gt=0)
+    recover_seedvr2_job_id: str | None = None
 
 
 class PromptReplyRequest(BaseModel):
     approved: bool | None = None
     fingerprint: str | None = None
+
+
+class Seedvr2RecoveryRequest(BaseModel):
+    recovery_job_id: str
+    instance_id: int | None = None
 
 
 class SourceAnalysisRequest(BaseModel):
@@ -216,6 +226,7 @@ class _Job:
         self.created_at = datetime.now(UTC).isoformat()
         self.updated_at = self.created_at
         self.status = "pending"
+        self.business_state = "pending"
         self.error: str | None = None
         self.result: WorkflowExecutionResult | None = None
         self.events: list[dict[str, Any]] = []
@@ -277,6 +288,7 @@ class WebTaskManager:
             "worker_image_source": "history" if latest_worker_image else "none",
             "worker_image_required": latest_worker_image == "",
             "ssh_bootstrap_mode": "tofu",
+            "seedvr2_recovery_jobs": _list_seedvr2_recovery_jobs(),
         }
 
     def list_instances(self) -> list[dict[str, Any]]:
@@ -395,6 +407,7 @@ class WebTaskManager:
 
     def _run_job(self, job: _Job) -> None:
         job.status = "running"
+        job.business_state = "running"
         job.append_event("status", {"state": "running", "message": "Workflow started."})
         started = time.perf_counter()
         settings = load_config(self._config_path)
@@ -438,6 +451,7 @@ class WebTaskManager:
                 )
             job.result = result
             job.status = "completed"
+            job.business_state = "completed"
             if job.request.worker_image:
                 try:
                     _store_latest_worker_image(job.request.worker_image, engine=_normalize_engine(job.request.engine))
@@ -465,20 +479,29 @@ class WebTaskManager:
             )
         except WebWorkflowCancelled:
             job.status = "cancelled"
+            job.business_state = "cancelled"
             job.error = "Cancelled by operator."
             job.append_event("error", {"message": job.error})
             if job.request.mode == "manual":
                 job.append_event(
-                    "status",
+                    "instance",
                     {"state": "manual-instance-preserved", "message": "Manual mode never destroys the existing instance automatically."},
                 )
         except Exception as exc:  # noqa: BLE001
             job.status = "failed"
+            details = str(exc)
+            lowered = details.lower()
+            if "could not download seedvr2" in lowered or "could not discover seedvr2" in lowered or "artifact" in lowered:
+                job.business_state = "failed_recovery"
+            elif "exited with code" in lowered or "report status is not completed" in lowered:
+                job.business_state = "failed_inference"
+            else:
+                job.business_state = "failed"
             job.error = str(exc)
             job.append_event("error", {"message": str(exc)})
             if job.request.mode == "manual":
                 job.append_event(
-                    "status",
+                    "instance",
                     {"state": "manual-instance-preserved", "message": "Manual mode never destroys the existing instance automatically."},
                 )
         finally:
@@ -494,6 +517,14 @@ class WebTaskManager:
 
     def _on_worker_progress(self, job: _Job, payload: dict[str, object]) -> None:
         self._raise_if_cancelled(job)
+        kind = str(payload.get("kind") or "")
+        stage = str(payload.get("stage") or "")
+        status = str(payload.get("status") or "")
+        if kind == "transfer" and stage == "download" and status == "started":
+            job.business_state = "inference_succeeded_recovering"
+            job.append_event("status", {"state": "inference_succeeded_recovering", "message": "Inference finished, downloading artifacts."})
+        elif stage:
+            job.business_state = "running"
         job.append_event("worker", payload)
 
     def _await_boolean_prompt(self, *, job: _Job, kind: str, message: str) -> bool:
@@ -546,6 +577,7 @@ class WebTaskManager:
         payload: dict[str, Any] = {
             "job_id": job.job_id,
             "status": job.status,
+            "business_state": job.business_state,
             "mode": job.request.mode,
             "engine": _normalize_engine(job.request.engine),
             "seedvr2_profile": _normalize_seedvr2_profile(job.request.seedvr2_profile),
@@ -578,6 +610,14 @@ class WebTaskManager:
 
     @staticmethod
     def _validate_paths(*, request: StartJobRequest) -> None:
+        recovery_job_id = (request.recover_seedvr2_job_id or "").strip()
+        if recovery_job_id:
+            engine = _normalize_engine(request.engine)
+            if engine != "seedvr2" or request.mode != "manual":
+                raise HTTPException(status_code=400, detail="SeedVR2 recovery requires manual mode and engine=seedvr2.")
+            _normalize_seedvr2_profile(request.seedvr2_profile)
+            return
+
         source_name = (request.source_name or "").strip()
         input_path_raw = (request.input_path or "").strip()
         if source_name and input_path_raw:
@@ -706,10 +746,11 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
             final_report_path = (
                 summary.worker_result.local_report_path if summary.worker_result is not None else report_path
             )
-            _safe_merge_report_metadata(
-                report_path=final_report_path,
-                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-            )
+            if effective_input is not None:
+                _safe_merge_report_metadata(
+                    report_path=final_report_path,
+                    metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+                )
             return WorkflowExecutionResult(
                 mode="automatic",
                 session_id=summary.session_id,
@@ -724,10 +765,11 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
                 cleanup_warning=summary.cleanup_warning,
             )
         except Exception:
-            _safe_merge_report_metadata(
-                report_path=report_path,
-                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-            )
+            if effective_input is not None:
+                _safe_merge_report_metadata(
+                    report_path=report_path,
+                    metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+                )
             raise
     finally:
         _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
@@ -737,20 +779,33 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
 
 def _default_manual_runner(request: StartJobRequest, settings: Settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
     callbacks.raise_if_cancelled()
-    if request.instance_id is None:
+    recovery_job_id = (request.recover_seedvr2_job_id or "").strip() or None
+    if request.instance_id is None and recovery_job_id is None:
         raise OrchestrationError("Manual mode requires an existing Vast instance id.")
     engine = _normalize_engine(request.engine)
+    if recovery_job_id and engine != "seedvr2":
+        raise OrchestrationError("Recovery-only mode is available for SeedVR2 manual jobs only.")
     seedvr2_profile = _normalize_seedvr2_profile(request.seedvr2_profile)
     effective_worker_image = (request.worker_image or _load_latest_known_worker_image(engine=engine)).strip() or None
     if effective_worker_image:
         _ensure_image_repository_matches_engine(image=effective_worker_image, engine=engine)
 
-    output_path = _resolve_output_path(request=request)
-    report_path = _resolve_report_path(request=request, output_path=output_path)
-    source_path = _resolve_input_video_path(request=request)
-    effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
-    input_path = effective_input.input_path
-    preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
+    effective_input: _EffectiveJobInput | None = None
+    preprocessing_contract = None
+    if recovery_job_id:
+        recovery_record = _load_seedvr2_recovery_job(recovery_job_id)
+        output_path = Path(str(recovery_record["local_output_path"]))
+        report_path = Path(str(recovery_record["local_report_path"]))
+        input_path = Path(str(recovery_record.get("local_input_path") or output_path))
+        if request.instance_id is None:
+            request.instance_id = int(recovery_record["instance_id"])
+    else:
+        output_path = _resolve_output_path(request=request)
+        report_path = _resolve_report_path(request=request, output_path=output_path)
+        source_path = _resolve_input_video_path(request=request)
+        effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
+        input_path = effective_input.input_path
+        preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
 
     transport = OpenSshTransport()
     write_client = _build_write_client(settings)
@@ -833,24 +888,74 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             }
         )
         if engine == "seedvr2":
-            callbacks.report_worker_progress(
-                {
-                    "phase": "seedvr2-prepared",
-                    "progress": 0.05,
-                    "message": f"SeedVR2 profile '{seedvr2_profile}' selected (input excerpt prepared locally).",
-                }
-            )
-            worker_result = execute_remote_seedvr2_worker(
-                transport=transport,
-                connection=connection,
-                request=Seedvr2RemoteRequest(
-                    session_id=f"manual-{uuid4().hex[:12]}",
-                    local_input_path=input_path,
-                    local_output_path=output_path,
-                    local_report_path=report_path,
-                    profile=seedvr2_profile,
-                ),
-            )
+            if recovery_job_id:
+                callbacks.report_worker_progress({"kind": "worker", "stage": "artifact-recovery", "status": "started", "determinate": False})
+                remote_root_base = str(recovery_record.get("remote_root_base") or "/workspace/seedvr2-sessions")
+                remote_session_id = str(recovery_record.get("remote_session_id") or recovery_job_id)
+                worker_result = recover_remote_seedvr2_results(
+                    transport=transport,
+                    connection=connection,
+                    request=Seedvr2RemoteRequest(
+                        session_id=remote_session_id,
+                        local_input_path=input_path,
+                        local_output_path=output_path,
+                        local_report_path=report_path,
+                        profile=seedvr2_profile,
+                        remote_root_base=remote_root_base,
+                    ),
+                    progress_callback=lambda payload: callbacks.report_worker_progress(payload),
+                )
+                _update_seedvr2_recovery_job_state(
+                    recovery_job_id=recovery_job_id,
+                    inference_state="completed",
+                    recovery_state="completed",
+                )
+            else:
+                callbacks.report_worker_progress(
+                    {
+                        "kind": "worker",
+                        "stage": "seedvr2-prepared",
+                        "progress": 0.05,
+                        "message": f"SeedVR2 profile '{seedvr2_profile}' selected (input excerpt prepared locally).",
+                    }
+                )
+                remote_session_id = f"manual-{uuid4().hex[:12]}"
+                _upsert_seedvr2_recovery_job(
+                    {
+                        "recovery_job_id": remote_session_id,
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "updated_at": datetime.now(UTC).isoformat(),
+                        "instance_id": instance.instance_id,
+                        "engine": "seedvr2",
+                        "seedvr2_profile": seedvr2_profile,
+                        "remote_root_base": "/workspace/seedvr2-sessions",
+                        "remote_session_id": remote_session_id,
+                        "ssh_host": instance.ssh_host,
+                        "ssh_port": instance.ssh_port,
+                        "local_input_path": str(input_path),
+                        "local_output_path": str(output_path),
+                        "local_report_path": str(report_path),
+                        "inference_state": "running",
+                        "recovery_state": "pending",
+                    }
+                )
+                worker_result = execute_remote_seedvr2_worker(
+                    transport=transport,
+                    connection=connection,
+                    request=Seedvr2RemoteRequest(
+                        session_id=remote_session_id,
+                        local_input_path=input_path,
+                        local_output_path=output_path,
+                        local_report_path=report_path,
+                        profile=seedvr2_profile,
+                    ),
+                    progress_callback=lambda payload: callbacks.report_worker_progress(payload),
+                )
+                _update_seedvr2_recovery_job_state(
+                    recovery_job_id=remote_session_id,
+                    inference_state="completed",
+                    recovery_state="completed",
+                )
             final_report_path = worker_result.local_report_path
         else:
             worker_result = execute_remote_worker(
@@ -893,10 +998,11 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                 },
             },
         )
-        _safe_merge_report_metadata(
-            report_path=final_report_path,
-            metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-        )
+        if effective_input is not None:
+            _safe_merge_report_metadata(
+                report_path=final_report_path,
+                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+            )
         elapsed = time.perf_counter() - started
         return WorkflowExecutionResult(
             mode="manual",
@@ -911,6 +1017,34 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             cleanup_verified=False,
             cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
         )
+    except RemoteSeedvr2WorkerRecoveryError:
+        if recovery_job_id and engine == "seedvr2":
+            _update_seedvr2_recovery_job_state(
+                recovery_job_id=recovery_job_id,
+                inference_state="completed",
+                recovery_state="failed",
+            )
+        elif engine == "seedvr2":
+            _update_seedvr2_recovery_job_state(
+                recovery_job_id=remote_session_id,  # type: ignore[name-defined]
+                inference_state="completed",
+                recovery_state="failed",
+            )
+        raise
+    except RemoteSeedvr2WorkerProcessError:
+        if recovery_job_id and engine == "seedvr2":
+            _update_seedvr2_recovery_job_state(
+                recovery_job_id=recovery_job_id,
+                inference_state="failed",
+                recovery_state="pending",
+            )
+        elif engine == "seedvr2":
+            _update_seedvr2_recovery_job_state(
+                recovery_job_id=remote_session_id,  # type: ignore[name-defined]
+                inference_state="failed",
+                recovery_state="pending",
+            )
+        raise
     except Exception:
         enrich_local_report_with_vast_metadata(
             report_path=report_path,
@@ -936,13 +1070,15 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                 },
             },
         )
-        _safe_merge_report_metadata(
-            report_path=report_path,
-            metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-        )
+        if effective_input is not None:
+            _safe_merge_report_metadata(
+                report_path=report_path,
+                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+            )
         raise
     finally:
-        _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
+        if effective_input is not None:
+            _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
         write_client.close()
 
 
@@ -1370,6 +1506,72 @@ def _store_latest_worker_image(value: str, *, engine: EngineName = _DEFAULT_ENGI
     _WORKER_IMAGE_HISTORY_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _read_seedvr2_recovery_payload() -> dict[str, Any]:
+    try:
+        payload = json.loads(_SEEDVR2_RECOVERY_STATE_PATH.read_text(encoding="utf-8"))
+    except OSError:
+        return {"jobs": {}}
+    except json.JSONDecodeError:
+        return {"jobs": {}}
+    if not isinstance(payload, dict):
+        return {"jobs": {}}
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, dict):
+        payload["jobs"] = {}
+    return payload
+
+
+def _write_seedvr2_recovery_payload(payload: dict[str, Any]) -> None:
+    _SEEDVR2_RECOVERY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SEEDVR2_RECOVERY_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _upsert_seedvr2_recovery_job(job_payload: dict[str, Any]) -> None:
+    payload = _read_seedvr2_recovery_payload()
+    jobs = payload.setdefault("jobs", {})
+    assert isinstance(jobs, dict)
+    jobs[job_payload["recovery_job_id"]] = job_payload
+    _write_seedvr2_recovery_payload(payload)
+
+
+def _update_seedvr2_recovery_job_state(*, recovery_job_id: str, inference_state: str | None = None, recovery_state: str | None = None) -> None:
+    payload = _read_seedvr2_recovery_payload()
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, dict):
+        return
+    record = jobs.get(recovery_job_id)
+    if not isinstance(record, dict):
+        return
+    if inference_state is not None:
+        record["inference_state"] = inference_state
+    if recovery_state is not None:
+        record["recovery_state"] = recovery_state
+    record["updated_at"] = datetime.now(UTC).isoformat()
+    jobs[recovery_job_id] = record
+    _write_seedvr2_recovery_payload(payload)
+
+
+def _load_seedvr2_recovery_job(recovery_job_id: str) -> dict[str, Any]:
+    payload = _read_seedvr2_recovery_payload()
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, dict):
+        raise HTTPException(status_code=404, detail="No SeedVR2 recovery metadata available.")
+    record = jobs.get(recovery_job_id)
+    if not isinstance(record, dict):
+        raise HTTPException(status_code=404, detail=f"Unknown SeedVR2 recovery job: {recovery_job_id}")
+    return record
+
+
+def _list_seedvr2_recovery_jobs() -> list[dict[str, Any]]:
+    payload = _read_seedvr2_recovery_payload()
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, dict):
+        return []
+    rows = [value for value in jobs.values() if isinstance(value, dict)]
+    rows.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+    return rows[:50]
+
+
 def _run_manual_engine_preflight(
     *,
     transport: OpenSshTransport,
@@ -1596,9 +1798,35 @@ def create_app(
     def api_instances() -> dict[str, Any]:
         return {"instances": manager.list_instances()}
 
+    @app.get("/api/seedvr2/recoveries")
+    def api_seedvr2_recoveries() -> dict[str, Any]:
+        return {"jobs": _list_seedvr2_recovery_jobs()}
+
     @app.post("/api/jobs/start")
     def api_start(request: StartJobRequest) -> dict[str, Any]:
         return manager.start_job(request)
+
+    @app.post("/api/jobs/recover-seedvr2")
+    def api_recover_seedvr2(request: Seedvr2RecoveryRequest) -> dict[str, Any]:
+        recovery = _load_seedvr2_recovery_job(request.recovery_job_id)
+        recovery_instance_id = int(recovery.get("instance_id"))
+        if request.instance_id is not None and request.instance_id != recovery_instance_id:
+            raise HTTPException(status_code=400, detail="Recovery job does not match the selected instance id.")
+        profile = str(recovery.get("seedvr2_profile") or "smoke")
+        input_path = str(recovery.get("local_input_path") or "").strip()
+        output_path = str(recovery.get("local_output_path") or "").strip()
+        report_path = str(recovery.get("local_report_path") or "").strip()
+        start_request = StartJobRequest(
+            mode="manual",
+            engine="seedvr2",
+            seedvr2_profile=profile,
+            input_path=input_path,
+            output_path=output_path,
+            report_path=report_path,
+            instance_id=recovery_instance_id,
+            recover_seedvr2_job_id=request.recovery_job_id,
+        )
+        return manager.start_job(start_request)
 
     @app.get("/api/jobs/{job_id}")
     def api_job(job_id: str) -> dict[str, Any]:
@@ -2107,6 +2335,10 @@ _INDEX_HTML = """
     <div class="actions">
       <button type="submit">Lancer le traitement</button>
       <button type="button" id="cancel-btn" class="secondary">Annuler</button>
+      <select id="recovery_job_id" class="secondary">
+        <option value="">-- Récupération SeedVR2 (job distant) --</option>
+      </select>
+      <button type="button" id="recover-btn" class="secondary">Récupérer les résultats</button>
     </div>
     </form>
 
@@ -2144,7 +2376,9 @@ _INDEX_HTML = """
     let latestAnalysisPayload = null;
     let latestPlanPayload = null;
     let analysisRequestToken = 0;
+    let currentBusinessState = "idle";
     let latestWorkerImageByEngine = { realesrgan: "", seedvr2: "" };
+    let latestRecoveryJobs = [];
     const expectedWorkerRepoByEngine = {
       realesrgan: "ghcr.io/davbg67/vast-video-upscaler-worker",
       seedvr2: "ghcr.io/davbg67/vast-video-upscaler-seedvr2",
@@ -2186,6 +2420,22 @@ _INDEX_HTML = """
 
     function setStatusLabel(value) {
       document.getElementById("status").textContent = value || "n/a";
+    }
+
+    function renderRecoveryJobs() {
+      const select = document.getElementById("recovery_job_id");
+      select.innerHTML = '<option value="">-- Récupération SeedVR2 (job distant) --</option>';
+      for (const item of latestRecoveryJobs) {
+        const id = item.recovery_job_id || "";
+        if (!id) continue;
+        const state = `${item.inference_state || "unknown"} / ${item.recovery_state || "unknown"}`;
+        const instance = item.instance_id != null ? `instance ${item.instance_id}` : "instance n/a";
+        const label = `${id} (${instance}, ${state})`;
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = label;
+        select.appendChild(opt);
+      }
     }
 
     function setModeHelp() {
@@ -2673,6 +2923,8 @@ _INDEX_HTML = """
       const res = await fetch("/api/config");
       const cfg = await res.json();
       latestWorkerImageByEngine = cfg.worker_image_latest_by_engine || latestWorkerImageByEngine;
+      latestRecoveryJobs = cfg.seedvr2_recovery_jobs || [];
+      renderRecoveryJobs();
       document.getElementById("target_width").value = cfg.target_width;
       document.getElementById("target_height").value = cfg.target_height;
       const engineSelect = document.getElementById("engine");
@@ -2749,13 +3001,19 @@ _INDEX_HTML = """
       const payload = data.payload || {};
       if (type === "status") {
         const state = payload.state || payload.message || "running";
+        currentBusinessState = String(state || currentBusinessState);
         setStatusLabel(state);
         if (payload.message) {
           document.getElementById("job-stage").textContent = payload.message;
         }
+        if (state === "inference_succeeded_recovering") {
+          document.getElementById("job-result").textContent = "Inférence terminée. Récupération des artefacts en cours…";
+        }
       } else if (type === "provisioning") {
         const phase = payload.phase || payload.status || "provisioning";
         document.getElementById("job-stage").textContent = String(phase);
+      } else if (type === "instance") {
+        document.getElementById("job-stage").textContent = String(payload.message || payload.state || "instance");
       } else if (type === "worker") {
         const stage = payload.stage || "worker";
         document.getElementById("job-stage").textContent = String(stage);
@@ -2779,7 +3037,10 @@ _INDEX_HTML = """
         if (Number.isFinite(Number(fps))) {
           document.getElementById("analysis-summary").textContent = `Cadence de traitement en cours : ${prettyFps(Number(fps))}`;
         }
+      } else if (type === "worker-log") {
+        // Keep technical logs in the SSE stream; summary UI remains stage-focused.
       } else if (type === "result") {
+        currentBusinessState = "completed";
         setStatusLabel("completed");
         document.getElementById("job-stage").textContent = String(payload.state || "completed");
         document.getElementById("job-progress").textContent = "Terminé";
@@ -2788,7 +3049,13 @@ _INDEX_HTML = """
         const reportPath = payload.report_path || "n/a";
         document.getElementById("job-result").innerHTML = `Sortie : <code>${outputPath}</code><br/>Rapport : <code>${reportPath}</code>`;
       } else if (type === "error") {
-        setStatusLabel("failed");
+        if (currentBusinessState === "inference_succeeded_recovering" || currentBusinessState === "failed_recovery") {
+          setStatusLabel("failed_recovery");
+          document.getElementById("job-result").textContent = "Inférence terminée mais récupération des artefacts échouée.";
+        } else {
+          setStatusLabel("failed");
+          document.getElementById("job-result").textContent = "Traitement échoué.";
+        }
         document.getElementById("job-error").classList.remove("hidden");
         document.getElementById("job-error").textContent = "Erreur : " + String(payload.message || "échec inconnu");
       } else if (type === "prompt") {
@@ -2808,7 +3075,13 @@ _INDEX_HTML = """
           await maybeHandlePrompt(jobId, data.payload);
         }
         if (data.type === "result" || data.type === "error") {
-          setStatusLabel(data.type === "result" ? "completed" : "failed");
+          if (data.type === "result") {
+            setStatusLabel("completed");
+          } else if (currentBusinessState === "inference_succeeded_recovering" || currentBusinessState === "failed_recovery") {
+            setStatusLabel("failed_recovery");
+          } else {
+            setStatusLabel("failed");
+          }
         }
       };
     }
@@ -2865,6 +3138,7 @@ _INDEX_HTML = """
       currentJobId = data.job_id;
       lastEventId = 0;
       currentJobStartedAt = Date.now();
+      currentBusinessState = "running";
       handledPromptIds.clear();
       promptDialogOpen = false;
       document.getElementById("job-error").classList.add("hidden");
@@ -2874,6 +3148,40 @@ _INDEX_HTML = """
       document.getElementById("job-stage").textContent = "Initialisation";
       setStatusLabel("running");
       appendEvent("Traitement démarré : " + currentJobId);
+      watchEvents(currentJobId);
+    });
+
+    document.getElementById("recover-btn").addEventListener("click", async () => {
+      const recoveryId = document.getElementById("recovery_job_id").value;
+      if (!recoveryId) {
+        appendEvent("Sélectionnez un job SeedVR2 à récupérer.");
+        return;
+      }
+      const response = await fetch("/api/jobs/recover-seedvr2", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ recovery_job_id: recoveryId }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        appendEvent("Échec de la récupération : " + (data.detail || JSON.stringify(data)));
+        document.getElementById("job-error").classList.remove("hidden");
+        document.getElementById("job-error").textContent = "Erreur : " + (data.detail || "récupération refusée");
+        return;
+      }
+      currentJobId = data.job_id;
+      lastEventId = 0;
+      currentJobStartedAt = Date.now();
+      currentBusinessState = "running";
+      handledPromptIds.clear();
+      promptDialogOpen = false;
+      document.getElementById("job-error").classList.add("hidden");
+      document.getElementById("job-error").textContent = "";
+      document.getElementById("job-result").textContent = "Récupération des résultats démarrée…";
+      document.getElementById("job-progress").textContent = "indéterminée";
+      document.getElementById("job-stage").textContent = "Récupération";
+      setStatusLabel("running");
+      appendEvent("Récupération SeedVR2 démarrée : " + currentJobId + " (source=" + recoveryId + ")");
       watchEvents(currentJobId);
     });
 
