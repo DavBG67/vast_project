@@ -31,6 +31,10 @@ Pour chaque exécution, il:
 
 Dans l'intégration web 6A.3, l'extrait est préparé localement côté API puis transmis au runner avec `--input-is-excerpt` pour éviter une seconde extraction SeedVR2 et tout décalage temporel inutile.
 
+> ⚠️ Compatibilité image (phase 6A.3-C)  
+> Toute image SeedVR2 utilisée par l'IHM 6A.3 doit exposer l'option `--input-is-excerpt` dans `--help` du runner `/opt/prototype/seedvr2_prototype.py`.  
+> Une image plus ancienne construite avant ce paramètre est considérée incompatible avec le contrat IHM actuel.
+
 ## Checkpoints utilisés
 
 - DiT par défaut: `seedvr2_ema_3b_fp8_e4m3fn.safetensors`

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -115,4 +116,35 @@ def test_run_cli_input_is_excerpt_skips_internal_extract(monkeypatch: pytest.Mon
     )
     assert exit_code == 0
     assert "extract_excerpt" not in executed_stages
+
+
+def test_run_cli_reference_profile_keeps_0039_10s_window_in_report(tmp_path: Path) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"video")
+    output_root = tmp_path / "out"
+    work_root = tmp_path / "work"
+    cache_dir = tmp_path / "cache"
+    exit_code = run_cli(
+        [
+            "--input-video",
+            str(source),
+            "--profile",
+            "reference",
+            "--output-root",
+            str(output_root),
+            "--work-root",
+            str(work_root),
+            "--cache-dir",
+            str(cache_dir),
+            "--dry-run",
+        ]
+    )
+    assert exit_code == 0
+    reports = sorted(output_root.rglob("prototype-report.json"))
+    assert reports, "Expected a report file in output root"
+    payload = json.loads(reports[-1].read_text(encoding="utf-8"))
+    assert payload["parameters"]["start_seconds"] == 39.0
+    assert payload["parameters"]["duration_seconds"] == 10.0
+    assert "extract_excerpt" in payload["commands"]
+    assert "-ss 39.000" in payload["commands"]["extract_excerpt"]
 

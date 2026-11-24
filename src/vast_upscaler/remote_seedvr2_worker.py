@@ -67,6 +67,10 @@ class Seedvr2RemoteResult:
     report_payload: dict
     local_output_path: Path
     local_report_path: Path
+    local_log_path: Path | None
+
+
+_SEEDVR2_PYTHON = "/opt/seedvr2-venv/bin/python"
 
 
 def execute_remote_seedvr2_worker(
@@ -117,6 +121,7 @@ def execute_remote_seedvr2_worker(
     discovered = _discover_seedvr2_outputs(transport=transport, connection=connection, output_root=paths.output_dir)
     remote_report_path = discovered["report"]
     remote_output_path = discovered["output"]
+    remote_log_path = discovered.get("log")
 
     try:
         transport.download_file(
@@ -135,6 +140,10 @@ def execute_remote_seedvr2_worker(
     if status != "completed":
         raise RemoteSeedvr2WorkerReportError(f"SeedVR2 report status is not completed: {status or 'missing'}")
 
+    _validate_remote_path_within_root(path=remote_output_path, root=paths.output_dir, label="output")
+    if remote_log_path is not None:
+        _validate_remote_path_within_root(path=remote_log_path, root=paths.output_dir, label="log")
+
     try:
         transport.download_file(
             connection,
@@ -147,6 +156,21 @@ def execute_remote_seedvr2_worker(
     except TransferError as exc:
         raise RemoteSeedvr2WorkerTransferError(f"Could not download SeedVR2 output video: {exc}") from exc
 
+    local_log_path: Path | None = None
+    if remote_log_path is not None:
+        local_log_path = request.local_report_path.with_suffix(request.local_report_path.suffix + ".run.log")
+        try:
+            transport.download_file(
+                connection,
+                remote_path=remote_log_path,
+                local_path=local_log_path,
+                timeout_seconds=request.download_timeout_seconds,
+                retry_policy=RetryPolicy(max_attempts=1),
+                overwrite=True,
+            )
+        except TransferError:
+            local_log_path = None
+
     return Seedvr2RemoteResult(
         session_id=request.session_id,
         command=command,
@@ -157,6 +181,7 @@ def execute_remote_seedvr2_worker(
         report_payload=report_payload,
         local_output_path=request.local_output_path,
         local_report_path=request.local_report_path,
+        local_log_path=local_log_path,
     )
 
 
@@ -169,7 +194,7 @@ def _build_seedvr2_command(
     cache_dir: str,
 ) -> list[str]:
     return [
-        "python",
+        _SEEDVR2_PYTHON,
         "/opt/prototype/seedvr2_prototype.py",
         "--input-video",
         input_path,
@@ -246,13 +271,15 @@ def _discover_seedvr2_outputs(
         "report_path = reports[-1]; "
         "payload = json.loads(report_path.read_text(encoding='utf-8')); "
         "output_path = payload.get('output_file'); "
+        "log_path = payload.get('log_file'); "
         "assert isinstance(output_path, str) and output_path.strip(), 'SeedVR2 report missing output_file'; "
-        "print(json.dumps({'report': str(report_path), 'output': output_path}))"
+        "if log_path is not None: assert isinstance(log_path, str) and log_path.strip(), 'SeedVR2 report has invalid log_file'; "
+        "print(json.dumps({'report': str(report_path), 'output': output_path, 'log': log_path}))"
     )
     try:
         result = transport.run_remote_command(
             connection,
-            command=["python", "-c", script],
+            command=[_SEEDVR2_PYTHON, "-c", script],
             timeout_seconds=30.0,
             retry_policy=RetryPolicy(max_attempts=1),
             idempotent=True,
@@ -274,7 +301,13 @@ def _discover_seedvr2_outputs(
         raise RemoteSeedvr2WorkerReportError("SeedVR2 discovery result missing report path.")
     if not isinstance(output, str) or not output.strip():
         raise RemoteSeedvr2WorkerReportError("SeedVR2 discovery result missing output path.")
-    return {"report": report, "output": output}
+    log_path = payload.get("log")
+    if log_path is not None and (not isinstance(log_path, str) or not log_path.strip()):
+        raise RemoteSeedvr2WorkerReportError("SeedVR2 discovery result contains invalid log path.")
+    result = {"report": report, "output": output}
+    if isinstance(log_path, str):
+        result["log"] = log_path
+    return result
 
 
 def _load_seedvr2_report(report_path: Path) -> dict:
@@ -294,3 +327,18 @@ def _sanitize_session_id(value: str) -> str:
     if not cleaned:
         raise RemoteSeedvr2WorkerError("session_id is empty after sanitization.")
     return cleaned
+
+
+def _validate_remote_path_within_root(*, path: str, root: str, label: str) -> None:
+    normalized_path = posixpath.normpath(path)
+    normalized_root = posixpath.normpath(root)
+    if not normalized_path.startswith("/"):
+        raise RemoteSeedvr2WorkerReportError(f"SeedVR2 {label} path is not absolute: {path}")
+    try:
+        common_root = posixpath.commonpath([normalized_path, normalized_root])
+    except ValueError as exc:
+        raise RemoteSeedvr2WorkerReportError(f"SeedVR2 {label} path validation failed: {path}") from exc
+    if common_root != normalized_root:
+        raise RemoteSeedvr2WorkerReportError(
+            f"SeedVR2 {label} path is outside output root: {path} (root: {normalized_root})"
+        )

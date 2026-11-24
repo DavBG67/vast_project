@@ -26,11 +26,18 @@ class FakeTransport:
                 {
                     "report": "/workspace/seedvr2-sessions/manual-01/output/run/prototype-report.json",
                     "output": "/workspace/seedvr2-sessions/manual-01/output/run/upscaled_h264_aac.mp4",
+                    "log": "/workspace/seedvr2-sessions/manual-01/output/run/run.log",
                 }
             ),
             stderr="",
         )
-        self.report_payload = json.dumps({"status": "completed", "output_file": "/tmp/upscaled.mp4"}).encode("utf-8")
+        self.report_payload = json.dumps(
+            {
+                "status": "completed",
+                "output_file": "/workspace/seedvr2-sessions/manual-01/output/run/upscaled_h264_aac.mp4",
+                "log_file": "/workspace/seedvr2-sessions/manual-01/output/run/run.log",
+            }
+        ).encode("utf-8")
 
     def upload_file(self, _conn, *, local_path, remote_dir, **_kwargs):
         self.upload_calls.append((Path(local_path), str(remote_dir)))
@@ -40,9 +47,9 @@ class FakeTransport:
         self.command_calls.append(command)
         if isinstance(command, str) and command.startswith("mkdir -p "):
             return RemoteCommandResult(returncode=0, stdout="", stderr="")
-        if isinstance(command, list) and command[:2] == ["python", "-c"]:
+        if isinstance(command, list) and command[:2] == ["/opt/seedvr2-venv/bin/python", "-c"]:
             return self.discovery_result
-        if isinstance(command, list) and command[:2] == ["python", "/opt/prototype/seedvr2_prototype.py"]:
+        if isinstance(command, list) and command[:2] == ["/opt/seedvr2-venv/bin/python", "/opt/prototype/seedvr2_prototype.py"]:
             return self.process_result
         raise AssertionError(f"Unexpected command: {command}")
 
@@ -51,6 +58,9 @@ class FakeTransport:
         target.parent.mkdir(parents=True, exist_ok=True)
         if str(remote_path).endswith("prototype-report.json"):
             target.write_bytes(self.report_payload)
+            return target
+        if str(remote_path).endswith("/run.log"):
+            target.write_text("seedvr2 log", encoding="utf-8")
             return target
         target.write_bytes(b"video")
         return target
@@ -89,7 +99,13 @@ def test_execute_remote_seedvr2_worker_nominal(tmp_path: Path) -> None:
     assert result.local_output_path.exists()
     assert result.local_report_path.exists()
     assert result.report_payload["status"] == "completed"
-    worker_cmd = next(c for c in transport.command_calls if isinstance(c, list) and c[:2] == ["python", "/opt/prototype/seedvr2_prototype.py"])
+    assert result.local_log_path is not None
+    assert result.local_log_path.exists()
+    worker_cmd = next(
+        c
+        for c in transport.command_calls
+        if isinstance(c, list) and c[:2] == ["/opt/seedvr2-venv/bin/python", "/opt/prototype/seedvr2_prototype.py"]
+    )
     assert "--input-is-excerpt" in worker_cmd
     assert "--profile" in worker_cmd
 
@@ -104,6 +120,23 @@ def test_execute_remote_seedvr2_worker_non_zero_exit(tmp_path: Path) -> None:
 def test_execute_remote_seedvr2_worker_invalid_discovery_json(tmp_path: Path) -> None:
     transport = FakeTransport()
     transport.discovery_result = RemoteCommandResult(returncode=0, stdout="not-json", stderr="")
+    with pytest.raises(RemoteSeedvr2WorkerReportError):
+        execute_remote_seedvr2_worker(transport=transport, connection=_connection(tmp_path), request=_request(tmp_path))
+
+
+def test_execute_remote_seedvr2_worker_rejects_output_outside_output_root(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    transport.discovery_result = RemoteCommandResult(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "report": "/workspace/seedvr2-sessions/manual-01/output/run/prototype-report.json",
+                "output": "/tmp/escape.mp4",
+                "log": "/workspace/seedvr2-sessions/manual-01/output/run/run.log",
+            }
+        ),
+        stderr="",
+    )
     with pytest.raises(RemoteSeedvr2WorkerReportError):
         execute_remote_seedvr2_worker(transport=transport, connection=_connection(tmp_path), request=_request(tmp_path))
 

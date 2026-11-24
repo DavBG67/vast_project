@@ -67,7 +67,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm "${{ steps.prepare.outputs.image_ref }}" --help
+          docker run --rm "${{ steps.prepare.outputs.image_ref }}" --help | tee /tmp/seedvr2-runner-help.txt
+          grep -q -- '--input-is-excerpt' /tmp/seedvr2-runner-help.txt
 
       - name: Push experimental image
         shell: bash

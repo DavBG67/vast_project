@@ -63,7 +63,11 @@ from vast_upscaler.source_analysis import (
     analyze_source_video,
     analyze_source_video_report,
 )
-from vast_upscaler.transfer import OpenSshTransport, SshConnectionInfo
+from vast_upscaler.transfer import (
+    OpenSshTransport,
+    SshConnectionInfo,
+    SshTransportError,
+)
 from vast_upscaler.vast_client import VastClient, VastClientConfig
 from vast_upscaler.vast_write_client import InstanceSummary, VastWriteClient
 from vast_upscaler.video import VideoProbeError, inspect_video
@@ -1350,17 +1354,22 @@ def _run_manual_engine_preflight(
     engine: EngineName,
 ) -> None:
     if engine == "seedvr2":
-        command: list[str] = ["python", "/opt/prototype/seedvr2_prototype.py", "--help"]
+        command: list[str] = ["/opt/seedvr2-venv/bin/python", "/opt/prototype/seedvr2_prototype.py", "--help"]
     else:
         command = ["python", "-c", "import torch; from app.worker.process import run_pipeline; print(torch.__version__)"]
     try:
-        transport.run_remote_command(
+        result = transport.run_remote_command(
             connection,
             command=command,
             timeout_seconds=30.0,
             check=True,
         )
-    except Exception as exc:
+        if engine == "seedvr2" and "--input-is-excerpt" not in (result.stdout or ""):
+            raise OrchestrationError(
+                "SeedVR2 runner is incompatible with current web contract: '--input-is-excerpt' is missing. "
+                "Publish and use a newer SeedVR2 image tag built from this branch."
+            )
+    except SshTransportError as exc:
         raise OrchestrationError(f"Engine preflight failed for {engine}: {exc}") from exc
 
 

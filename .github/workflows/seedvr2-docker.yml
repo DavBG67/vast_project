@@ -64,7 +64,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm "$IMAGE_NAME" --help
+          docker run --rm "$IMAGE_NAME" --help | tee /tmp/seedvr2-runner-help.txt
+          grep -q -- '--input-is-excerpt' /tmp/seedvr2-runner-help.txt
 
       - name: Verify venv python and torch/cuda runtime
         shell: bash

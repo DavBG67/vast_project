@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from vast_upscaler.local_preprocessing import LocalExecutionReport
 from vast_upscaler.orchestrator import OrchestrationError
 from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
+from vast_upscaler.vast_write_client import InstanceSummary
 from vast_upscaler.webapp import (
     RunCallbacks,
     StartJobRequest,
@@ -22,6 +23,7 @@ from vast_upscaler.webapp import (
     _preview_dimensions_from_plan_payload,
     _resolve_output_path,
     _resolve_remote_preprocessing_contract,
+    _run_manual_engine_preflight,
     create_app,
 )
 
@@ -1013,6 +1015,21 @@ def test_web_rejects_worker_image_repo_mismatch_for_selected_engine(tmp_path: Pa
     assert "repository mismatch" in response.json()["detail"]
 
 
+def test_run_manual_engine_preflight_rejects_old_seedvr2_runner(monkeypatch) -> None:
+    class _FakeTransport:
+        def run_remote_command(self, _connection, *, command, **_kwargs):
+            assert command == ["/opt/seedvr2-venv/bin/python", "/opt/prototype/seedvr2_prototype.py", "--help"]
+            return SimpleNamespace(stdout="usage: seedvr2_prototype.py [-h] --input-video INPUT_VIDEO")
+
+    with pytest.raises(OrchestrationError) as exc:
+        _run_manual_engine_preflight(
+            transport=_FakeTransport(),
+            connection=object(),
+            engine="seedvr2",
+        )
+    assert "--input-is-excerpt" in str(exc.value)
+
+
 def test_manual_mode_keeps_instance_on_failure(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
@@ -1301,6 +1318,104 @@ def test_default_auto_runner_merges_excerpt_metadata_and_cleans_temp_excerpt(tmp
     assert payload["excerpt_actual_duration_seconds"] == 1.95
     assert payload["excerpt_source"] == str(excerpt_file)
     assert not excerpt_file.exists()
+
+
+def test_default_manual_seedvr2_runner_preserves_excerpt_window_and_uses_excerpt_input(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"x")
+    output = tmp_path / "output.mp4"
+    report = tmp_path / "report.json"
+    excerpt_file = tmp_path / "data" / "excerpts" / "job-excerpt-test.mkv"
+    excerpt_file.parent.mkdir(parents=True, exist_ok=True)
+    excerpt_file.write_bytes(b"x")
+
+    request = StartJobRequest(
+        mode="manual",
+        engine="seedvr2",
+        seedvr2_profile="reference",
+        input_path=str(source),
+        output_path=str(output),
+        report_path=str(report),
+        instance_id=123,
+        worker_image="ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test",
+        excerpt_enabled=True,
+        excerpt_start="00:39",
+        excerpt_duration_seconds=10.0,
+    )
+
+    from vast_upscaler.config import load_config
+
+    loaded_settings = load_config(_write_config(tmp_path))
+
+    class _FakeWriteClient:
+        def get_instance(self, _instance_id: int):
+            return InstanceSummary(
+                instance_id=123,
+                actual_status="running",
+                intended_status="running",
+                cur_state="running",
+                label="manual-instance",
+                image_runtype="ssh_direct",
+                ssh_port=22,
+                gpu_name="RTX 5080",
+                ssh_host="1.2.3.4",
+                machine_id="node",
+                image_name="ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test",
+                hourly_price_usd=None,
+            )
+
+        def close(self) -> None:
+            return
+
+    captured: dict = {}
+
+    monkeypatch.setattr("vast_upscaler.webapp._build_write_client", lambda _s: _FakeWriteClient())
+    monkeypatch.setattr("vast_upscaler.webapp._wait_for_ssh_tcp_availability", lambda **_kwargs: None)
+    monkeypatch.setattr("vast_upscaler.webapp._build_trusted_connection", lambda **_kwargs: object())
+    monkeypatch.setattr("vast_upscaler.webapp._resolve_private_key", lambda **_kwargs: Path("C:/keys/id_ed25519"))
+    monkeypatch.setattr("vast_upscaler.webapp.OpenSshTransport.check_ssh_ready", lambda *_a, **_k: None)
+    monkeypatch.setattr("vast_upscaler.webapp._run_manual_engine_preflight", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        "vast_upscaler.webapp._prepare_effective_job_input",
+        lambda **_kwargs: SimpleNamespace(
+            input_path=excerpt_file,
+            original_source=source,
+            excerpt_result=SimpleNamespace(
+                excerpt_path=excerpt_file,
+                start_seconds=39.0,
+                requested_duration_seconds=10.0,
+                actual_duration_seconds=10.0,
+            ),
+            cleanup_excerpt_path=excerpt_file,
+        ),
+    )
+
+    def _fake_execute_remote_seedvr2_worker(**kwargs):
+        captured["request"] = kwargs["request"]
+        report.write_text('{"status":"completed","report_schema_version":"2.0"}', encoding="utf-8")
+        output.write_bytes(b"video")
+        return SimpleNamespace(local_output_path=output, local_report_path=report)
+
+    monkeypatch.setattr("vast_upscaler.webapp.execute_remote_seedvr2_worker", _fake_execute_remote_seedvr2_worker)
+
+    callbacks = RunCallbacks(
+        report_provisioning_status=lambda _payload: None,
+        report_worker_progress=lambda _payload: None,
+        confirm_paid=lambda _message: True,
+        confirm_ssh_trust=lambda _message: True,
+        request_verified_fingerprint=lambda _message: None,
+        raise_if_cancelled=lambda: None,
+    )
+    result = _default_manual_runner(request, loaded_settings, callbacks)
+    assert result.state == "COMPLETED"
+    assert captured["request"].local_input_path == excerpt_file
+    assert captured["request"].profile == "reference"
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["original_source"] == str(source)
+    assert payload["excerpt_enabled"] is True
+    assert payload["excerpt_start_seconds"] == 39.0
+    assert payload["excerpt_requested_duration_seconds"] == 10.0
+    assert payload["excerpt_actual_duration_seconds"] == 10.0
 
 
 def test_manual_plan_path_overrides_generated_plan_payload_for_contract_resolution(tmp_path: Path) -> None:
