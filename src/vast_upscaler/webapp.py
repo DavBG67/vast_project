@@ -48,6 +48,7 @@ from vast_upscaler.preprocessing_planner import (
 )
 from vast_upscaler.provisioning_history import ProvisioningAttemptTracker
 from vast_upscaler.remote_seedvr2_worker import (
+    RemoteSeedvr2WorkerPreparationError,
     RemoteSeedvr2WorkerProcessError,
     RemoteSeedvr2WorkerRecoveryError,
     Seedvr2RemoteRequest,
@@ -1029,6 +1030,20 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                 recovery_job_id=remote_session_id,  # type: ignore[name-defined]
                 inference_state="completed",
                 recovery_state="failed",
+            )
+        raise
+    except RemoteSeedvr2WorkerPreparationError:
+        if recovery_job_id and engine == "seedvr2":
+            _update_seedvr2_recovery_job_state(
+                recovery_job_id=recovery_job_id,
+                inference_state="failed",
+                recovery_state="pending",
+            )
+        elif engine == "seedvr2":
+            _update_seedvr2_recovery_job_state(
+                recovery_job_id=remote_session_id,  # type: ignore[name-defined]
+                inference_state="failed",
+                recovery_state="pending",
             )
         raise
     except RemoteSeedvr2WorkerProcessError:

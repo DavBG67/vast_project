@@ -1575,6 +1575,36 @@ def test_web_seedvr2_recovery_endpoint_recovers_without_reinference(tmp_path: Pa
     assert any(job["recovery_job_id"] == recovery_job_id for job in jobs)
 
 
+def test_web_seedvr2_recovery_jobs_persist_after_app_restart(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    recovery_state_path = tmp_path / "seedvr2_recovery_jobs.json"
+    monkeypatch.setattr(webapp_module, "_SEEDVR2_RECOVERY_STATE_PATH", recovery_state_path)
+    webapp_module._upsert_seedvr2_recovery_job(
+        {
+            "recovery_job_id": "seedvr2-persisted-job",
+            "instance_id": 456,
+            "engine": "seedvr2",
+            "seedvr2_profile": "reference",
+            "remote_root_base": "/workspace/seedvr2-sessions",
+            "remote_session_id": "manual-persisted",
+            "ssh_host": "1.2.3.4",
+            "ssh_port": 22,
+            "local_input_path": str(tmp_path / "input.mp4"),
+            "local_output_path": str(tmp_path / "out.mp4"),
+            "local_report_path": str(tmp_path / "report.json"),
+            "inference_state": "completed",
+            "recovery_state": "pending",
+        }
+    )
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    cfg = client.get("/api/config")
+    assert cfg.status_code == 200
+    jobs = cfg.json()["seedvr2_recovery_jobs"]
+    assert any(job["recovery_job_id"] == "seedvr2-persisted-job" for job in jobs)
+
+
 def test_manual_plan_path_overrides_generated_plan_payload_for_contract_resolution(tmp_path: Path) -> None:
     source = tmp_path / "input.mp4"
     source.write_bytes(b"x")

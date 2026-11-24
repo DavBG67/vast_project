@@ -1,22 +1,33 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
 from vast_upscaler.remote_seedvr2_worker import (
+    RemoteSeedvr2WorkerPreparationError,
     RemoteSeedvr2WorkerProcessError,
     RemoteSeedvr2WorkerRecoveryError,
-    RemoteSeedvr2WorkerReportError,
     Seedvr2RemoteRequest,
+    _build_checkpoint_cache_script,
     _build_seedvr2_discovery_script,
+    _parse_seedvr2_progress_line,
+    _Seedvr2ProgressState,
     execute_remote_seedvr2_worker,
     recover_remote_seedvr2_results,
 )
-from vast_upscaler.transfer import RemoteCommandResult, SshConnectionInfo, TransferError
+from vast_upscaler.transfer import (
+    RemoteCommandResult,
+    SshConnectionInfo,
+    SshTransportError,
+    TransferError,
+)
 
 
 class FakeTransport:
@@ -132,10 +143,17 @@ def test_execute_remote_seedvr2_worker_non_zero_exit(tmp_path: Path) -> None:
         execute_remote_seedvr2_worker(transport=transport, connection=_connection(tmp_path), request=_request(tmp_path))
 
 
+def test_execute_remote_seedvr2_worker_failed_report_status_is_inference_error(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    transport.report_payload = json.dumps({"status": "failed"}).encode("utf-8")
+    with pytest.raises(RemoteSeedvr2WorkerProcessError):
+        execute_remote_seedvr2_worker(transport=transport, connection=_connection(tmp_path), request=_request(tmp_path))
+
+
 def test_execute_remote_seedvr2_worker_invalid_discovery_json(tmp_path: Path) -> None:
     transport = FakeTransport()
     transport.discovery_result = RemoteCommandResult(returncode=0, stdout="not-json", stderr="")
-    with pytest.raises(RemoteSeedvr2WorkerReportError):
+    with pytest.raises(RemoteSeedvr2WorkerRecoveryError):
         execute_remote_seedvr2_worker(transport=transport, connection=_connection(tmp_path), request=_request(tmp_path))
 
 
@@ -152,7 +170,7 @@ def test_execute_remote_seedvr2_worker_rejects_output_outside_output_root(tmp_pa
         ),
         stderr="",
     )
-    with pytest.raises(RemoteSeedvr2WorkerReportError):
+    with pytest.raises(RemoteSeedvr2WorkerRecoveryError):
         execute_remote_seedvr2_worker(transport=transport, connection=_connection(tmp_path), request=_request(tmp_path))
 
 
@@ -241,3 +259,189 @@ def test_discovery_script_rejects_symlink_escape(tmp_path: Path) -> None:
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
     assert run.returncode != 0
     assert "outside output root" in (run.stderr or "")
+
+
+def test_seedvr2_progress_parser_uses_expected_patterns() -> None:
+    state = _Seedvr2ProgressState()
+
+    assert _parse_seedvr2_progress_line(line="VAE encode started", state=state) == {
+        "kind": "worker",
+        "stage": "vae-encode",
+        "determinate": False,
+    }
+    assert _parse_seedvr2_progress_line(line="DiT upscale running", state=state) == {
+        "kind": "worker",
+        "stage": "dit-upscale",
+        "determinate": False,
+    }
+    assert _parse_seedvr2_progress_line(line="chunk 1/4", state=state) == {
+        "kind": "worker",
+        "stage": "dit-upscale",
+        "chunk_done": 1,
+        "chunk_total": 4,
+        "determinate": False,
+    }
+    frame_event = _parse_seedvr2_progress_line(line="frames 25/100", state=state)
+    assert frame_event is not None
+    assert frame_event["frames_done"] == 25
+    assert frame_event["frames_total"] == 100
+    assert frame_event["progress"] == pytest.approx(0.25)
+    assert _parse_seedvr2_progress_line(line="unrecognized noise line", state=state) is None
+
+
+def test_seedvr2_progress_parser_keeps_global_progress_non_decreasing() -> None:
+    state = _Seedvr2ProgressState()
+    first = _parse_seedvr2_progress_line(line="frames 60/100", state=state)
+    second = _parse_seedvr2_progress_line(line="frames 10/100", state=state)
+    assert first is not None and second is not None
+    assert first["progress"] == pytest.approx(0.6)
+    assert second["progress"] == pytest.approx(0.6)
+
+
+def test_seedvr2_progress_parser_does_not_treat_chunk_internal_counters_as_global() -> None:
+    state = _Seedvr2ProgressState()
+    event = _parse_seedvr2_progress_line(line="chunk 2/8 - frames 4/32", state=state)
+    assert event == {
+        "kind": "worker",
+        "stage": "dit-upscale",
+        "chunk_done": 2,
+        "chunk_total": 8,
+        "determinate": False,
+    }
+    assert state.last_progress == 0.0
+
+
+def test_execute_remote_seedvr2_worker_emits_progress_before_inference_end(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    transport.stream_lines = [
+        "VAE encode",
+        "chunk 1/2",
+        "frames 10/100",
+        "DiT upscale",
+    ]
+    events: list[dict[str, object]] = []
+    execute_remote_seedvr2_worker(
+        transport=transport,
+        connection=_connection(tmp_path),
+        request=_request(tmp_path),
+        progress_callback=events.append,
+    )
+    frame_event_index = next(i for i, payload in enumerate(events) if payload.get("frames_done") == 10)
+    download_started_index = next(
+        i for i, payload in enumerate(events) if payload.get("kind") == "transfer" and payload.get("stage") == "download"
+    )
+    assert frame_event_index < download_started_index
+
+
+def test_execute_remote_seedvr2_worker_cache_prep_error_is_preparation_error(tmp_path: Path) -> None:
+    class FailingCacheTransport(FakeTransport):
+        def run_remote_command(self, _conn, *, command, **kwargs):
+            if isinstance(command, list) and command[:2] == ["/opt/seedvr2-venv/bin/python", "-c"]:
+                script = command[2]
+                if "urllib.request" in script:
+                    raise SshTransportError("cache prep failed")
+            return super().run_remote_command(_conn, command=command, **kwargs)
+
+    with pytest.raises(RemoteSeedvr2WorkerPreparationError):
+        execute_remote_seedvr2_worker(
+            transport=FailingCacheTransport(),
+            connection=_connection(tmp_path),
+            request=_request(tmp_path),
+        )
+
+
+def _run_python_script(script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+
+def _checkpoint_sha(path: Path) -> str:
+    return sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX flock semantics")
+def test_checkpoint_cache_script_handles_concurrency_and_reuse(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = tmp_path / "cache"
+    checkpoint = source_dir / "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+    vae = source_dir / "ema_vae_fp16.safetensors"
+    checkpoint.write_bytes(b"checkpoint-v1")
+    vae.write_bytes(b"vae-v1")
+    metadata = {
+        checkpoint.name: {"repo": "local/test", "sha256": _checkpoint_sha(checkpoint), "url": checkpoint.as_uri()},
+        vae.name: {"repo": "local/test", "sha256": _checkpoint_sha(vae), "url": vae.as_uri()},
+    }
+    script = _build_checkpoint_cache_script(cache_dir=str(cache_dir), metadata_override=metadata, hold_lock_seconds=1.0)
+    proc_a = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.2)
+    proc_b = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out_a, err_a = proc_a.communicate(timeout=10)
+    out_b, err_b = proc_b.communicate(timeout=10)
+    assert proc_a.returncode == 0, err_a or out_a
+    assert proc_b.returncode == 0, err_b or out_b
+    assert (cache_dir / checkpoint.name).exists()
+    assert (cache_dir / vae.name).exists()
+
+    checkpoint.write_bytes(b"checkpoint-v2")
+    vae.write_bytes(b"vae-v2")
+    metadata_updated = {
+        checkpoint.name: {"repo": "local/test", "sha256": _checkpoint_sha(checkpoint), "url": checkpoint.as_uri()},
+        vae.name: {"repo": "local/test", "sha256": _checkpoint_sha(vae), "url": vae.as_uri()},
+    }
+    rerun = _run_python_script(_build_checkpoint_cache_script(cache_dir=str(cache_dir), metadata_override=metadata_updated))
+    assert rerun.returncode == 0, rerun.stderr
+    assert (cache_dir / checkpoint.name).read_bytes() == b"checkpoint-v2"
+    assert (cache_dir / vae.name).read_bytes() == b"vae-v2"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX flock semantics")
+def test_checkpoint_cache_script_lock_released_after_holder_termination(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = tmp_path / "cache"
+    checkpoint = source_dir / "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+    vae = source_dir / "ema_vae_fp16.safetensors"
+    checkpoint.write_bytes(b"checkpoint-v1")
+    vae.write_bytes(b"vae-v1")
+    metadata = {
+        checkpoint.name: {"repo": "local/test", "sha256": _checkpoint_sha(checkpoint), "url": checkpoint.as_uri()},
+        vae.name: {"repo": "local/test", "sha256": _checkpoint_sha(vae), "url": vae.as_uri()},
+    }
+    long_script = _build_checkpoint_cache_script(
+        cache_dir=str(cache_dir),
+        metadata_override=metadata,
+        lock_timeout_seconds=5.0,
+        hold_lock_seconds=30.0,
+    )
+    holder = subprocess.Popen([sys.executable, "-c", long_script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    holder.terminate()
+    holder.communicate(timeout=10)
+    retry = _run_python_script(
+        _build_checkpoint_cache_script(
+            cache_dir=str(cache_dir),
+            metadata_override=metadata,
+            lock_timeout_seconds=5.0,
+        )
+    )
+    assert retry.returncode == 0, retry.stderr
+
+
+def test_checkpoint_cache_script_cleans_part_file_after_download_failure(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    metadata = {
+        "seedvr2_ema_3b_fp8_e4m3fn.safetensors": {
+            "repo": "local/test",
+            "sha256": "0" * 64,
+            "url": "file:///definitely-missing-file",
+        }
+    }
+    run = _run_python_script(
+        _build_checkpoint_cache_script(
+            cache_dir=str(cache_dir),
+            metadata_override=metadata,
+            lock_timeout_seconds=1.0,
+        )
+    )
+    assert run.returncode != 0
+    assert not (cache_dir / "seedvr2_ema_3b_fp8_e4m3fn.safetensors.part").exists()

@@ -30,6 +30,10 @@ class RemoteSeedvr2WorkerProcessError(RemoteSeedvr2WorkerError):
     """Raised when remote SeedVR2 process exits with an error."""
 
 
+class RemoteSeedvr2WorkerPreparationError(RemoteSeedvr2WorkerError):
+    """Raised when remote preparation fails before SeedVR2 inference starts."""
+
+
 class RemoteSeedvr2WorkerReportError(RemoteSeedvr2WorkerError):
     """Raised when SeedVR2 report is missing or invalid."""
 
@@ -326,7 +330,10 @@ def _download_seedvr2_artifacts(
     process_stderr: str,
     progress_callback: ProgressCallback | None,
 ) -> Seedvr2RemoteResult:
-    discovered = _discover_seedvr2_outputs(transport=transport, connection=connection, output_root=paths.output_dir)
+    try:
+        discovered = _discover_seedvr2_outputs(transport=transport, connection=connection, output_root=paths.output_dir)
+    except RemoteSeedvr2WorkerReportError as exc:
+        raise RemoteSeedvr2WorkerRecoveryError(f"Could not discover SeedVR2 output artifacts: {exc}") from exc
     remote_report_path = discovered["report"]
     remote_output_path = discovered["output"]
     remote_log_path = discovered.get("log")
@@ -345,14 +352,22 @@ def _download_seedvr2_artifacts(
     except TransferError as exc:
         raise RemoteSeedvr2WorkerRecoveryError(f"Could not download SeedVR2 report: {exc}") from exc
 
-    report_payload = _load_seedvr2_report(request.local_report_path)
+    try:
+        report_payload = _load_seedvr2_report(request.local_report_path)
+    except RemoteSeedvr2WorkerReportError as exc:
+        raise RemoteSeedvr2WorkerRecoveryError(f"SeedVR2 report is missing or invalid after inference: {exc}") from exc
     status = str(report_payload.get("status") or "").lower()
     if status != "completed":
-        raise RemoteSeedvr2WorkerReportError(f"SeedVR2 report status is not completed: {status or 'missing'}")
+        if status in {"failed", "error", "cancelled"}:
+            raise RemoteSeedvr2WorkerProcessError(f"SeedVR2 inference report status: {status}")
+        raise RemoteSeedvr2WorkerRecoveryError(f"SeedVR2 report status is not completed: {status or 'missing'}")
 
-    _validate_remote_path_within_root(path=remote_output_path, root=paths.output_dir, label="output")
-    if remote_log_path is not None:
-        _validate_remote_path_within_root(path=remote_log_path, root=paths.output_dir, label="log")
+    try:
+        _validate_remote_path_within_root(path=remote_output_path, root=paths.output_dir, label="output")
+        if remote_log_path is not None:
+            _validate_remote_path_within_root(path=remote_log_path, root=paths.output_dir, label="log")
+    except RemoteSeedvr2WorkerReportError as exc:
+        raise RemoteSeedvr2WorkerRecoveryError(f"Discovered SeedVR2 artifact path is invalid: {exc}") from exc
 
     try:
         transport.download_file(
@@ -511,25 +526,33 @@ def _ensure_shared_checkpoints(
             check=True,
         )
     except SshTransportError as exc:
-        raise RemoteSeedvr2WorkerRecoveryError(f"SeedVR2 checkpoint cache preparation failed: {exc}") from exc
+        raise RemoteSeedvr2WorkerPreparationError(f"SeedVR2 checkpoint cache preparation failed: {exc}") from exc
     if progress_callback is not None:
         progress_callback({"kind": "worker", "stage": "checkpoint-cache", "status": "completed", "determinate": False})
 
 
-def _build_checkpoint_cache_script(*, cache_dir: str) -> str:
+def _build_checkpoint_cache_script(
+    *,
+    cache_dir: str,
+    metadata_override: dict[str, dict[str, str]] | None = None,
+    lock_timeout_seconds: float = _CHECKPOINT_LOCK_TIMEOUT_SECONDS,
+    lock_retry_delay_seconds: float = _CHECKPOINT_RETRY_DELAY_SECONDS,
+    hold_lock_seconds: float = 0.0,
+) -> str:
     metadata = {
         filename: {
             "repo": values["repo"],
             "sha256": values["sha256"],
-            "url": f"https://huggingface.co/{values['repo']}/resolve/main/{filename}",
+            "url": values.get("url", f"https://huggingface.co/{values['repo']}/resolve/main/{filename}"),
         }
-        for filename, values in _CHECKPOINT_METADATA.items()
+        for filename, values in (metadata_override or _CHECKPOINT_METADATA).items()
     }
     return textwrap.dedent(
         f"""
+        import errno
+        import fcntl
         import hashlib
         import json
-        import os
         import time
         import urllib.request
         from pathlib import Path
@@ -538,23 +561,40 @@ def _build_checkpoint_cache_script(*, cache_dir: str) -> str:
         cache.mkdir(parents=True, exist_ok=True)
         lock_path = cache / {_CHECKPOINT_LOCKFILE!r}
         started = time.time()
-        lock_fd = None
+        lock_handle = lock_path.open("a+b")
+        lock_acquired = False
         while True:
             try:
-                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_acquired = True
                 break
-            except FileExistsError:
-                if time.time() - started > {_CHECKPOINT_LOCK_TIMEOUT_SECONDS!r}:
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.time() - started > {lock_timeout_seconds!r}:
                     raise RuntimeError("Timeout while waiting for SeedVR2 checkpoint lock")
-                time.sleep({_CHECKPOINT_RETRY_DELAY_SECONDS!r})
+                time.sleep({lock_retry_delay_seconds!r})
 
         try:
+            if {hold_lock_seconds!r} > 0:
+                time.sleep({hold_lock_seconds!r})
             meta = {json.dumps(metadata, separators=(",", ":"))}
+
+            def compute_sha256(path: Path) -> str:
+                digest = hashlib.sha256()
+                with path.open("rb") as fh:
+                    while True:
+                        chunk = fh.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                return digest.hexdigest().lower()
+
             for filename, item in meta.items():
                 target = cache / filename
                 expected_sha = item["sha256"].lower()
                 if target.exists() and target.is_file():
-                    digest = hashlib.sha256(target.read_bytes()).hexdigest().lower()
+                    digest = compute_sha256(target)
                     if digest == expected_sha:
                         continue
                     target.unlink()
@@ -563,23 +603,27 @@ def _build_checkpoint_cache_script(*, cache_dir: str) -> str:
                 if tmp.exists():
                     tmp.unlink()
 
-                with urllib.request.urlopen(item["url"]) as response, tmp.open("wb") as fh:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
+                try:
+                    with urllib.request.urlopen(item["url"], timeout=120) as response, tmp.open("wb") as fh:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                except Exception:
+                    if tmp.exists():
+                        tmp.unlink()
+                    raise
 
-                digest = hashlib.sha256(tmp.read_bytes()).hexdigest().lower()
+                digest = compute_sha256(tmp)
                 if digest != expected_sha:
                     tmp.unlink(missing_ok=True)
                     raise RuntimeError(f"Checkpoint checksum mismatch for {{filename}}")
-                os.replace(tmp, target)
+                tmp.replace(target)
         finally:
-            if lock_fd is not None:
-                os.close(lock_fd)
-            if lock_path.exists():
-                lock_path.unlink()
+            if lock_acquired:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
         """
     ).strip()
 
@@ -610,7 +654,17 @@ def _parse_seedvr2_progress_line(*, line: str, state: _Seedvr2ProgressState) -> 
         state.current_stage = stage
         return {"kind": "worker", "stage": stage, "determinate": False}
 
-    frame_match = re.search(r"(?:frame|frames)\s*[:=]?\s*(\\d+)(?:\\s*/\\s*(\\d+))?", lowered)
+    chunk_match = re.search(r"chunk\s*(\d+)\s*/\s*(\d+)", lowered)
+    if chunk_match:
+        return {
+            "kind": "worker",
+            "stage": state.current_stage or "dit-upscale",
+            "chunk_done": int(chunk_match.group(1)),
+            "chunk_total": int(chunk_match.group(2)),
+            "determinate": False,
+        }
+
+    frame_match = re.search(r"(?:frame|frames|image|images)\s*[:=]?\s*(\d+)(?:\s*/\s*(\d+))?", lowered)
     if frame_match:
         done = int(frame_match.group(1))
         total = frame_match.group(2)
@@ -623,16 +677,6 @@ def _parse_seedvr2_progress_line(*, line: str, state: _Seedvr2ProgressState) -> 
                 payload["frames_total"] = total_int
                 payload["progress"] = progress
         return payload
-
-    chunk_match = re.search(r"chunk\\s*(\\d+)\\s*/\\s*(\\d+)", lowered)
-    if chunk_match:
-        return {
-            "kind": "worker",
-            "stage": state.current_stage or "dit-upscale",
-            "chunk_done": int(chunk_match.group(1)),
-            "chunk_total": int(chunk_match.group(2)),
-            "determinate": False,
-        }
 
     return None
 
