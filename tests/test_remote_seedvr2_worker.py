@@ -246,8 +246,10 @@ def test_discovery_script_rejects_symlink_escape(tmp_path: Path) -> None:
     link = run_dir / "output-link.mp4"
     try:
         link.symlink_to(outside)
-    except OSError:
-        pytest.skip("Symlinks are not available in this environment")
+    except OSError as exc:
+        if os.name == "nt":
+            pytest.skip("symlink creation is not permitted in this Windows environment")
+        raise AssertionError("symlink creation should be available in CI Linux") from exc
 
     report = run_dir / "prototype-report.json"
     report.write_text(

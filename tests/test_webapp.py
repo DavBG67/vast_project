@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -340,8 +341,10 @@ def test_web_video_analyze_rejects_symlink_outside_video_directory(tmp_path: Pat
     link = video_dir / "link.mp4"
     try:
         link.symlink_to(outside)
-    except OSError:
-        pytest.skip("symlink creation is not permitted in this environment")
+    except OSError as exc:
+        if os.name == "nt":
+            pytest.skip("symlink creation is not permitted in this Windows environment")
+        raise AssertionError("symlink creation should be available in CI Linux") from exc
 
     monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
 
