@@ -38,6 +38,7 @@ RUN python -m venv --system-site-packages "${VENV_PATH}" \
 
 RUN mkdir -p /opt/prototype/src/vast_upscaler /workspace/input /workspace/output /workspace/cache/seedvr2 /workspace/tmp
 COPY src/vast_upscaler/seedvr2_prototype.py /opt/prototype/src/vast_upscaler/seedvr2_prototype.py
+COPY src/vast_upscaler/video.py /opt/prototype/src/vast_upscaler/video.py
 COPY scripts/seedvr2_prototype.py /opt/prototype/seedvr2_prototype.py
 
 ENV PYTHONPATH=/opt/prototype/src
