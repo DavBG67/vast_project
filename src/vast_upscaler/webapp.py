@@ -5,6 +5,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -117,6 +118,7 @@ _VIDEO_SOURCE_EXTENSIONS = {
 }
 _VIDEO_SOURCE_EXCLUDED_SUFFIXES = ("-upscaled", "-cropped")
 _ALLOWED_OUTPUT_CONTAINER_EXTENSIONS = {".mp4"}
+_MAX_JOB_EVENTS = 5_000
 
 
 class WebWorkflowCancelled(RuntimeError):
@@ -146,6 +148,7 @@ class StartJobRequest(BaseModel):
     excerpt_start: str | None = None
     excerpt_duration_seconds: float = Field(default=10.0, gt=0)
     recover_seedvr2_job_id: str | None = None
+    execution_id: str | None = None
 
 
 class PromptReplyRequest(BaseModel):
@@ -230,7 +233,7 @@ class _Job:
         self.business_state = "pending"
         self.error: str | None = None
         self.result: WorkflowExecutionResult | None = None
-        self.events: list[dict[str, Any]] = []
+        self.events: deque[dict[str, Any]] = deque(maxlen=_MAX_JOB_EVENTS)
         self.next_event_id = 1
         self.condition = threading.Condition()
         self.thread: threading.Thread | None = None
@@ -416,6 +419,9 @@ class WebTaskManager:
             cursor = max(0, last_event_id)
             while True:
                 with job.condition:
+                    if job.events:
+                        oldest = int(job.events[0]["id"])
+                        cursor = max(cursor, oldest - 1)
                     pending = [e for e in job.events if int(e["id"]) > cursor]
                     if not pending:
                         if not job.is_active():
@@ -1181,13 +1187,27 @@ def _resolve_output_path(*, request: StartJobRequest) -> Path:
     if request.output_path:
         return Path(request.output_path)
     source = _resolve_input_video_path(request=request)
-    return source.with_name(f"{source.stem}-upscaled.mp4")
+    engine = _normalize_engine(request.engine)
+    execution_id = _ensure_execution_id(request)
+    return source.with_name(f"{source.stem}-upscaled-{engine}-{execution_id}.mp4")
 
 
 def _resolve_report_path(*, request: StartJobRequest, output_path: Path) -> Path:
     if request.report_path:
         return Path(request.report_path)
     return output_path.with_suffix(output_path.suffix + ".report.json")
+
+
+def _ensure_execution_id(request: StartJobRequest) -> str:
+    current = (request.execution_id or "").strip().lower()
+    if current:
+        normalized = re.sub(r"[^a-z0-9-]+", "-", current).strip("-")
+        if normalized:
+            request.execution_id = normalized
+            return normalized
+    generated = datetime.now(UTC).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:6]
+    request.execution_id = generated
+    return generated
 
 
 def _resolve_remote_preprocessing_contract(*, request: StartJobRequest) -> dict[str, Any] | None:
