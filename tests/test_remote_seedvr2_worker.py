@@ -357,6 +357,64 @@ def test_recovery_rolls_back_if_second_publish_step_fails(tmp_path: Path, monkey
     assert payload["job_id"] == request.session_id
 
 
+def test_recovery_first_publish_failure_without_existing_artifacts_removes_partial_outputs(tmp_path: Path, monkeypatch) -> None:
+    request = _request(tmp_path)
+    original_replace = Path.replace
+
+    def failing_replace(self: Path, target: Path) -> Path:
+        if self.name.endswith(".part") and str(target) == str(request.local_report_path):
+            raise OSError("simulated report publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(worker_module.Path, "replace", failing_replace)
+    with pytest.raises(RemoteSeedvr2WorkerRecoveryError):
+        recover_remote_seedvr2_results(transport=FakeTransport(), connection=_connection(tmp_path), request=request)
+    assert not request.local_output_path.exists()
+    assert not request.local_report_path.exists()
+
+
+def test_recovery_restore_failure_keeps_backup_available(tmp_path: Path, monkeypatch) -> None:
+    request = _request(tmp_path)
+    request.local_output_path.parent.mkdir(parents=True, exist_ok=True)
+    request.local_output_path.write_bytes(b"old-video")
+    request.local_report_path.write_text(
+        json.dumps({"engine": "seedvr2", "job_id": request.session_id, "status": "completed"}),
+        encoding="utf-8",
+    )
+    original_replace = Path.replace
+    failed_once = {"done": False}
+
+    def failing_replace(self: Path, target: Path) -> Path:
+        source_name = str(self.name)
+        if source_name.endswith(".part") and str(target) == str(request.local_report_path):
+            raise OSError("simulated report publish failure")
+        if ".rollback." in source_name and str(target) == str(request.local_output_path) and not failed_once["done"]:
+            failed_once["done"] = True
+            raise OSError("simulated rollback restore failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(worker_module.Path, "replace", failing_replace)
+    with pytest.raises(RemoteSeedvr2WorkerRecoveryError):
+        recover_remote_seedvr2_results(transport=FakeTransport(), connection=_connection(tmp_path), request=request)
+    backups = list(request.local_output_path.parent.glob(request.local_output_path.name + ".rollback.*"))
+    assert backups, "rollback backup should remain when restoration fails"
+
+
+def test_recovery_publish_failure_cleans_temp_part_files(tmp_path: Path, monkeypatch) -> None:
+    request = _request(tmp_path)
+    original_replace = Path.replace
+
+    def failing_replace(self: Path, target: Path) -> Path:
+        if self.name.endswith(".part") and str(target) == str(request.local_report_path):
+            raise OSError("simulated report publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(worker_module.Path, "replace", failing_replace)
+    with pytest.raises(RemoteSeedvr2WorkerRecoveryError):
+        recover_remote_seedvr2_results(transport=FakeTransport(), connection=_connection(tmp_path), request=request)
+    assert list(request.local_output_path.parent.glob("*.part")) == []
+
+
 def test_execute_remote_seedvr2_worker_emits_progress_before_inference_end(tmp_path: Path) -> None:
     transport = FakeTransport()
     transport.stream_lines = [

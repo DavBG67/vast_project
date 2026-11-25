@@ -368,12 +368,23 @@ def _download_seedvr2_artifacts(
     def _publish_atomically(*, local_log_path: Path | None, staged_log_path: Path | None) -> None:
         rollback_suffix = f".rollback.{uuid4().hex[:8]}"
         backups: dict[str, Path] = {}
+        published_paths: list[Path] = []
+        failed_restore_backups: set[Path] = set()
 
         def _backup_if_exists(label: str, final_path: Path) -> None:
             if final_path.exists():
                 backup_path = final_path.with_name(final_path.name + rollback_suffix)
                 final_path.replace(backup_path)
                 backups[label] = backup_path
+
+        def _target_for_label(label: str) -> Path | None:
+            if label == "output":
+                return request.local_output_path
+            if label == "report":
+                return request.local_report_path
+            if label == "log":
+                return local_log_path
+            return None
 
         request.local_output_path.parent.mkdir(parents=True, exist_ok=True)
         request.local_report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -387,27 +398,31 @@ def _download_seedvr2_artifacts(
                 _backup_if_exists("log", local_log_path)
 
             output_tmp.replace(request.local_output_path)
+            published_paths.append(request.local_output_path)
             report_tmp.replace(request.local_report_path)
+            published_paths.append(request.local_report_path)
             if local_log_path is not None and staged_log_path is not None and staged_log_path.exists():
                 staged_log_path.replace(local_log_path)
+                published_paths.append(local_log_path)
         except OSError as exc:
-            if request.local_output_path.exists() and "output" in backups:
-                request.local_output_path.unlink(missing_ok=True)
-            if request.local_report_path.exists() and "report" in backups:
-                request.local_report_path.unlink(missing_ok=True)
-            if local_log_path is not None and local_log_path.exists() and "log" in backups:
-                local_log_path.unlink(missing_ok=True)
+            for published in reversed(published_paths):
+                if published.exists():
+                    published.unlink(missing_ok=True)
             for label, backup in backups.items():
-                if label == "output":
-                    backup.replace(request.local_output_path)
-                elif label == "report":
-                    backup.replace(request.local_report_path)
-                elif label == "log" and local_log_path is not None:
-                    backup.replace(local_log_path)
+                target = _target_for_label(label)
+                if target is None:
+                    continue
+                try:
+                    backup.replace(target)
+                except OSError:
+                    failed_restore_backups.add(backup)
             raise RemoteSeedvr2WorkerRecoveryError(f"Could not publish SeedVR2 local artifacts: {exc}") from exc
         finally:
             for backup in backups.values():
-                backup.unlink(missing_ok=True)
+                if backup in failed_restore_backups:
+                    continue
+                if backup.exists():
+                    backup.unlink(missing_ok=True)
 
     _guard_overwrite_of_other_execution()
     try:
@@ -497,8 +512,10 @@ def _download_seedvr2_artifacts(
     try:
         report_tmp.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False), encoding="utf-8")
         _publish_atomically(local_log_path=local_log_path, staged_log_path=log_tmp)
-    except OSError as exc:
+    except (OSError, RemoteSeedvr2WorkerRecoveryError) as exc:
         _cleanup_tmp_files()
+        if isinstance(exc, RemoteSeedvr2WorkerRecoveryError):
+            raise
         raise RemoteSeedvr2WorkerRecoveryError(f"Could not finalize SeedVR2 local artifacts: {exc}") from exc
 
     if progress_callback is not None:
