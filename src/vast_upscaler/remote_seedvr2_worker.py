@@ -8,6 +8,7 @@ import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from vast_upscaler.transfer import (
     OpenSshTransport,
@@ -330,9 +331,104 @@ def _download_seedvr2_artifacts(
     process_stderr: str,
     progress_callback: ProgressCallback | None,
 ) -> Seedvr2RemoteResult:
+    tmp_suffix = f".{uuid4().hex[:8]}.part"
+    report_tmp = request.local_report_path.with_name(request.local_report_path.name + tmp_suffix)
+    output_tmp = request.local_output_path.with_name(request.local_output_path.name + tmp_suffix)
+    log_tmp: Path | None = None
+
+    def _cleanup_tmp_files() -> None:
+        for candidate in (report_tmp, output_tmp, log_tmp):
+            if candidate is not None and candidate.exists():
+                candidate.unlink(missing_ok=True)
+
+    def _existing_identity(report_path: Path) -> tuple[str | None, str | None]:
+        if not report_path.exists() or not report_path.is_file():
+            return (None, None)
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return (None, None)
+        if not isinstance(payload, dict):
+            return (None, None)
+        engine = payload.get("engine")
+        job_id = payload.get("job_id")
+        return (
+            str(engine) if isinstance(engine, str) and engine.strip() else None,
+            str(job_id) if isinstance(job_id, str) and job_id.strip() else None,
+        )
+
+    def _guard_overwrite_of_other_execution() -> None:
+        if not request.local_report_path.exists() and not request.local_output_path.exists():
+            return
+        engine, job_id = _existing_identity(request.local_report_path)
+        if engine == "seedvr2" and job_id == request.session_id:
+            return
+        raise RemoteSeedvr2WorkerRecoveryError("Refusing to overwrite existing local artifacts from another execution.")
+
+    def _publish_atomically(*, local_log_path: Path | None, staged_log_path: Path | None) -> None:
+        rollback_suffix = f".rollback.{uuid4().hex[:8]}"
+        backups: dict[str, Path] = {}
+        published_paths: list[Path] = []
+        failed_restore_backups: set[Path] = set()
+
+        def _backup_if_exists(label: str, final_path: Path) -> None:
+            if final_path.exists():
+                backup_path = final_path.with_name(final_path.name + rollback_suffix)
+                final_path.replace(backup_path)
+                backups[label] = backup_path
+
+        def _target_for_label(label: str) -> Path | None:
+            if label == "output":
+                return request.local_output_path
+            if label == "report":
+                return request.local_report_path
+            if label == "log":
+                return local_log_path
+            return None
+
+        request.local_output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.local_report_path.parent.mkdir(parents=True, exist_ok=True)
+        if local_log_path is not None:
+            local_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            _backup_if_exists("output", request.local_output_path)
+            _backup_if_exists("report", request.local_report_path)
+            if local_log_path is not None:
+                _backup_if_exists("log", local_log_path)
+
+            output_tmp.replace(request.local_output_path)
+            published_paths.append(request.local_output_path)
+            report_tmp.replace(request.local_report_path)
+            published_paths.append(request.local_report_path)
+            if local_log_path is not None and staged_log_path is not None and staged_log_path.exists():
+                staged_log_path.replace(local_log_path)
+                published_paths.append(local_log_path)
+        except OSError as exc:
+            for published in reversed(published_paths):
+                if published.exists():
+                    published.unlink(missing_ok=True)
+            for label, backup in backups.items():
+                target = _target_for_label(label)
+                if target is None:
+                    continue
+                try:
+                    backup.replace(target)
+                except OSError:
+                    failed_restore_backups.add(backup)
+            raise RemoteSeedvr2WorkerRecoveryError(f"Could not publish SeedVR2 local artifacts: {exc}") from exc
+        finally:
+            for backup in backups.values():
+                if backup in failed_restore_backups:
+                    continue
+                if backup.exists():
+                    backup.unlink(missing_ok=True)
+
+    _guard_overwrite_of_other_execution()
     try:
         discovered = _discover_seedvr2_outputs(transport=transport, connection=connection, output_root=paths.output_dir)
     except RemoteSeedvr2WorkerReportError as exc:
+        _cleanup_tmp_files()
         raise RemoteSeedvr2WorkerRecoveryError(f"Could not discover SeedVR2 output artifacts: {exc}") from exc
     remote_report_path = discovered["report"]
     remote_output_path = discovered["output"]
@@ -344,22 +440,26 @@ def _download_seedvr2_artifacts(
         transport.download_file(
             connection,
             remote_path=remote_report_path,
-            local_path=request.local_report_path,
+            local_path=report_tmp,
             timeout_seconds=request.download_timeout_seconds,
             retry_policy=RetryPolicy(max_attempts=1),
             overwrite=True,
         )
     except TransferError as exc:
+        _cleanup_tmp_files()
         raise RemoteSeedvr2WorkerRecoveryError(f"Could not download SeedVR2 report: {exc}") from exc
 
     try:
-        report_payload = _load_seedvr2_report(request.local_report_path)
+        report_payload = _load_seedvr2_report(report_tmp)
     except RemoteSeedvr2WorkerReportError as exc:
+        _cleanup_tmp_files()
         raise RemoteSeedvr2WorkerRecoveryError(f"SeedVR2 report is missing or invalid after inference: {exc}") from exc
     status = str(report_payload.get("status") or "").lower()
     if status != "completed":
         if status in {"failed", "error", "cancelled"}:
+            _cleanup_tmp_files()
             raise RemoteSeedvr2WorkerProcessError(f"SeedVR2 inference report status: {status}")
+        _cleanup_tmp_files()
         raise RemoteSeedvr2WorkerRecoveryError(f"SeedVR2 report status is not completed: {status or 'missing'}")
 
     try:
@@ -367,34 +467,57 @@ def _download_seedvr2_artifacts(
         if remote_log_path is not None:
             _validate_remote_path_within_root(path=remote_log_path, root=paths.output_dir, label="log")
     except RemoteSeedvr2WorkerReportError as exc:
+        _cleanup_tmp_files()
         raise RemoteSeedvr2WorkerRecoveryError(f"Discovered SeedVR2 artifact path is invalid: {exc}") from exc
 
     try:
         transport.download_file(
             connection,
             remote_path=remote_output_path,
-            local_path=request.local_output_path,
+            local_path=output_tmp,
             timeout_seconds=request.download_timeout_seconds,
             retry_policy=RetryPolicy(max_attempts=1),
             overwrite=True,
         )
     except TransferError as exc:
+        _cleanup_tmp_files()
         raise RemoteSeedvr2WorkerRecoveryError(f"Could not download SeedVR2 output video: {exc}") from exc
 
     local_log_path: Path | None = None
     if remote_log_path is not None:
         local_log_path = request.local_report_path.with_suffix(request.local_report_path.suffix + ".run.log")
+        log_tmp = local_log_path.with_name(local_log_path.name + tmp_suffix)
         try:
             transport.download_file(
                 connection,
                 remote_path=remote_log_path,
-                local_path=local_log_path,
+                local_path=log_tmp,
                 timeout_seconds=request.download_timeout_seconds,
                 retry_policy=RetryPolicy(max_attempts=1),
                 overwrite=True,
             )
         except TransferError:
+            if log_tmp.exists():
+                log_tmp.unlink(missing_ok=True)
             local_log_path = None
+            log_tmp = None
+
+    report_payload["engine"] = "seedvr2"
+    report_payload["job_id"] = request.session_id
+    report_payload["artifact_paths"] = {
+        "output": str(request.local_output_path),
+        "report": str(request.local_report_path),
+        "log": str(local_log_path) if local_log_path is not None else None,
+    }
+    try:
+        report_tmp.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        _publish_atomically(local_log_path=local_log_path, staged_log_path=log_tmp)
+    except (OSError, RemoteSeedvr2WorkerRecoveryError) as exc:
+        _cleanup_tmp_files()
+        if isinstance(exc, RemoteSeedvr2WorkerRecoveryError):
+            raise
+        raise RemoteSeedvr2WorkerRecoveryError(f"Could not finalize SeedVR2 local artifacts: {exc}") from exc
+
     if progress_callback is not None:
         progress_callback({"kind": "transfer", "stage": "download", "status": "completed"})
 
@@ -634,6 +757,8 @@ class _Seedvr2ProgressState:
         self.last_log_emit_line: int = 0
         self.seen_lines: int = 0
         self.current_stage: str | None = None
+        self.chunk_total: int | None = None
+        self.completed_chunks: int = 0
 
 
 def _parse_seedvr2_progress_line(*, line: str, state: _Seedvr2ProgressState) -> dict[str, object] | None:
@@ -656,11 +781,23 @@ def _parse_seedvr2_progress_line(*, line: str, state: _Seedvr2ProgressState) -> 
 
     chunk_match = re.search(r"chunk\s*(\d+)\s*/\s*(\d+)", lowered)
     if chunk_match:
+        current_chunk = int(chunk_match.group(1))
+        chunk_total = int(chunk_match.group(2))
+        if chunk_total > 0:
+            state.chunk_total = chunk_total
+            completed_chunks = max(0, min(chunk_total, current_chunk - 1))
+            state.completed_chunks = max(state.completed_chunks, completed_chunks)
+            progress = max(state.last_progress, min(0.999, state.completed_chunks / chunk_total))
+            state.last_progress = progress
+        else:
+            progress = state.last_progress
         return {
             "kind": "worker",
             "stage": state.current_stage or "dit-upscale",
-            "chunk_done": int(chunk_match.group(1)),
-            "chunk_total": int(chunk_match.group(2)),
+            "chunk_current": current_chunk,
+            "chunk_total": chunk_total,
+            "chunks_completed": state.completed_chunks,
+            "progress": progress,
             "determinate": False,
         }
 

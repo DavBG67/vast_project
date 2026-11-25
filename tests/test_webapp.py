@@ -108,6 +108,10 @@ def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -
     assert "currentRepo !== expectedRepo" in html
     assert "workerImage.value = suggested;" in html
     assert 'payload.state !== "manual-instance-preserved"' in html
+    assert "MAX_EVENT_LINES = 1000" in html
+    assert "resyncJobSnapshot" in html
+    assert "scheduleSseReconnect" in html
+    assert "localStorage.setItem" in html
 
 
 def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) -> None:
@@ -143,6 +147,456 @@ def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) ->
         "cancel-btn",
     ):
         assert f'id="{control_id}"' in html
+
+
+def test_web_monitoring_runtime_handles_sse_resync_terminal_and_prompt_recovery(tmp_path: Path) -> None:
+    if shutil.which("node") is None:
+        pytest.skip("node is required for JavaScript runtime monitoring tests")
+
+    config_path = _write_config(tmp_path)
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    html = client.get("/").text
+    html_path = tmp_path / "index.html"
+    html_path.write_text(html, encoding="utf-8")
+
+    node_script = tmp_path / "monitoring_harness.mjs"
+    node_script.write_text(
+        r"""
+import fs from "node:fs";
+import vm from "node:vm";
+
+const html = fs.readFileSync(process.argv[2], "utf8");
+const scriptStart = html.lastIndexOf("<script>");
+const scriptEnd = html.lastIndexOf("</script>");
+if (scriptStart < 0 || scriptEnd < scriptStart) {
+  throw new Error("script block not found");
+}
+const script = html.slice(scriptStart + "<script>".length, scriptEnd);
+
+function createHarness({ skipBootstrap = true, rememberedJobId = null, initialSnapshots = {} } = {}) {
+  const elements = new Map();
+  const timeouts = [];
+  const intervals = new Map();
+  let nextTimer = 1;
+  let confirmCount = 0;
+  let promptPostCount = 0;
+  const snapshots = new Map(Object.entries(initialSnapshots));
+  let api = null;
+
+  function makeElement(id = "") {
+    return {
+      id,
+      value: "",
+      textContent: "",
+      innerHTML: "",
+      disabled: false,
+      checked: false,
+      scrollTop: 0,
+      scrollHeight: 0,
+      className: "",
+      style: {},
+      options: [],
+      classList: {
+        add() {},
+        remove() {},
+        toggle() {},
+      },
+      addEventListener() {},
+      appendChild(child) {
+        this.options.push(child);
+      },
+    };
+  }
+
+  const document = {
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, makeElement(id));
+      return elements.get(id);
+    },
+    querySelector(selector) {
+      if (selector.includes("processing_scope")) return { value: "full_video" };
+      if (selector.includes("crop_mode")) return { value: "preserve" };
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+    createElement(tag) {
+      return makeElement(tag);
+    },
+  };
+
+  class FakeEventSource {
+    static instances = [];
+    constructor(url) {
+      this.url = url;
+      this.closed = false;
+      this.onmessage = null;
+      this.onerror = null;
+      FakeEventSource.instances.push(this);
+    }
+    close() {
+      this.closed = true;
+    }
+    emit(event) {
+      if (this.closed || !this.onmessage) return;
+      this.onmessage({ data: JSON.stringify(event) });
+    }
+    fail() {
+      if (this.closed || !this.onerror) return;
+      this.onerror(new Error("network"));
+    }
+  }
+
+  const localStore = new Map();
+  if (rememberedJobId) {
+    localStore.set("vast-upscaler-current-job-id", rememberedJobId);
+  }
+
+  async function fakeFetch(url, options = {}) {
+    const path = String(url);
+    if (path === "/api/config") {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            target_width: 1280,
+            target_height: 720,
+            worker_image_latest_known: "",
+            worker_image_required: false,
+            default_engine: "realesrgan",
+            engines: ["realesrgan", "seedvr2"],
+            seedvr2_profiles: ["smoke", "reference"],
+            gpu_models: ["RTX 4090"],
+            worker_image_latest_by_engine: {
+              realesrgan: "",
+              seedvr2: "",
+            },
+            seedvr2_recovery_jobs: [],
+          };
+        },
+      };
+    }
+    if (path === "/api/video/sources") {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { sources: [] };
+        },
+      };
+    }
+    if (path.includes("/prompts/") && options.method === "POST") {
+      promptPostCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {};
+        },
+      };
+    }
+    const match = path.match(/^\/api\/jobs\/([^/]+)$/);
+    if (match) {
+      const jobId = match[1];
+      const snapshot = snapshots.get(jobId);
+      if (!snapshot) {
+        return {
+          ok: false,
+          status: 404,
+          async json() {
+            return { detail: "not found" };
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return JSON.parse(JSON.stringify(snapshot));
+        },
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {};
+      },
+    };
+  }
+
+  const context = {
+    console,
+    document,
+    EventSource: FakeEventSource,
+    fetch: fakeFetch,
+    setTimeout(fn) {
+      const id = nextTimer++;
+      timeouts.push({ id, fn });
+      return id;
+    },
+    clearTimeout(id) {
+      const idx = timeouts.findIndex((item) => item.id === id);
+      if (idx >= 0) timeouts.splice(idx, 1);
+    },
+    setInterval(fn) {
+      const id = nextTimer++;
+      intervals.set(id, fn);
+      return id;
+    },
+    clearInterval(id) {
+      intervals.delete(id);
+    },
+    Date,
+    Math,
+    Number,
+    JSON,
+    String,
+    Boolean,
+    RegExp,
+    Array,
+    Map,
+    Set,
+  };
+  context.window = {
+    prompt() {
+      return "sha256:test";
+    },
+    confirm() {
+      confirmCount += 1;
+      return true;
+    },
+    localStorage: {
+      getItem(key) {
+        return localStore.get(key) ?? null;
+      },
+      setItem(key, value) {
+        localStore.set(key, String(value));
+      },
+      removeItem(key) {
+        localStore.delete(key);
+      },
+    },
+    __VAST_TEST_HOOKS__: {
+      init(receivedApi) {
+        api = receivedApi;
+      },
+    },
+  };
+  if (skipBootstrap) {
+    context.window.__VAST_SKIP_BOOTSTRAP__ = true;
+  }
+  context.globalThis = context;
+
+  vm.createContext(context);
+  vm.runInContext(script, context);
+
+  async function flushMicrotasks() {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  async function flushTimeouts() {
+    for (let i = 0; i < 20; i += 1) {
+      if (timeouts.length === 0) break;
+      const pending = [...timeouts];
+      timeouts.length = 0;
+      for (const item of pending) {
+        item.fn();
+      }
+      await flushMicrotasks();
+    }
+  }
+
+  async function runIntervals() {
+    for (const fn of intervals.values()) fn();
+    await flushMicrotasks();
+  }
+
+  function setSnapshot(jobId, snapshot) {
+    snapshots.set(jobId, snapshot);
+  }
+
+  function assert(condition, message) {
+    if (!condition) {
+      throw new Error(message);
+    }
+  }
+
+  return {
+    api,
+    document,
+    FakeEventSource,
+    setSnapshot,
+    flushMicrotasks,
+    flushTimeouts,
+    runIntervals,
+    assert,
+    get confirmCount() {
+      return confirmCount;
+    },
+    get promptPostCount() {
+      return promptPostCount;
+    },
+  };
+}
+
+async function run() {
+  // Scenario 1, 2, 4, 6, 7 in one session
+  const h = createHarness({ skipBootstrap: true });
+  const job = "job-sse";
+  h.api.setCurrentJobId(job);
+  h.setSnapshot(job, {
+    job_id: job,
+    status: "running",
+    business_state: "running",
+    latest_event_id: 8,
+    oldest_event_id: 1,
+    pending_prompt: null,
+    stage: "seedvr2",
+    progress: null,
+    chunk_current: null,
+    chunk_total: null,
+    chunks_completed: null,
+    elapsed_seconds: 5,
+    error: null,
+    result: null,
+  });
+  h.api.watchEvents(job);
+  await h.flushMicrotasks();
+  const stream = h.FakeEventSource.instances.at(-1);
+  stream.emit({ id: 1, type: "worker", payload: { stage: "dit-upscale", chunk_current: 1, chunk_total: 16, chunks_completed: 0, progress: 0.0 } });
+  await h.flushMicrotasks();
+  stream.emit({ id: 2, type: "worker", payload: { stage: "dit-upscale", chunk_current: 7, chunk_total: 16, chunks_completed: 6, progress: 0.375 } });
+  await h.flushMicrotasks();
+  const stateAfterEvents = h.api.getState();
+  h.assert(stateAfterEvents.lastConsumedEventId === 2, "SSE cursor should track consumed events only");
+  h.assert(stateAfterEvents.latestSnapshotEventId === 8, "Snapshot cursor should be independent from SSE cursor");
+  h.assert(h.document.getElementById("job-progress").textContent.includes("37.5%"), "Chunk progress should be restored in UI");
+
+  h.setSnapshot(job, {
+    job_id: job,
+    status: "running",
+    business_state: "running",
+    latest_event_id: 8,
+    oldest_event_id: 1,
+    pending_prompt: { prompt_id: "prompt-ssh", kind: "ssh_trust", message: "Trust host?" },
+    stage: "Confirmation requise",
+    progress: 0.375,
+    chunk_current: 7,
+    chunk_total: 16,
+    chunks_completed: 6,
+    elapsed_seconds: 12,
+    error: null,
+    result: null,
+  });
+  stream.fail();
+  await h.flushMicrotasks();
+  await h.flushTimeouts();
+  h.assert(h.confirmCount === 1, "Prompt should be restored once during SSE outage");
+  h.assert(h.promptPostCount === 1, "Prompt answer should be posted once");
+
+  h.setSnapshot(job, {
+    job_id: job,
+    status: "completed",
+    business_state: "completed",
+    latest_event_id: 9,
+    oldest_event_id: 1,
+    pending_prompt: null,
+    stage: "COMPLETED",
+    progress: 1.0,
+    chunk_current: 16,
+    chunk_total: 16,
+    chunks_completed: 16,
+    elapsed_seconds: 42,
+    error: null,
+    result: {
+      output_path: "/tmp/out.mp4",
+      report_path: "/tmp/out.json",
+      duration_seconds: 42,
+      state: "COMPLETED",
+    },
+  });
+  await h.api.resyncJobSnapshot(job, h.api.getState().trackedJobVersion);
+  await h.flushMicrotasks();
+  h.assert(h.document.getElementById("status").textContent === "completed", "Terminal completed snapshot should set status");
+  h.assert(h.document.getElementById("job-result").innerHTML.includes("/tmp/out.mp4"), "Completed snapshot should expose result");
+  const beforeReconnectCount = h.FakeEventSource.instances.length;
+  stream.fail();
+  await h.flushTimeouts();
+  h.assert(h.FakeEventSource.instances.length === beforeReconnectCount, "No reconnect should happen after terminal snapshot");
+
+  // Scenario 5: failed snapshot without SSE error event
+  const hFail = createHarness({ skipBootstrap: true });
+  const failJob = "job-failed";
+  hFail.api.setCurrentJobId(failJob);
+  hFail.setSnapshot(failJob, {
+    job_id: failJob,
+    status: "failed",
+    business_state: "failed_recovery",
+    latest_event_id: 3,
+    oldest_event_id: 1,
+    pending_prompt: null,
+    stage: "download",
+    progress: 0.9,
+    chunk_current: 16,
+    chunk_total: 16,
+    chunks_completed: 16,
+    elapsed_seconds: 30,
+    error: "download failed",
+    result: null,
+  });
+  hFail.api.watchEvents(failJob);
+  await hFail.api.resyncJobSnapshot(failJob, hFail.api.getState().trackedJobVersion);
+  await hFail.flushMicrotasks();
+  hFail.assert(
+    ["failed", "failed_recovery"].includes(hFail.document.getElementById("status").textContent),
+    "Terminal failed snapshot should set a failed status",
+  );
+  hFail.assert(hFail.document.getElementById("job-error").textContent.includes("download failed"), "Failed snapshot should expose error");
+
+  // Scenario 3: refresh with pending prompt should rehydrate prompt once
+  const hRefresh = createHarness({
+    skipBootstrap: false,
+    rememberedJobId: "job-refresh",
+    initialSnapshots: {
+      "job-refresh": {
+        job_id: "job-refresh",
+        status: "running",
+        business_state: "running",
+        latest_event_id: 4,
+        oldest_event_id: 1,
+        pending_prompt: { prompt_id: "prompt-refresh", kind: "ssh_trust", message: "Trust refreshed host?" },
+        stage: "Confirmation requise",
+        progress: null,
+        chunk_current: null,
+        chunk_total: null,
+        chunks_completed: null,
+        elapsed_seconds: 1,
+        error: null,
+        result: null,
+      },
+    },
+  });
+  await hRefresh.api.resyncJobSnapshot("job-refresh", hRefresh.api.getState().trackedJobVersion);
+  await hRefresh.flushMicrotasks();
+  await hRefresh.flushTimeouts();
+  hRefresh.assert(hRefresh.promptPostCount === 1, "Refresh should restore pending prompt exactly once");
+}
+
+run().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+        encoding="utf-8",
+    )
+
+    run = subprocess.run(["node", str(node_script), str(html_path)], capture_output=True, text=True, check=False)
+    assert run.returncode == 0, run.stderr or run.stdout
 
 
 def test_web_video_sources_listing_filters_outputs_and_non_video(tmp_path: Path, monkeypatch) -> None:
@@ -718,9 +1172,10 @@ def test_resolve_output_path_defaults_to_mp4_for_all_sources(tmp_path: Path) -> 
     mp4 = tmp_path / "clip.mp4"
     for item in (mkv, webm, mp4):
         item.write_bytes(b"x")
-    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mkv))).name == "clip-upscaled.mp4"
-    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(webm))).name == "clip-upscaled.mp4"
-    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mp4))).name == "clip-upscaled.mp4"
+    for source in (mkv, webm, mp4):
+        resolved = _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(source))).name
+        assert resolved.startswith("clip-upscaled-realesrgan-")
+        assert resolved.endswith(".mp4")
 
 
 def test_web_job_start_rejects_incompatible_explicit_output_extension(tmp_path: Path) -> None:
@@ -1203,6 +1658,44 @@ def test_manual_seedvr2_sequence_inference_success_then_download_then_completed(
     download_completed_index = events_payload.index('"stage":"download","status":"completed"')
     result_index = events_payload.index('"type":"result"')
     assert recovering_index < download_started_index < download_completed_index < result_index
+
+
+def test_manual_seedvr2_high_volume_worker_logs_preserve_terminal_state(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        for index in range(10_000):
+            callbacks.report_worker_progress({"kind": "worker-log", "line": f"log line {index}"})
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "completed"})
+        return WorkflowExecutionResult(
+            mode="manual",
+            session_id=None,
+            state="COMPLETED",
+            output_path=str(tmp_path / "out.mp4"),
+            report_path=str(tmp_path / "report.json"),
+            duration_seconds=0.1,
+            estimated_total_usd=None,
+            instance_id=123,
+            instance_state="running",
+            cleanup_verified=False,
+            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
+        )
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    terminal = _wait_for_status(client, job_id, {"completed"})
+    assert terminal["status"] == "completed"
+    assert terminal["latest_event_id"] >= terminal["oldest_event_id"] > 1
+    assert (terminal["latest_event_id"] - terminal["oldest_event_id"]) < 5_000
+    events_payload = _read_events_text(client, job_id)
+    assert '"type":"result"' in events_payload
 
 
 @pytest.mark.parametrize(
