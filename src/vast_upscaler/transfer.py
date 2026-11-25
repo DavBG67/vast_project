@@ -372,6 +372,8 @@ class OpenSshTransport:
                 args,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout_seconds,
                 check=False,
                 shell=False,
@@ -395,6 +397,8 @@ class OpenSshTransport:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 shell=False,
             )
         except FileNotFoundError as exc:
@@ -437,6 +441,14 @@ class OpenSshTransport:
         finally:
             if process.poll() is None:
                 process.kill()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
 
     @staticmethod
     def _sleep(seconds: float) -> None:
@@ -563,6 +575,8 @@ def fetch_ssh_ed25519_host_key(*, host: str, port: int, timeout_seconds: float =
             ["ssh-keyscan", "-p", str(port), "-t", "ed25519", host],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
             check=False,
             shell=False,
@@ -623,6 +637,8 @@ def local_ssh_supported_kex_algorithms() -> set[str]:
             ["ssh", "-Q", "kex"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10.0,
             check=False,
             shell=False,
@@ -733,6 +749,8 @@ def _fetch_ssh_ed25519_host_key_with_ssh(*, host: str, port: int, timeout_second
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout_seconds,
                 check=False,
                 shell=False,

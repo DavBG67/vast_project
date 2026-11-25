@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -462,6 +463,89 @@ def test_run_remote_command_timeout_raises(tmp_path: Path) -> None:
             retry_policy=RetryPolicy(max_attempts=1),
             idempotent=True,
         )
+
+
+def test_exec_streaming_decodes_utf8_with_replacement(tmp_path: Path) -> None:
+    transport = OpenSshTransport()
+    seen_lines: list[str] = []
+    completed = transport._exec_streaming(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write('emoji 😀 café '.encode('utf-8') + b'\\x8f\\n'); "
+                "sys.stdout.flush(); "
+                "sys.stderr.buffer.write('stderr café '.encode('utf-8') + b'\\x8f\\n'); "
+                "sys.stderr.flush()"
+            ),
+        ],
+        timeout_seconds=5.0,
+        stdout_line_callback=seen_lines.append,
+    )
+    assert completed.returncode == 0
+    assert "emoji 😀 café" in completed.stdout
+    assert "�" in completed.stdout
+    assert "stderr café" in completed.stderr
+    assert "�" in completed.stderr
+    assert any("emoji 😀 café" in line for line in seen_lines)
+
+
+def test_exec_streaming_releases_process_resources_on_callback_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeReader:
+        def __init__(self, first_line: str = "", tail: str = "") -> None:
+            self._first_line = first_line
+            self._tail = tail
+            self._consumed = False
+            self.closed = False
+
+        def readline(self) -> str:
+            if self._consumed:
+                return ""
+            self._consumed = True
+            return self._first_line
+
+        def read(self) -> str:
+            return self._tail
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _FakeReader(first_line="line\n")
+            self.stderr = _FakeReader(tail="stderr")
+            self.returncode = None
+            self.killed = False
+            self.wait_called = False
+
+        def poll(self):
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_called = True
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    fake_process = _FakeProcess()
+    monkeypatch.setattr("vast_upscaler.transfer.subprocess.Popen", lambda *a, **k: fake_process)
+
+    transport = OpenSshTransport()
+    with pytest.raises(RuntimeError, match="callback failed"):
+        transport._exec_streaming(
+            ["ssh", "host", "echo", "x"],
+            timeout_seconds=5.0,
+            stdout_line_callback=lambda _line: (_ for _ in ()).throw(RuntimeError("callback failed")),
+        )
+    assert fake_process.killed is True
+    assert fake_process.wait_called is True
+    assert fake_process.stdout.closed is True
+    assert fake_process.stderr.closed is True
 
 
 def test_known_host_markers_non_standard_port() -> None:

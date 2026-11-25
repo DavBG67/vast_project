@@ -3028,7 +3028,9 @@ _INDEX_HTML = """
         const phase = payload.phase || payload.status || "provisioning";
         document.getElementById("job-stage").textContent = String(phase);
       } else if (type === "instance") {
-        document.getElementById("job-stage").textContent = String(payload.message || payload.state || "instance");
+        if (payload.state !== "manual-instance-preserved") {
+          document.getElementById("job-stage").textContent = String(payload.message || payload.state || "instance");
+        }
       } else if (type === "worker") {
         const stage = payload.stage || "worker";
         document.getElementById("job-stage").textContent = String(stage);

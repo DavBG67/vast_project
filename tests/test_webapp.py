@@ -107,6 +107,7 @@ def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -
     assert "en attente du plan validé ou recadrage non fiable" in html
     assert "currentRepo !== expectedRepo" in html
     assert "workerImage.value = suggested;" in html
+    assert 'payload.state !== "manual-instance-preserved"' in html
 
 
 def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) -> None:
