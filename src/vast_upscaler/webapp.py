@@ -5,7 +5,6 @@ import re
 import subprocess
 import threading
 import time
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -99,7 +98,6 @@ _WORKER_IMAGE_REPO_BY_ENGINE: dict[EngineName, str] = {
     "realesrgan": "ghcr.io/davbg67/vast-video-upscaler-worker",
     "seedvr2": "ghcr.io/davbg67/vast-video-upscaler-seedvr2",
 }
-_MAX_JOB_EVENTS = 5_000
 _WORKER_IMAGE_PLACEHOLDERS = {
     "ghcr.io/acme/worker:test",
     "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>",
@@ -148,7 +146,6 @@ class StartJobRequest(BaseModel):
     excerpt_start: str | None = None
     excerpt_duration_seconds: float = Field(default=10.0, gt=0)
     recover_seedvr2_job_id: str | None = None
-    execution_id: str | None = None
 
 
 class PromptReplyRequest(BaseModel):
@@ -233,13 +230,20 @@ class _Job:
         self.business_state = "pending"
         self.error: str | None = None
         self.result: WorkflowExecutionResult | None = None
-        self.events: deque[dict[str, Any]] = deque(maxlen=_MAX_JOB_EVENTS)
+        self.events: list[dict[str, Any]] = []
         self.next_event_id = 1
         self.condition = threading.Condition()
         self.thread: threading.Thread | None = None
         self.cancel_requested = False
         self.pending_prompt: dict[str, Any] | None = None
         self.answered_prompt_ids: set[str] = set()
+        self.stage: str = "pending"
+        self.progress: float | None = None
+        self.chunk_current: int | None = None
+        self.chunk_total: int | None = None
+        self.chunks_completed: int | None = None
+        self.started_at: str | None = None
+        self.completed_at: str | None = None
 
     def is_active(self) -> bool:
         return self.status in {"pending", "running"}
@@ -256,6 +260,23 @@ class _Job:
             self.events.append(event)
             self.updated_at = event["timestamp"]
             self.condition.notify_all()
+
+    def elapsed_seconds(self) -> float | None:
+        if self.started_at is None:
+            return None
+        try:
+            started = datetime.fromisoformat(self.started_at)
+        except ValueError:
+            return None
+        finished = self.completed_at or datetime.now(UTC).isoformat()
+        try:
+            ended = datetime.fromisoformat(finished)
+        except ValueError:
+            return None
+        elapsed = (ended - started).total_seconds()
+        if elapsed < 0:
+            return 0.0
+        return round(elapsed, 3)
 
 
 class WebTaskManager:
@@ -395,9 +416,6 @@ class WebTaskManager:
             cursor = max(0, last_event_id)
             while True:
                 with job.condition:
-                    if job.events:
-                        oldest = int(job.events[0]["id"])
-                        cursor = max(cursor, oldest - 1)
                     pending = [e for e in job.events if int(e["id"]) > cursor]
                     if not pending:
                         if not job.is_active():
@@ -415,6 +433,8 @@ class WebTaskManager:
     def _run_job(self, job: _Job) -> None:
         job.status = "running"
         job.business_state = "running"
+        job.started_at = datetime.now(UTC).isoformat()
+        job.stage = "Workflow started."
         job.append_event("status", {"state": "running", "message": "Workflow started."})
         started = time.perf_counter()
         settings = load_config(self._config_path)
@@ -459,6 +479,9 @@ class WebTaskManager:
             job.result = result
             job.status = "completed"
             job.business_state = "completed"
+            job.stage = str(result.state or "completed")
+            job.progress = 1.0
+            job.completed_at = datetime.now(UTC).isoformat()
             if job.request.worker_image:
                 try:
                     _store_latest_worker_image(job.request.worker_image, engine=_normalize_engine(job.request.engine))
@@ -488,6 +511,8 @@ class WebTaskManager:
             job.status = "cancelled"
             job.business_state = "cancelled"
             job.error = "Cancelled by operator."
+            job.stage = "cancelled"
+            job.completed_at = datetime.now(UTC).isoformat()
             job.append_event("error", {"message": job.error})
             if job.request.mode == "manual":
                 job.append_event(
@@ -505,6 +530,8 @@ class WebTaskManager:
             else:
                 job.business_state = "failed"
             job.error = str(exc)
+            job.stage = "failed"
+            job.completed_at = datetime.now(UTC).isoformat()
             job.append_event("error", {"message": str(exc)})
             if job.request.mode == "manual":
                 job.append_event(
@@ -520,6 +547,9 @@ class WebTaskManager:
 
     def _on_provisioning(self, job: _Job, payload: dict[str, str]) -> None:
         self._raise_if_cancelled(job)
+        phase = str(payload.get("phase") or payload.get("status") or "").strip()
+        if phase:
+            job.stage = phase
         job.append_event("provisioning", payload)
 
     def _on_worker_progress(self, job: _Job, payload: dict[str, object]) -> None:
@@ -529,9 +559,27 @@ class WebTaskManager:
         status = str(payload.get("status") or "")
         if kind == "transfer" and stage == "download" and status == "started":
             job.business_state = "inference_succeeded_recovering"
+            job.stage = "download"
             job.append_event("status", {"state": "inference_succeeded_recovering", "message": "Inference finished, downloading artifacts."})
         elif stage and job.business_state != "inference_succeeded_recovering":
             job.business_state = "running"
+            job.stage = stage
+        if stage:
+            job.stage = stage
+        progress_value = payload.get("progress")
+        if isinstance(progress_value, (int, float)):
+            clamped = max(0.0, min(1.0, float(progress_value)))
+            if job.progress is None or clamped >= job.progress:
+                job.progress = clamped
+        chunk_current = payload.get("chunk_current")
+        chunk_total = payload.get("chunk_total")
+        chunks_completed = payload.get("chunks_completed")
+        if isinstance(chunk_current, int) and chunk_current >= 0:
+            job.chunk_current = chunk_current
+        if isinstance(chunk_total, int) and chunk_total > 0:
+            job.chunk_total = chunk_total
+        if isinstance(chunks_completed, int) and chunks_completed >= 0:
+            job.chunks_completed = chunks_completed
         job.append_event("worker", payload)
 
     def _await_boolean_prompt(self, *, job: _Job, kind: str, message: str) -> bool:
@@ -596,6 +644,14 @@ class WebTaskManager:
             "pending_prompt": None,
             "latest_event_id": latest_event_id,
             "oldest_event_id": oldest_event_id,
+            "stage": job.stage,
+            "progress": job.progress,
+            "chunk_current": job.chunk_current,
+            "chunk_total": job.chunk_total,
+            "chunks_completed": job.chunks_completed,
+            "started_at": job.started_at,
+            "completed_at": job.completed_at,
+            "elapsed_seconds": job.elapsed_seconds(),
         }
         if job.pending_prompt is not None:
             payload["pending_prompt"] = {
@@ -1125,27 +1181,13 @@ def _resolve_output_path(*, request: StartJobRequest) -> Path:
     if request.output_path:
         return Path(request.output_path)
     source = _resolve_input_video_path(request=request)
-    execution_id = _ensure_execution_id(request)
-    engine = _normalize_engine(request.engine)
-    return source.with_name(f"{source.stem}-upscaled-{engine}-{execution_id}.mp4")
+    return source.with_name(f"{source.stem}-upscaled.mp4")
 
 
 def _resolve_report_path(*, request: StartJobRequest, output_path: Path) -> Path:
     if request.report_path:
         return Path(request.report_path)
     return output_path.with_suffix(output_path.suffix + ".report.json")
-
-
-def _ensure_execution_id(request: StartJobRequest) -> str:
-    current = (request.execution_id or "").strip().lower()
-    if current:
-        normalized = re.sub(r"[^a-z0-9-]+", "-", current).strip("-")
-        if normalized:
-            request.execution_id = normalized
-            return normalized
-    generated = datetime.now(UTC).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:6]
-    request.execution_id = generated
-    return generated
 
 
 def _resolve_remote_preprocessing_contract(*, request: StartJobRequest) -> dict[str, Any] | None:
@@ -2409,21 +2451,20 @@ _INDEX_HTML = """
 
   <script>
     let currentJobId = null;
-    let lastEventId = 0;
+    let lastConsumedEventId = 0;
+    let latestSnapshotEventId = 0;
     let es = null;
+    let trackedJobVersion = 0;
     let sseRetryCount = 0;
     let sseReconnectTimer = null;
     let snapshotPollTimer = null;
     let snapshotRefreshTimer = null;
-    let trackedJobVersion = 0;
+    let activePromptId = null;
     let promptDialogOpen = false;
     let latestAnalysisPayload = null;
     let latestPlanPayload = null;
     let analysisRequestToken = 0;
     let currentBusinessState = "idle";
-    let currentStageLabel = "n/a";
-    let latestProgressRatio = null;
-    let latestChunkProgress = null;
     let latestWorkerImageByEngine = { realesrgan: "", seedvr2: "" };
     let latestRecoveryJobs = [];
     const expectedWorkerRepoByEngine = {
@@ -2432,14 +2473,17 @@ _INDEX_HTML = """
     };
     let sourcesIndex = new Map();
     let currentJobStartedAt = null;
+    let currentStageLabel = "n/a";
+    let latestProgressRatio = null;
+    let latestChunkProgress = null;
     const handledPromptIds = new Set();
     const unsupportedRemoteOps = new Set(["deinterlace", "denoise", "deblock"]);
+    const ACTIVE_JOB_STATUSES = new Set(["pending", "running"]);
+    const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
     const MAX_EVENT_LINES = 1000;
     const EVENT_FLUSH_INTERVAL_MS = 100;
     const eventLines = [];
     let eventFlushScheduled = false;
-    const ACTIVE_JOB_STATUSES = new Set(["running"]);
-    const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
     function appendEvent(msg) {
       eventLines.push(msg);
@@ -2508,6 +2552,7 @@ _INDEX_HTML = """
         clearInterval(snapshotRefreshTimer);
         snapshotRefreshTimer = null;
       }
+      sseRetryCount = 0;
     }
 
     function rememberTrackedJob(jobId) {
@@ -2518,7 +2563,7 @@ _INDEX_HTML = """
           window.localStorage.removeItem("vast-upscaler-current-job-id");
         }
       } catch (_err) {
-        // localStorage may be unavailable in private contexts
+        // localStorage may be unavailable
       }
     }
 
@@ -2537,22 +2582,54 @@ _INDEX_HTML = """
       document.getElementById("job-progress").textContent = label ? `${pct}% — ${label}` : `${pct}%`;
     }
 
-    async function resyncJobSnapshot(jobId, expectedVersion) {
-      const response = await fetch(`/api/jobs/${jobId}`);
-      if (!response.ok) {
-        throw new Error(`snapshot ${response.status}`);
+    async function syncPendingPromptFromSnapshot(jobId, snapshot) {
+      const pending = snapshot && snapshot.pending_prompt ? snapshot.pending_prompt : null;
+      if (!pending || !pending.prompt_id || pending.prompt_id === activePromptId || promptDialogOpen) {
+        return;
       }
-      const snapshot = await response.json();
-      if (expectedVersion !== trackedJobVersion || snapshot.job_id !== currentJobId) return;
-      if (Number.isFinite(Number(snapshot.latest_event_id))) {
-        lastEventId = Math.max(lastEventId, Number(snapshot.latest_event_id));
+      if (handledPromptIds.has(pending.prompt_id)) {
+        return;
       }
-      const snapshotState = String(snapshot.business_state || snapshot.status || currentBusinessState);
-      currentBusinessState = snapshotState;
-      setStatusLabel(snapshot.status || snapshotState);
-      if (snapshot.error) {
-        document.getElementById("job-error").classList.remove("hidden");
-        document.getElementById("job-error").textContent = "Erreur : " + String(snapshot.error);
+      activePromptId = pending.prompt_id;
+      try {
+        await answerPrompt(jobId, pending);
+      } finally {
+        if (activePromptId === pending.prompt_id) {
+          activePromptId = null;
+        }
+      }
+    }
+
+    function applySnapshotToUi(snapshot) {
+      if (!snapshot || snapshot.job_id !== currentJobId) return;
+      if (snapshot.started_at) {
+        const parsed = Date.parse(String(snapshot.started_at));
+        if (Number.isFinite(parsed)) {
+          currentJobStartedAt = parsed;
+        }
+      }
+      currentBusinessState = String(snapshot.business_state || snapshot.status || currentBusinessState);
+      setStatusLabel(snapshot.status || currentBusinessState);
+      if (snapshot.stage) {
+        setJobStage(snapshot.stage);
+      }
+      if (Number.isFinite(Number(snapshot.chunk_current)) && Number.isFinite(Number(snapshot.chunk_total)) && Number(snapshot.chunk_total) > 0) {
+        const current = Number(snapshot.chunk_current);
+        const total = Number(snapshot.chunk_total);
+        const completed = Number.isFinite(Number(snapshot.chunks_completed))
+          ? Number(snapshot.chunks_completed)
+          : Math.max(0, current - 1);
+        latestChunkProgress = { current, total, completed };
+      }
+      if (Number.isFinite(Number(snapshot.progress))) {
+        setJobProgressFromRatio(Number(snapshot.progress), snapshot.chunk_current && snapshot.chunk_total
+          ? `chunk ${snapshot.chunk_current}/${snapshot.chunk_total}`
+          : null);
+      } else if (latestProgressRatio == null && snapshot.status === "running") {
+        document.getElementById("job-progress").textContent = "indéterminée";
+      }
+      if (Number.isFinite(Number(snapshot.elapsed_seconds))) {
+        document.getElementById("job-elapsed").textContent = prettyDuration(Number(snapshot.elapsed_seconds));
       }
       if (snapshot.result) {
         const outputPath = snapshot.result.output_path || "n/a";
@@ -2562,30 +2639,53 @@ _INDEX_HTML = """
           document.getElementById("job-elapsed").textContent = prettyDuration(Number(snapshot.result.duration_seconds));
         }
       }
-      if (!TERMINAL_JOB_STATUSES.has(String(snapshot.status || ""))) {
-        if (currentJobStartedAt) {
-          const elapsed = (Date.now() - currentJobStartedAt) / 1000;
-          document.getElementById("job-elapsed").textContent = prettyDuration(elapsed);
-        }
+      if (snapshot.error) {
+        document.getElementById("job-error").classList.remove("hidden");
+        document.getElementById("job-error").textContent = "Erreur : " + String(snapshot.error);
       } else {
+        document.getElementById("job-error").classList.add("hidden");
+        document.getElementById("job-error").textContent = "";
+      }
+      if (snapshot.status === "completed") {
+        setJobProgressFromRatio(1.0, "Terminé");
+      }
+      if (TERMINAL_JOB_STATUSES.has(String(snapshot.status || ""))) {
         clearMonitoring();
         rememberTrackedJob(null);
       }
     }
 
+    async function resyncJobSnapshot(jobId, expectedVersion) {
+      const response = await fetch(`/api/jobs/${jobId}`);
+      if (!response.ok) throw new Error(`snapshot ${response.status}`);
+      const snapshot = await response.json();
+      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return snapshot;
+      latestSnapshotEventId = Math.max(latestSnapshotEventId, Number(snapshot.latest_event_id || 0));
+      const oldestEventId = Number(snapshot.oldest_event_id || 0);
+      if (oldestEventId > 0 && lastConsumedEventId < oldestEventId - 1) {
+        appendEvent(`[warning] Événements SSE expirés sur le serveur (reprise à id ${oldestEventId}).`);
+        lastConsumedEventId = oldestEventId - 1;
+      }
+      applySnapshotToUi(snapshot);
+      await syncPendingPromptFromSnapshot(jobId, snapshot);
+      return snapshot;
+    }
+
     function scheduleSseReconnect(jobId, expectedVersion) {
       if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
-      if (sseReconnectTimer) return;
+      if (sseReconnectTimer || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
       const baseDelay = Math.min(5000, 500 * Math.pow(2, Math.min(sseRetryCount, 5)));
       const delay = baseDelay + Math.floor(Math.random() * 250);
       sseReconnectTimer = setTimeout(async () => {
         sseReconnectTimer = null;
         if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        if (TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
         try {
           await resyncJobSnapshot(jobId, expectedVersion);
         } catch (_err) {
           // keep reconnect loop alive
         }
+        if (expectedVersion !== trackedJobVersion || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
         connectEventStream(jobId, expectedVersion);
       }, delay);
     }
@@ -3168,7 +3268,7 @@ _INDEX_HTML = """
       const snapshot = await snapshotResp.json();
       const pending = snapshot.pending_prompt;
       if (!pending || pending.prompt_id !== prompt.prompt_id) return;
-      await answerPrompt(jobId, prompt);
+      await syncPendingPromptFromSnapshot(jobId, snapshot);
     }
 
     function updateJobSummaryFromEvent(data) {
@@ -3256,20 +3356,20 @@ _INDEX_HTML = """
     }
 
     function connectEventStream(jobId, expectedVersion) {
-      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
       if (es) {
         es.close();
         es = null;
       }
-      es = new EventSource(`/api/jobs/${jobId}/events?last_event_id=${lastEventId}`);
+      es = new EventSource(`/api/jobs/${jobId}/events?last_event_id=${lastConsumedEventId}`);
       es.onmessage = async (evt) => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
         const data = JSON.parse(evt.data);
-        if (Number.isFinite(Number(data.id)) && Number(data.id) <= lastEventId) {
+        const eventId = Number(data.id);
+        if (!Number.isFinite(eventId) || eventId <= lastConsumedEventId) {
           return;
         }
-        lastEventId = data.id;
-        sseRetryCount = 0;
+        lastConsumedEventId = eventId;
         appendEvent(`[${data.type}] ${JSON.stringify(data.payload)}`);
         updateJobSummaryFromEvent(data);
         if (data.type === "prompt") {
@@ -3288,12 +3388,15 @@ _INDEX_HTML = """
         }
       };
       es.onerror = async () => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
         sseRetryCount += 1;
         try {
-          await resyncJobSnapshot(jobId, expectedVersion);
+          const snapshot = await resyncJobSnapshot(jobId, expectedVersion);
+          if (snapshot && TERMINAL_JOB_STATUSES.has(String(snapshot.status || ""))) {
+            return;
+          }
         } catch (_err) {
-          // ignored, next reconnect will retry
+          // retry loop will continue
         }
         scheduleSseReconnect(jobId, expectedVersion);
       };
@@ -3305,16 +3408,17 @@ _INDEX_HTML = """
       const expectedVersion = trackedJobVersion;
       connectEventStream(jobId, expectedVersion);
       snapshotPollTimer = setInterval(() => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
         resyncJobSnapshot(jobId, expectedVersion).catch(() => {});
       }, 3000);
       snapshotRefreshTimer = setInterval(() => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
-        if (currentJobStartedAt && ACTIVE_JOB_STATUSES.has(currentBusinessState) && latestProgressRatio == null) {
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
+        if (Number.isFinite(Number(currentJobStartedAt)) && latestProgressRatio == null && ACTIVE_JOB_STATUSES.has(document.getElementById("status").textContent || "")) {
           const elapsed = (Date.now() - currentJobStartedAt) / 1000;
           document.getElementById("job-elapsed").textContent = prettyDuration(elapsed);
         }
       }, 1000);
+      resyncJobSnapshot(jobId, expectedVersion).catch(() => {});
     }
 
     document.getElementById("job-form").addEventListener("submit", async (event) => {
@@ -3369,13 +3473,15 @@ _INDEX_HTML = """
       }
       currentJobId = data.job_id;
       rememberTrackedJob(currentJobId);
-      lastEventId = 0;
+      lastConsumedEventId = 0;
+      latestSnapshotEventId = 0;
       currentJobStartedAt = Date.now();
       currentBusinessState = "running";
+      currentStageLabel = "Initialisation";
       latestProgressRatio = null;
       latestChunkProgress = null;
-      currentStageLabel = "Initialisation";
       handledPromptIds.clear();
+      activePromptId = null;
       promptDialogOpen = false;
       resetEventsLog();
       document.getElementById("job-error").classList.add("hidden");
@@ -3408,13 +3514,15 @@ _INDEX_HTML = """
       }
       currentJobId = data.job_id;
       rememberTrackedJob(currentJobId);
-      lastEventId = 0;
+      lastConsumedEventId = 0;
+      latestSnapshotEventId = 0;
       currentJobStartedAt = Date.now();
       currentBusinessState = "running";
+      currentStageLabel = "Récupération";
       latestProgressRatio = null;
       latestChunkProgress = null;
-      currentStageLabel = "Récupération";
       handledPromptIds.clear();
+      activePromptId = null;
       promptDialogOpen = false;
       resetEventsLog();
       document.getElementById("job-error").classList.add("hidden");
@@ -3471,19 +3579,42 @@ _INDEX_HTML = """
     setCropInputsDisabled(true);
     setModeHelp();
     updateExcerptControls();
-    loadDefaults();
-    loadVideoSources();
-    const rememberedJobId = (() => {
-      try {
-        return window.localStorage.getItem("vast-upscaler-current-job-id");
-      } catch (_err) {
-        return null;
+    if (window.__VAST_TEST_HOOKS__) {
+      window.__VAST_TEST_HOOKS__.init({
+        watchEvents,
+        connectEventStream,
+        updateJobSummaryFromEvent,
+        resyncJobSnapshot,
+        clearMonitoring,
+        applySnapshotToUi,
+        syncPendingPromptFromSnapshot,
+        setCurrentJobId: (jobId) => { currentJobId = jobId; },
+        getState: () => ({
+          currentJobId,
+          lastConsumedEventId,
+          latestSnapshotEventId,
+          trackedJobVersion,
+          currentBusinessState,
+          currentStageLabel,
+          latestProgressRatio,
+          promptDialogOpen,
+        }),
+      });
+    }
+    if (!window.__VAST_SKIP_BOOTSTRAP__) {
+      loadDefaults();
+      loadVideoSources();
+      const rememberedJobId = (() => {
+        try {
+          return window.localStorage.getItem("vast-upscaler-current-job-id");
+        } catch (_err) {
+          return null;
+        }
+      })();
+      if (rememberedJobId) {
+        currentJobId = rememberedJobId;
+        watchEvents(currentJobId);
       }
-    })();
-    if (rememberedJobId) {
-      currentJobId = rememberedJobId;
-      watchEvents(currentJobId);
-      resyncJobSnapshot(currentJobId, trackedJobVersion).catch(() => {});
     }
   </script>
 </body>

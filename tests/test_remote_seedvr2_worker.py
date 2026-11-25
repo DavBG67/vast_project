@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from vast_upscaler import remote_seedvr2_worker as worker_module
 from vast_upscaler.remote_seedvr2_worker import (
     RemoteSeedvr2WorkerPreparationError,
     RemoteSeedvr2WorkerProcessError,
@@ -315,6 +316,45 @@ def test_seedvr2_progress_parser_does_not_treat_chunk_internal_counters_as_globa
         "determinate": False,
     }
     assert state.last_progress == pytest.approx(0.125)
+
+
+def test_recovery_refuses_overwrite_of_other_execution_artifacts(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    request.local_output_path.parent.mkdir(parents=True, exist_ok=True)
+    request.local_output_path.write_bytes(b"old-video")
+    request.local_report_path.write_text(
+        json.dumps({"engine": "seedvr2", "job_id": "manual-other", "status": "completed"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RemoteSeedvr2WorkerRecoveryError):
+        recover_remote_seedvr2_results(transport=FakeTransport(), connection=_connection(tmp_path), request=request)
+    assert request.local_output_path.read_bytes() == b"old-video"
+    payload = json.loads(request.local_report_path.read_text(encoding="utf-8"))
+    assert payload["job_id"] == "manual-other"
+
+
+def test_recovery_rolls_back_if_second_publish_step_fails(tmp_path: Path, monkeypatch) -> None:
+    request = _request(tmp_path)
+    request.local_output_path.parent.mkdir(parents=True, exist_ok=True)
+    request.local_output_path.write_bytes(b"old-video")
+    request.local_report_path.write_text(
+        json.dumps({"engine": "seedvr2", "job_id": request.session_id, "status": "completed"}),
+        encoding="utf-8",
+    )
+    original_replace = Path.replace
+
+    def failing_replace(self: Path, target: Path) -> Path:
+        source_name = str(self.name)
+        if source_name.endswith(".part") and str(target) == str(request.local_report_path):
+            raise OSError("simulated publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(worker_module.Path, "replace", failing_replace)
+    with pytest.raises(RemoteSeedvr2WorkerRecoveryError):
+        recover_remote_seedvr2_results(transport=FakeTransport(), connection=_connection(tmp_path), request=request)
+    assert request.local_output_path.read_bytes() == b"old-video"
+    payload = json.loads(request.local_report_path.read_text(encoding="utf-8"))
+    assert payload["job_id"] == request.session_id
 
 
 def test_execute_remote_seedvr2_worker_emits_progress_before_inference_end(tmp_path: Path) -> None:

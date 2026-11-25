@@ -335,11 +335,81 @@ def _download_seedvr2_artifacts(
     report_tmp = request.local_report_path.with_name(request.local_report_path.name + tmp_suffix)
     output_tmp = request.local_output_path.with_name(request.local_output_path.name + tmp_suffix)
     log_tmp: Path | None = None
+
     def _cleanup_tmp_files() -> None:
         for candidate in (report_tmp, output_tmp, log_tmp):
             if candidate is not None and candidate.exists():
                 candidate.unlink(missing_ok=True)
 
+    def _existing_identity(report_path: Path) -> tuple[str | None, str | None]:
+        if not report_path.exists() or not report_path.is_file():
+            return (None, None)
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return (None, None)
+        if not isinstance(payload, dict):
+            return (None, None)
+        engine = payload.get("engine")
+        job_id = payload.get("job_id")
+        return (
+            str(engine) if isinstance(engine, str) and engine.strip() else None,
+            str(job_id) if isinstance(job_id, str) and job_id.strip() else None,
+        )
+
+    def _guard_overwrite_of_other_execution() -> None:
+        if not request.local_report_path.exists() and not request.local_output_path.exists():
+            return
+        engine, job_id = _existing_identity(request.local_report_path)
+        if engine == "seedvr2" and job_id == request.session_id:
+            return
+        raise RemoteSeedvr2WorkerRecoveryError("Refusing to overwrite existing local artifacts from another execution.")
+
+    def _publish_atomically(*, local_log_path: Path | None, staged_log_path: Path | None) -> None:
+        rollback_suffix = f".rollback.{uuid4().hex[:8]}"
+        backups: dict[str, Path] = {}
+
+        def _backup_if_exists(label: str, final_path: Path) -> None:
+            if final_path.exists():
+                backup_path = final_path.with_name(final_path.name + rollback_suffix)
+                final_path.replace(backup_path)
+                backups[label] = backup_path
+
+        request.local_output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.local_report_path.parent.mkdir(parents=True, exist_ok=True)
+        if local_log_path is not None:
+            local_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            _backup_if_exists("output", request.local_output_path)
+            _backup_if_exists("report", request.local_report_path)
+            if local_log_path is not None:
+                _backup_if_exists("log", local_log_path)
+
+            output_tmp.replace(request.local_output_path)
+            report_tmp.replace(request.local_report_path)
+            if local_log_path is not None and staged_log_path is not None and staged_log_path.exists():
+                staged_log_path.replace(local_log_path)
+        except OSError as exc:
+            if request.local_output_path.exists() and "output" in backups:
+                request.local_output_path.unlink(missing_ok=True)
+            if request.local_report_path.exists() and "report" in backups:
+                request.local_report_path.unlink(missing_ok=True)
+            if local_log_path is not None and local_log_path.exists() and "log" in backups:
+                local_log_path.unlink(missing_ok=True)
+            for label, backup in backups.items():
+                if label == "output":
+                    backup.replace(request.local_output_path)
+                elif label == "report":
+                    backup.replace(request.local_report_path)
+                elif label == "log" and local_log_path is not None:
+                    backup.replace(local_log_path)
+            raise RemoteSeedvr2WorkerRecoveryError(f"Could not publish SeedVR2 local artifacts: {exc}") from exc
+        finally:
+            for backup in backups.values():
+                backup.unlink(missing_ok=True)
+
+    _guard_overwrite_of_other_execution()
     try:
         discovered = _discover_seedvr2_outputs(transport=transport, connection=connection, output_root=paths.output_dir)
     except RemoteSeedvr2WorkerReportError as exc:
@@ -412,25 +482,21 @@ def _download_seedvr2_artifacts(
                 overwrite=True,
             )
         except TransferError:
+            if log_tmp.exists():
+                log_tmp.unlink(missing_ok=True)
             local_log_path = None
             log_tmp = None
 
+    report_payload["engine"] = "seedvr2"
+    report_payload["job_id"] = request.session_id
+    report_payload["artifact_paths"] = {
+        "output": str(request.local_output_path),
+        "report": str(request.local_report_path),
+        "log": str(local_log_path) if local_log_path is not None else None,
+    }
     try:
-        report_payload["engine"] = "seedvr2"
-        report_payload["job_id"] = request.session_id
-        report_payload["artifact_paths"] = {
-            "output": str(request.local_output_path),
-            "report": str(request.local_report_path),
-            "log": str(local_log_path) if local_log_path is not None else None,
-        }
-        report_tmp.parent.mkdir(parents=True, exist_ok=True)
-        request.local_output_path.parent.mkdir(parents=True, exist_ok=True)
         report_tmp.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        output_tmp.replace(request.local_output_path)
-        report_tmp.replace(request.local_report_path)
-        if local_log_path is not None and log_tmp is not None and log_tmp.exists():
-            local_log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_tmp.replace(local_log_path)
+        _publish_atomically(local_log_path=local_log_path, staged_log_path=log_tmp)
     except OSError as exc:
         _cleanup_tmp_files()
         raise RemoteSeedvr2WorkerRecoveryError(f"Could not finalize SeedVR2 local artifacts: {exc}") from exc
