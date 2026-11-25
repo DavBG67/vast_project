@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import threading
 import time
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,14 +46,6 @@ from vast_upscaler.preprocessing_planner import (
     load_analysis_payload_from_file,
 )
 from vast_upscaler.provisioning_history import ProvisioningAttemptTracker
-from vast_upscaler.remote_seedvr2_worker import (
-    RemoteSeedvr2WorkerPreparationError,
-    RemoteSeedvr2WorkerProcessError,
-    RemoteSeedvr2WorkerRecoveryError,
-    Seedvr2RemoteRequest,
-    execute_remote_seedvr2_worker,
-    recover_remote_seedvr2_results,
-)
 from vast_upscaler.remote_worker import (
     RemoteWorkerRequest,
     execute_remote_worker,
@@ -68,11 +58,7 @@ from vast_upscaler.source_analysis import (
     analyze_source_video,
     analyze_source_video_report,
 )
-from vast_upscaler.transfer import (
-    OpenSshTransport,
-    SshConnectionInfo,
-    SshTransportError,
-)
+from vast_upscaler.transfer import OpenSshTransport
 from vast_upscaler.vast_client import VastClient, VastClientConfig
 from vast_upscaler.vast_write_client import InstanceSummary, VastWriteClient
 from vast_upscaler.video import VideoProbeError, inspect_video
@@ -86,19 +72,9 @@ from vast_upscaler.video_excerpt import (
 RunMode = Literal["automatic", "manual"]
 SortBy = Literal["price", "reliability", "performance"]
 SshBootstrapMode = Literal["tofu", "strict"]
-EngineName = Literal["realesrgan", "seedvr2"]
-Seedvr2Profile = Literal["smoke", "reference"]
 
 _DEFAULT_WORKER_IMAGE = ""
 _WORKER_IMAGE_HISTORY_PATH = Path.home() / ".vast_upscaler" / "web_worker_images.json"
-_SEEDVR2_RECOVERY_STATE_PATH = Path.home() / ".vast_upscaler" / "seedvr2_recovery_jobs.json"
-_DEFAULT_ENGINE: EngineName = "realesrgan"
-_SUPPORTED_ENGINES: tuple[EngineName, ...] = ("realesrgan", "seedvr2")
-_SEEDVR2_PROFILES: tuple[Seedvr2Profile, ...] = ("smoke", "reference")
-_WORKER_IMAGE_REPO_BY_ENGINE: dict[EngineName, str] = {
-    "realesrgan": "ghcr.io/davbg67/vast-video-upscaler-worker",
-    "seedvr2": "ghcr.io/davbg67/vast-video-upscaler-seedvr2",
-}
 _WORKER_IMAGE_PLACEHOLDERS = {
     "ghcr.io/acme/worker:test",
     "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>",
@@ -118,7 +94,6 @@ _VIDEO_SOURCE_EXTENSIONS = {
 }
 _VIDEO_SOURCE_EXCLUDED_SUFFIXES = ("-upscaled", "-cropped")
 _ALLOWED_OUTPUT_CONTAINER_EXTENSIONS = {".mp4"}
-_MAX_JOB_EVENTS = 5_000
 
 
 class WebWorkflowCancelled(RuntimeError):
@@ -127,8 +102,6 @@ class WebWorkflowCancelled(RuntimeError):
 
 class StartJobRequest(BaseModel):
     mode: RunMode
-    engine: EngineName = _DEFAULT_ENGINE
-    seedvr2_profile: Seedvr2Profile = "smoke"
     input_path: str | None = None
     source_name: str | None = None
     output_path: str | None = None
@@ -147,18 +120,11 @@ class StartJobRequest(BaseModel):
     excerpt_enabled: bool = False
     excerpt_start: str | None = None
     excerpt_duration_seconds: float = Field(default=10.0, gt=0)
-    recover_seedvr2_job_id: str | None = None
-    execution_id: str | None = None
 
 
 class PromptReplyRequest(BaseModel):
     approved: bool | None = None
     fingerprint: str | None = None
-
-
-class Seedvr2RecoveryRequest(BaseModel):
-    recovery_job_id: str
-    instance_id: int | None = None
 
 
 class SourceAnalysisRequest(BaseModel):
@@ -230,23 +196,15 @@ class _Job:
         self.created_at = datetime.now(UTC).isoformat()
         self.updated_at = self.created_at
         self.status = "pending"
-        self.business_state = "pending"
         self.error: str | None = None
         self.result: WorkflowExecutionResult | None = None
-        self.events: deque[dict[str, Any]] = deque(maxlen=_MAX_JOB_EVENTS)
+        self.events: list[dict[str, Any]] = []
         self.next_event_id = 1
         self.condition = threading.Condition()
         self.thread: threading.Thread | None = None
         self.cancel_requested = False
         self.pending_prompt: dict[str, Any] | None = None
         self.answered_prompt_ids: set[str] = set()
-        self.stage: str = "pending"
-        self.progress: float | None = None
-        self.chunk_current: int | None = None
-        self.chunk_total: int | None = None
-        self.chunks_completed: int | None = None
-        self.started_at: str | None = None
-        self.completed_at: str | None = None
 
     def is_active(self) -> bool:
         return self.status in {"pending", "running"}
@@ -263,23 +221,6 @@ class _Job:
             self.events.append(event)
             self.updated_at = event["timestamp"]
             self.condition.notify_all()
-
-    def elapsed_seconds(self) -> float | None:
-        if self.started_at is None:
-            return None
-        try:
-            started = datetime.fromisoformat(self.started_at)
-        except ValueError:
-            return None
-        finished = self.completed_at or datetime.now(UTC).isoformat()
-        try:
-            ended = datetime.fromisoformat(finished)
-        except ValueError:
-            return None
-        elapsed = (ended - started).total_seconds()
-        if elapsed < 0:
-            return 0.0
-        return round(elapsed, 3)
 
 
 class WebTaskManager:
@@ -299,24 +240,15 @@ class WebTaskManager:
 
     def defaults(self) -> dict[str, Any]:
         settings = load_config(self._config_path)
-        latest_worker_image = _load_latest_known_worker_image(engine=_DEFAULT_ENGINE)
-        latest_worker_image_seedvr2 = _load_latest_known_worker_image(engine="seedvr2")
+        latest_worker_image = _load_latest_known_worker_image()
         return {
-            "default_engine": _DEFAULT_ENGINE,
-            "engines": list(_SUPPORTED_ENGINES),
-            "seedvr2_profiles": list(_SEEDVR2_PROFILES),
             "target_width": settings.video.target_width,
             "target_height": settings.video.target_height,
             "gpu_models": settings.vast.gpu_models,
             "worker_image_latest_known": latest_worker_image,
-            "worker_image_latest_by_engine": {
-                _DEFAULT_ENGINE: latest_worker_image,
-                "seedvr2": latest_worker_image_seedvr2,
-            },
             "worker_image_source": "history" if latest_worker_image else "none",
             "worker_image_required": latest_worker_image == "",
             "ssh_bootstrap_mode": "tofu",
-            "seedvr2_recovery_jobs": _list_seedvr2_recovery_jobs(),
         }
 
     def list_instances(self) -> list[dict[str, Any]]:
@@ -349,8 +281,6 @@ class WebTaskManager:
             "configuration",
             {
                 "mode": request.mode,
-                "engine": _normalize_engine(request.engine),
-                "seedvr2_profile": _normalize_seedvr2_profile(request.seedvr2_profile),
                 "input_path": str(_resolve_input_video_path(request=request)),
                 "source_name": request.source_name,
                 "output_path": str(_resolve_output_path(request=request)),
@@ -419,9 +349,6 @@ class WebTaskManager:
             cursor = max(0, last_event_id)
             while True:
                 with job.condition:
-                    if job.events:
-                        oldest = int(job.events[0]["id"])
-                        cursor = max(cursor, oldest - 1)
                     pending = [e for e in job.events if int(e["id"]) > cursor]
                     if not pending:
                         if not job.is_active():
@@ -438,9 +365,6 @@ class WebTaskManager:
 
     def _run_job(self, job: _Job) -> None:
         job.status = "running"
-        job.business_state = "running"
-        job.started_at = datetime.now(UTC).isoformat()
-        job.stage = "Workflow started."
         job.append_event("status", {"state": "running", "message": "Workflow started."})
         started = time.perf_counter()
         settings = load_config(self._config_path)
@@ -484,21 +408,8 @@ class WebTaskManager:
                 )
             job.result = result
             job.status = "completed"
-            job.business_state = "completed"
-            job.stage = str(result.state or "completed")
-            job.progress = 1.0
-            job.completed_at = datetime.now(UTC).isoformat()
             if job.request.worker_image:
-                try:
-                    _store_latest_worker_image(job.request.worker_image, engine=_normalize_engine(job.request.engine))
-                except (HTTPException, OSError, TypeError, ValueError) as exc:
-                    job.append_event(
-                        "status",
-                        {
-                            "state": "warning",
-                            "message": f"Could not persist latest worker image suggestion: {exc}",
-                        },
-                    )
+                _store_latest_worker_image(job.request.worker_image)
             job.append_event(
                 "result",
                 {
@@ -515,33 +426,20 @@ class WebTaskManager:
             )
         except WebWorkflowCancelled:
             job.status = "cancelled"
-            job.business_state = "cancelled"
             job.error = "Cancelled by operator."
-            job.stage = "cancelled"
-            job.completed_at = datetime.now(UTC).isoformat()
             job.append_event("error", {"message": job.error})
             if job.request.mode == "manual":
                 job.append_event(
-                    "instance",
+                    "status",
                     {"state": "manual-instance-preserved", "message": "Manual mode never destroys the existing instance automatically."},
                 )
         except Exception as exc:  # noqa: BLE001
             job.status = "failed"
-            if isinstance(exc, RemoteSeedvr2WorkerRecoveryError):
-                job.business_state = "failed_recovery"
-            elif isinstance(exc, RemoteSeedvr2WorkerProcessError):
-                job.business_state = "failed_inference"
-            elif isinstance(exc, RemoteSeedvr2WorkerPreparationError):
-                job.business_state = "failed_preparation"
-            else:
-                job.business_state = "failed"
             job.error = str(exc)
-            job.stage = "failed"
-            job.completed_at = datetime.now(UTC).isoformat()
             job.append_event("error", {"message": str(exc)})
             if job.request.mode == "manual":
                 job.append_event(
-                    "instance",
+                    "status",
                     {"state": "manual-instance-preserved", "message": "Manual mode never destroys the existing instance automatically."},
                 )
         finally:
@@ -553,39 +451,10 @@ class WebTaskManager:
 
     def _on_provisioning(self, job: _Job, payload: dict[str, str]) -> None:
         self._raise_if_cancelled(job)
-        phase = str(payload.get("phase") or payload.get("status") or "").strip()
-        if phase:
-            job.stage = phase
         job.append_event("provisioning", payload)
 
     def _on_worker_progress(self, job: _Job, payload: dict[str, object]) -> None:
         self._raise_if_cancelled(job)
-        kind = str(payload.get("kind") or "")
-        stage = str(payload.get("stage") or "")
-        status = str(payload.get("status") or "")
-        if kind == "transfer" and stage == "download" and status == "started":
-            job.business_state = "inference_succeeded_recovering"
-            job.stage = "download"
-            job.append_event("status", {"state": "inference_succeeded_recovering", "message": "Inference finished, downloading artifacts."})
-        elif stage and job.business_state != "inference_succeeded_recovering":
-            job.business_state = "running"
-            job.stage = stage
-        if stage:
-            job.stage = stage
-        progress_value = payload.get("progress")
-        if isinstance(progress_value, (int, float)):
-            clamped = max(0.0, min(1.0, float(progress_value)))
-            if job.progress is None or clamped >= job.progress:
-                job.progress = clamped
-        chunk_current = payload.get("chunk_current")
-        chunk_total = payload.get("chunk_total")
-        chunks_completed = payload.get("chunks_completed")
-        if isinstance(chunk_current, int) and chunk_current >= 0:
-            job.chunk_current = chunk_current
-        if isinstance(chunk_total, int) and chunk_total > 0:
-            job.chunk_total = chunk_total
-        if isinstance(chunks_completed, int) and chunks_completed >= 0:
-            job.chunks_completed = chunks_completed
         job.append_event("worker", payload)
 
     def _await_boolean_prompt(self, *, job: _Job, kind: str, message: str) -> bool:
@@ -635,29 +504,14 @@ class WebTaskManager:
 
     @staticmethod
     def _job_snapshot(job: _Job) -> dict[str, Any]:
-        latest_event_id = int(job.events[-1]["id"]) if job.events else 0
-        oldest_event_id = int(job.events[0]["id"]) if job.events else 0
         payload: dict[str, Any] = {
             "job_id": job.job_id,
             "status": job.status,
-            "business_state": job.business_state,
             "mode": job.request.mode,
-            "engine": _normalize_engine(job.request.engine),
-            "seedvr2_profile": _normalize_seedvr2_profile(job.request.seedvr2_profile),
             "created_at": job.created_at,
             "updated_at": job.updated_at,
             "error": job.error,
             "pending_prompt": None,
-            "latest_event_id": latest_event_id,
-            "oldest_event_id": oldest_event_id,
-            "stage": job.stage,
-            "progress": job.progress,
-            "chunk_current": job.chunk_current,
-            "chunk_total": job.chunk_total,
-            "chunks_completed": job.chunks_completed,
-            "started_at": job.started_at,
-            "completed_at": job.completed_at,
-            "elapsed_seconds": job.elapsed_seconds(),
         }
         if job.pending_prompt is not None:
             payload["pending_prompt"] = {
@@ -683,14 +537,6 @@ class WebTaskManager:
 
     @staticmethod
     def _validate_paths(*, request: StartJobRequest) -> None:
-        recovery_job_id = (request.recover_seedvr2_job_id or "").strip()
-        if recovery_job_id:
-            engine = _normalize_engine(request.engine)
-            if engine != "seedvr2" or request.mode != "manual":
-                raise HTTPException(status_code=400, detail="SeedVR2 recovery requires manual mode and engine=seedvr2.")
-            _normalize_seedvr2_profile(request.seedvr2_profile)
-            return
-
         source_name = (request.source_name or "").strip()
         input_path_raw = (request.input_path or "").strip()
         if source_name and input_path_raw:
@@ -731,9 +577,7 @@ class WebTaskManager:
         if request.preprocessing_plan_payload is not None and not isinstance(request.preprocessing_plan_payload, dict):
             raise HTTPException(status_code=400, detail="preprocessing_plan_payload must be a JSON object.")
         if request.mode == "automatic":
-            if _normalize_engine(request.engine) == "seedvr2":
-                raise HTTPException(status_code=400, detail="SeedVR2 is available in manual mode only.")
-            image = (request.worker_image or _load_latest_known_worker_image(engine=_normalize_engine(request.engine))).strip()
+            image = (request.worker_image or _load_latest_known_worker_image()).strip()
             if not image:
                 raise HTTPException(
                     status_code=400,
@@ -741,19 +585,10 @@ class WebTaskManager:
                 )
             if image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
                 raise HTTPException(status_code=400, detail=f"Refusing placeholder worker image tag: {image}")
-        engine = _normalize_engine(request.engine)
-        _normalize_seedvr2_profile(request.seedvr2_profile)
-        if engine == "seedvr2" and request.mode != "manual":
-            raise HTTPException(status_code=400, detail="SeedVR2 is available in manual mode only.")
-        if request.worker_image:
-            _ensure_image_repository_matches_engine(image=request.worker_image, engine=engine)
 
 
 def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
     callbacks.raise_if_cancelled()
-    engine = _normalize_engine(request.engine)
-    if engine != "realesrgan":
-        raise OrchestrationError("Automatic mode currently supports Real-ESRGAN only.")
     effective_settings = settings.model_copy(deep=True)
     if request.gpu_model:
         effective_settings.vast.gpu_models = [request.gpu_model]
@@ -764,12 +599,11 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
     effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
     input_path = effective_input.input_path
     preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
-    worker_image = (request.worker_image or _load_latest_known_worker_image(engine=engine)).strip()
+    worker_image = (request.worker_image or _load_latest_known_worker_image()).strip()
     if not worker_image:
         raise OrchestrationError("Worker image tag is required.")
     if worker_image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
         raise OrchestrationError(f"Refusing placeholder worker image tag: {worker_image}")
-    _ensure_image_repository_matches_engine(image=worker_image, engine=engine)
     callbacks.report_provisioning_status(
         {
             "phase": "worker-image",
@@ -819,11 +653,10 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
             final_report_path = (
                 summary.worker_result.local_report_path if summary.worker_result is not None else report_path
             )
-            if effective_input is not None:
-                _safe_merge_report_metadata(
-                    report_path=final_report_path,
-                    metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-                )
+            _safe_merge_report_metadata(
+                report_path=final_report_path,
+                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+            )
             return WorkflowExecutionResult(
                 mode="automatic",
                 session_id=summary.session_id,
@@ -838,11 +671,10 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
                 cleanup_warning=summary.cleanup_warning,
             )
         except Exception:
-            if effective_input is not None:
-                _safe_merge_report_metadata(
-                    report_path=report_path,
-                    metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-                )
+            _safe_merge_report_metadata(
+                report_path=report_path,
+                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
+            )
             raise
     finally:
         _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
@@ -852,45 +684,20 @@ def _default_auto_runner(request: StartJobRequest, settings: Settings, callbacks
 
 def _default_manual_runner(request: StartJobRequest, settings: Settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
     callbacks.raise_if_cancelled()
-    recovery_job_id = (request.recover_seedvr2_job_id or "").strip() or None
-    if request.instance_id is None and recovery_job_id is None:
+    if request.instance_id is None:
         raise OrchestrationError("Manual mode requires an existing Vast instance id.")
-    engine = _normalize_engine(request.engine)
-    if recovery_job_id and engine != "seedvr2":
-        raise OrchestrationError("Recovery-only mode is available for SeedVR2 manual jobs only.")
-    seedvr2_profile = _normalize_seedvr2_profile(request.seedvr2_profile)
-    effective_worker_image = (request.worker_image or _load_latest_known_worker_image(engine=engine)).strip() or None
-    if effective_worker_image:
-        _ensure_image_repository_matches_engine(image=effective_worker_image, engine=engine)
 
-    effective_input: _EffectiveJobInput | None = None
-    preprocessing_contract = None
-    if recovery_job_id:
-        recovery_record = _load_seedvr2_recovery_job(recovery_job_id)
-        output_path = Path(str(recovery_record["local_output_path"]))
-        report_path = Path(str(recovery_record["local_report_path"]))
-        input_path = Path(str(recovery_record.get("local_input_path") or output_path))
-        if request.instance_id is None:
-            request.instance_id = int(recovery_record["instance_id"])
-    else:
-        output_path = _resolve_output_path(request=request)
-        report_path = _resolve_report_path(request=request, output_path=output_path)
-        source_path = _resolve_input_video_path(request=request)
-        effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
-        input_path = effective_input.input_path
-        preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
+    output_path = _resolve_output_path(request=request)
+    report_path = _resolve_report_path(request=request, output_path=output_path)
+    source_path = _resolve_input_video_path(request=request)
+    effective_input = _prepare_effective_job_input(request=request, source_path=source_path, job_prefix="job-excerpt")
+    input_path = effective_input.input_path
+    preprocessing_contract = _resolve_remote_preprocessing_contract(request=request)
 
     transport = OpenSshTransport()
     write_client = _build_write_client(settings)
     started = time.perf_counter()
     instance: InstanceSummary | None = None
-    worker_image_identity: dict[str, Any] = {
-        "requested": (request.worker_image or "").strip() or None,
-        "suggested_or_expected": effective_worker_image,
-        "instance_declared": None,
-        "expected_repository": _WORKER_IMAGE_REPO_BY_ENGINE[engine],
-        "verification_level": "not-checked",
-    }
     callbacks.report_provisioning_status(
         {
             "phase": "worker-image",
@@ -925,7 +732,7 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                     input_path=input_path,
                     output_path=output_path,
                     report_path=report_path,
-                    worker_image=effective_worker_image or "",
+                    worker_image=request.worker_image or _load_latest_known_worker_image(),
                     profile=settings.video.default_profile,
                     target_width=request.target_width or settings.video.target_width,
                     target_height=request.target_height or settings.video.target_height,
@@ -938,18 +745,6 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             request_verified_fingerprint=lambda message: callbacks.request_verified_fingerprint(message),
         )
         transport.check_ssh_ready(connection, timeout_seconds=30.0)
-        _run_manual_engine_preflight(
-            transport=transport,
-            connection=connection,
-            engine=engine,
-        )
-        worker_image_identity = _check_manual_instance_image_compatibility(
-            instance=instance,
-            requested_image=request.worker_image,
-            effective_worker_image=effective_worker_image,
-            engine=engine,
-            callbacks=callbacks,
-        )
         callbacks.report_provisioning_status(
             {
                 "phase": "manual-warning",
@@ -960,129 +755,39 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
                 "status_message": "Manual mode does not destroy the instance automatically. Billing continues.",
             }
         )
-        if engine == "seedvr2":
-            if recovery_job_id:
-                callbacks.report_worker_progress({"kind": "worker", "stage": "artifact-recovery", "status": "started", "determinate": False})
-                remote_root_base = str(recovery_record.get("remote_root_base") or "/workspace/seedvr2-sessions")
-                remote_session_id = str(recovery_record.get("remote_session_id") or recovery_job_id)
-                worker_result = recover_remote_seedvr2_results(
-                    transport=transport,
-                    connection=connection,
-                    request=Seedvr2RemoteRequest(
-                        session_id=remote_session_id,
-                        local_input_path=input_path,
-                        local_output_path=output_path,
-                        local_report_path=report_path,
-                        profile=seedvr2_profile,
-                        remote_root_base=remote_root_base,
-                    ),
-                    progress_callback=lambda payload: callbacks.report_worker_progress(payload),
-                )
-                _update_seedvr2_recovery_job_state(
-                    recovery_job_id=recovery_job_id,
-                    inference_state="completed",
-                    recovery_state="completed",
-                )
-            else:
-                callbacks.report_worker_progress(
-                    {
-                        "kind": "worker",
-                        "stage": "seedvr2-prepared",
-                        "progress": 0.05,
-                        "message": f"SeedVR2 profile '{seedvr2_profile}' selected (input excerpt prepared locally).",
-                    }
-                )
-                remote_session_id = f"manual-{uuid4().hex[:12]}"
-                _upsert_seedvr2_recovery_job(
-                    {
-                        "recovery_job_id": remote_session_id,
-                        "created_at": datetime.now(UTC).isoformat(),
-                        "updated_at": datetime.now(UTC).isoformat(),
-                        "instance_id": instance.instance_id,
-                        "engine": "seedvr2",
-                        "seedvr2_profile": seedvr2_profile,
-                        "remote_root_base": "/workspace/seedvr2-sessions",
-                        "remote_session_id": remote_session_id,
-                        "ssh_host": instance.ssh_host,
-                        "ssh_port": instance.ssh_port,
-                        "local_input_path": str(input_path),
-                        "local_output_path": str(output_path),
-                        "local_report_path": str(report_path),
-                        "inference_state": "running",
-                        "recovery_state": "pending",
-                    }
-                )
-                worker_result = execute_remote_seedvr2_worker(
-                    transport=transport,
-                    connection=connection,
-                    request=Seedvr2RemoteRequest(
-                        session_id=remote_session_id,
-                        local_input_path=input_path,
-                        local_output_path=output_path,
-                        local_report_path=report_path,
-                        profile=seedvr2_profile,
-                    ),
-                    progress_callback=lambda payload: callbacks.report_worker_progress(payload),
-                )
-                _update_seedvr2_recovery_job_state(
-                    recovery_job_id=remote_session_id,
-                    inference_state="completed",
-                    recovery_state="completed",
-                )
-            final_report_path = worker_result.local_report_path
-        else:
-            worker_result = execute_remote_worker(
-                transport=transport,
-                connection=connection,
-                request=RemoteWorkerRequest(
-                    session_id=f"manual-{uuid4().hex[:12]}",
-                    local_input_path=input_path,
-                    local_output_path=output_path,
-                    local_report_path=report_path,
-                    target_width=request.target_width or settings.video.target_width,
-                    target_height=request.target_height or settings.video.target_height,
-                    profile=settings.video.default_profile,
-                    preprocessing_contract=preprocessing_contract,
-                ),
-                progress_callback=lambda payload: callbacks.report_worker_progress(payload),
-            )
-            final_report_path = worker_result.local_report_path
+        worker_result = execute_remote_worker(
+            transport=transport,
+            connection=connection,
+            request=RemoteWorkerRequest(
+                session_id=f"manual-{uuid4().hex[:12]}",
+                local_input_path=input_path,
+                local_output_path=output_path,
+                local_report_path=report_path,
+                target_width=request.target_width or settings.video.target_width,
+                target_height=request.target_height or settings.video.target_height,
+                profile=settings.video.default_profile,
+                preprocessing_contract=preprocessing_contract,
+            ),
+            progress_callback=lambda payload: callbacks.report_worker_progress(payload),
+        )
         enrich_local_report_with_vast_metadata(
-            report_path=final_report_path,
+            report_path=worker_result.local_report_path,
             mode="manual",
             requested_worker_image=request.worker_image,
             instance=instance,
             offer=None,
         )
         _safe_merge_report_metadata(
-            report_path=final_report_path,
-            metadata={
-                "engine": {
-                    "requested": request.engine,
-                    "effective": engine,
-                    "seedvr2_profile": seedvr2_profile if engine == "seedvr2" else None,
-                },
-                "worker_image": {
-                    "requested": worker_image_identity["requested"],
-                    "suggested_or_expected": worker_image_identity["suggested_or_expected"],
-                    "instance_declared": worker_image_identity["instance_declared"],
-                    "expected_repository": worker_image_identity["expected_repository"],
-                    "verification_level": worker_image_identity["verification_level"],
-                },
-            },
+            report_path=worker_result.local_report_path,
+            metadata=_build_excerpt_report_metadata(effective_input=effective_input),
         )
-        if effective_input is not None:
-            _safe_merge_report_metadata(
-                report_path=final_report_path,
-                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-            )
         elapsed = time.perf_counter() - started
         return WorkflowExecutionResult(
             mode="manual",
             session_id=None,
             state="COMPLETED",
             output_path=str(worker_result.local_output_path),
-            report_path=str(final_report_path),
+            report_path=str(worker_result.local_report_path),
             duration_seconds=elapsed,
             estimated_total_usd=None,
             instance_id=instance.instance_id,
@@ -1090,48 +795,6 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
             cleanup_verified=False,
             cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
         )
-    except RemoteSeedvr2WorkerRecoveryError:
-        if recovery_job_id and engine == "seedvr2":
-            _update_seedvr2_recovery_job_state(
-                recovery_job_id=recovery_job_id,
-                inference_state="completed",
-                recovery_state="failed",
-            )
-        elif engine == "seedvr2":
-            _update_seedvr2_recovery_job_state(
-                recovery_job_id=remote_session_id,  # type: ignore[name-defined]
-                inference_state="completed",
-                recovery_state="failed",
-            )
-        raise
-    except RemoteSeedvr2WorkerPreparationError:
-        if recovery_job_id and engine == "seedvr2":
-            _update_seedvr2_recovery_job_state(
-                recovery_job_id=recovery_job_id,
-                inference_state="failed",
-                recovery_state="pending",
-            )
-        elif engine == "seedvr2":
-            _update_seedvr2_recovery_job_state(
-                recovery_job_id=remote_session_id,  # type: ignore[name-defined]
-                inference_state="failed",
-                recovery_state="pending",
-            )
-        raise
-    except RemoteSeedvr2WorkerProcessError:
-        if recovery_job_id and engine == "seedvr2":
-            _update_seedvr2_recovery_job_state(
-                recovery_job_id=recovery_job_id,
-                inference_state="failed",
-                recovery_state="pending",
-            )
-        elif engine == "seedvr2":
-            _update_seedvr2_recovery_job_state(
-                recovery_job_id=remote_session_id,  # type: ignore[name-defined]
-                inference_state="failed",
-                recovery_state="pending",
-            )
-        raise
     except Exception:
         enrich_local_report_with_vast_metadata(
             report_path=report_path,
@@ -1142,30 +805,11 @@ def _default_manual_runner(request: StartJobRequest, settings: Settings, callbac
         )
         _safe_merge_report_metadata(
             report_path=report_path,
-            metadata={
-                "engine": {
-                    "requested": request.engine,
-                    "effective": engine,
-                    "seedvr2_profile": seedvr2_profile if engine == "seedvr2" else None,
-                },
-                "worker_image": {
-                    "requested": worker_image_identity["requested"],
-                    "suggested_or_expected": worker_image_identity["suggested_or_expected"],
-                    "instance_declared": worker_image_identity["instance_declared"],
-                    "expected_repository": worker_image_identity["expected_repository"],
-                    "verification_level": worker_image_identity["verification_level"],
-                },
-            },
+            metadata=_build_excerpt_report_metadata(effective_input=effective_input),
         )
-        if effective_input is not None:
-            _safe_merge_report_metadata(
-                report_path=report_path,
-                metadata=_build_excerpt_report_metadata(effective_input=effective_input),
-            )
         raise
     finally:
-        if effective_input is not None:
-            _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
+        _cleanup_job_excerpt(effective_input.cleanup_excerpt_path)
         write_client.close()
 
 
@@ -1187,27 +831,13 @@ def _resolve_output_path(*, request: StartJobRequest) -> Path:
     if request.output_path:
         return Path(request.output_path)
     source = _resolve_input_video_path(request=request)
-    engine = _normalize_engine(request.engine)
-    execution_id = _ensure_execution_id(request)
-    return source.with_name(f"{source.stem}-upscaled-{engine}-{execution_id}.mp4")
+    return source.with_name(f"{source.stem}-upscaled.mp4")
 
 
 def _resolve_report_path(*, request: StartJobRequest, output_path: Path) -> Path:
     if request.report_path:
         return Path(request.report_path)
     return output_path.with_suffix(output_path.suffix + ".report.json")
-
-
-def _ensure_execution_id(request: StartJobRequest) -> str:
-    current = (request.execution_id or "").strip().lower()
-    if current:
-        normalized = re.sub(r"[^a-z0-9-]+", "-", current).strip("-")
-        if normalized:
-            request.execution_id = normalized
-            return normalized
-    generated = datetime.now(UTC).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:6]
-    request.execution_id = generated
-    return generated
 
 
 def _resolve_remote_preprocessing_contract(*, request: StartJobRequest) -> dict[str, Any] | None:
@@ -1505,270 +1135,31 @@ def _preview_dimensions_from_plan_payload(plan_payload: dict[str, Any]) -> dict[
     return {"width": out_width, "height": out_height}
 
 
-def _normalize_engine(value: str | None) -> EngineName:
-    candidate = (value or _DEFAULT_ENGINE).strip().lower()
-    if candidate in _SUPPORTED_ENGINES:
-        return candidate  # type: ignore[return-value]
-    raise HTTPException(status_code=400, detail=f"Unsupported engine: {value}")
-
-
-def _normalize_seedvr2_profile(value: str | None) -> Seedvr2Profile:
-    candidate = (value or "smoke").strip().lower()
-    if candidate in _SEEDVR2_PROFILES:
-        return candidate  # type: ignore[return-value]
-    raise HTTPException(status_code=400, detail=f"Unsupported SeedVR2 profile: {value}")
-
-
-def _parse_image_repository(image: str) -> str | None:
-    text = image.strip()
-    if not text or text.lower() in _WORKER_IMAGE_PLACEHOLDERS:
-        return None
-    repository = text.split("@", 1)[0].split(":", 1)[0].strip()
-    if not repository:
-        return None
-    if not re.fullmatch(r"[A-Za-z0-9._/-]+", repository):
-        return None
-    return repository.lower()
-
-
-def _ensure_image_repository_matches_engine(*, image: str, engine: EngineName) -> None:
-    parsed_repo = _parse_image_repository(image)
-    if parsed_repo is None:
-        raise HTTPException(status_code=400, detail=f"Invalid worker image reference: {image}")
-    expected_repo = _WORKER_IMAGE_REPO_BY_ENGINE[engine]
-    if parsed_repo != expected_repo:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Worker image repository mismatch for engine '{engine}': expected {expected_repo}, got {parsed_repo}.",
-        )
-
-
-def _read_worker_image_history_payload() -> dict[str, Any]:
+def _load_latest_known_worker_image() -> str:
     try:
         payload = json.loads(_WORKER_IMAGE_HISTORY_PATH.read_text(encoding="utf-8"))
     except OSError:
-        return {}
+        return _DEFAULT_WORKER_IMAGE
     except json.JSONDecodeError:
-        return {}
+        return _DEFAULT_WORKER_IMAGE
     if not isinstance(payload, dict):
-        return {}
-    return payload
-
-
-def _load_latest_known_worker_image(*, engine: EngineName = _DEFAULT_ENGINE) -> str:
-    payload = _read_worker_image_history_payload()
-    expected_repo = _WORKER_IMAGE_REPO_BY_ENGINE[engine]
-
-    def _normalized_if_compatible(value: object) -> str | None:
-        if not isinstance(value, str):
-            return None
+        return _DEFAULT_WORKER_IMAGE
+    value = payload.get("latest")
+    if isinstance(value, str):
         normalized = value.strip()
-        if not normalized or normalized.lower() in _WORKER_IMAGE_PLACEHOLDERS:
-            return None
-        repository = _parse_image_repository(normalized)
-        if repository != expected_repo:
-            return None
-        return normalized
-
-    engines = payload.get("engines")
-    if isinstance(engines, dict):
-        entry = engines.get(engine)
-        if isinstance(entry, dict):
-            compatible = _normalized_if_compatible(entry.get("latest"))
-            if compatible is not None:
-                return compatible
-    if engine == _DEFAULT_ENGINE:
-        compatible = _normalized_if_compatible(payload.get("latest"))
-        if compatible is not None:
-            return compatible
+        if normalized and normalized.lower() not in _WORKER_IMAGE_PLACEHOLDERS:
+            return normalized
     return _DEFAULT_WORKER_IMAGE
 
 
-def _store_latest_worker_image(value: str, *, engine: EngineName = _DEFAULT_ENGINE) -> None:
+def _store_latest_worker_image(value: str) -> None:
     image = value.strip()
     if not image:
         return
     if image.lower() in _WORKER_IMAGE_PLACEHOLDERS:
         return
-    _ensure_image_repository_matches_engine(image=image, engine=engine)
-    payload = _read_worker_image_history_payload()
-    engines = payload.get("engines")
-    if not isinstance(engines, dict):
-        engines = {}
-    engine_entry = engines.get(engine)
-    if not isinstance(engine_entry, dict):
-        engine_entry = {}
-    engine_entry["latest"] = image
-    engines[engine] = engine_entry
-    payload["engines"] = engines
-    if engine == _DEFAULT_ENGINE:
-        payload["latest"] = image
     _WORKER_IMAGE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _WORKER_IMAGE_HISTORY_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _read_seedvr2_recovery_payload() -> dict[str, Any]:
-    try:
-        payload = json.loads(_SEEDVR2_RECOVERY_STATE_PATH.read_text(encoding="utf-8"))
-    except OSError:
-        return {"jobs": {}}
-    except json.JSONDecodeError:
-        return {"jobs": {}}
-    if not isinstance(payload, dict):
-        return {"jobs": {}}
-    jobs = payload.get("jobs")
-    if not isinstance(jobs, dict):
-        payload["jobs"] = {}
-    return payload
-
-
-def _write_seedvr2_recovery_payload(payload: dict[str, Any]) -> None:
-    _SEEDVR2_RECOVERY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _SEEDVR2_RECOVERY_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _upsert_seedvr2_recovery_job(job_payload: dict[str, Any]) -> None:
-    payload = _read_seedvr2_recovery_payload()
-    jobs = payload.setdefault("jobs", {})
-    assert isinstance(jobs, dict)
-    jobs[job_payload["recovery_job_id"]] = job_payload
-    _write_seedvr2_recovery_payload(payload)
-
-
-def _update_seedvr2_recovery_job_state(*, recovery_job_id: str, inference_state: str | None = None, recovery_state: str | None = None) -> None:
-    payload = _read_seedvr2_recovery_payload()
-    jobs = payload.get("jobs")
-    if not isinstance(jobs, dict):
-        return
-    record = jobs.get(recovery_job_id)
-    if not isinstance(record, dict):
-        return
-    if inference_state is not None:
-        record["inference_state"] = inference_state
-    if recovery_state is not None:
-        record["recovery_state"] = recovery_state
-    record["updated_at"] = datetime.now(UTC).isoformat()
-    jobs[recovery_job_id] = record
-    _write_seedvr2_recovery_payload(payload)
-
-
-def _load_seedvr2_recovery_job(recovery_job_id: str) -> dict[str, Any]:
-    payload = _read_seedvr2_recovery_payload()
-    jobs = payload.get("jobs")
-    if not isinstance(jobs, dict):
-        raise HTTPException(status_code=404, detail="No SeedVR2 recovery metadata available.")
-    record = jobs.get(recovery_job_id)
-    if not isinstance(record, dict):
-        raise HTTPException(status_code=404, detail=f"Unknown SeedVR2 recovery job: {recovery_job_id}")
-    return record
-
-
-def _list_seedvr2_recovery_jobs() -> list[dict[str, Any]]:
-    payload = _read_seedvr2_recovery_payload()
-    jobs = payload.get("jobs")
-    if not isinstance(jobs, dict):
-        return []
-    rows = [value for value in jobs.values() if isinstance(value, dict)]
-    rows.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
-    return rows[:50]
-
-
-def _run_manual_engine_preflight(
-    *,
-    transport: OpenSshTransport,
-    connection: SshConnectionInfo,
-    engine: EngineName,
-) -> None:
-    if engine == "seedvr2":
-        command: list[str] = ["/opt/seedvr2-venv/bin/python", "/opt/prototype/seedvr2_prototype.py", "--help"]
-    else:
-        command = ["python", "-c", "import torch; from app.worker.process import run_pipeline; print(torch.__version__)"]
-    try:
-        result = transport.run_remote_command(
-            connection,
-            command=command,
-            timeout_seconds=30.0,
-            check=True,
-        )
-        if engine == "seedvr2" and "--input-is-excerpt" not in (result.stdout or ""):
-            raise OrchestrationError(
-                "SeedVR2 runner is incompatible with current web contract: '--input-is-excerpt' is missing. "
-                "Publish and use a newer SeedVR2 image tag built from this branch."
-            )
-    except SshTransportError as exc:
-        raise OrchestrationError(f"Engine preflight failed for {engine}: {exc}") from exc
-
-
-def _check_manual_instance_image_compatibility(
-    *,
-    instance: InstanceSummary,
-    requested_image: str | None,
-    effective_worker_image: str | None,
-    engine: EngineName,
-    callbacks: RunCallbacks,
-) -> dict[str, Any]:
-    instance_id = getattr(instance, "instance_id", "n/a")
-    gpu_name = getattr(instance, "gpu_name", None) or "unknown"
-    ssh_host = getattr(instance, "ssh_host", None) or "unknown"
-    actual_image = (getattr(instance, "image_name", None) or "").strip() or None
-    expected_repo = _WORKER_IMAGE_REPO_BY_ENGINE[engine]
-    expected_image = (requested_image or "").strip() or effective_worker_image
-    metadata: dict[str, Any] = {
-        "requested": (requested_image or "").strip() or None,
-        "suggested_or_expected": expected_image,
-        "instance_declared": actual_image,
-        "expected_repository": expected_repo,
-        "verification_level": "unverified",
-    }
-    if actual_image is None:
-        callbacks.report_provisioning_status(
-            {
-                "phase": "image-compatibility",
-                "instance_id": str(instance_id),
-                "gpu": gpu_name,
-                "host": ssh_host,
-                "status": "unverified",
-                "status_message": f"Instance image metadata unavailable; expected repository: {expected_repo}.",
-            }
-        )
-        return metadata
-    parsed_repo = _parse_image_repository(actual_image)
-    if parsed_repo is None:
-        callbacks.report_provisioning_status(
-            {
-                "phase": "image-compatibility",
-                "instance_id": str(instance_id),
-                "gpu": gpu_name,
-                "host": ssh_host,
-                "status": "unverified",
-                "status_message": f"Could not parse instance image metadata '{actual_image}'.",
-            }
-        )
-        return metadata
-    if parsed_repo != expected_repo:
-        raise OrchestrationError(
-            f"Selected engine '{engine}' is incompatible with instance image '{actual_image}' (repo={parsed_repo}). "
-            f"Expected repository: {expected_repo}."
-        )
-    metadata["verification_level"] = "repository-match"
-    if expected_image and actual_image != expected_image:
-        callbacks.report_provisioning_status(
-            {
-                "phase": "image-compatibility",
-                "instance_id": str(instance_id),
-                "gpu": gpu_name,
-                "host": ssh_host,
-                "status": "repo-match-tag-unverified",
-                "status_message": (
-                    f"Instance repository matches {expected_repo}, but exact tag differs "
-                    f"(expected {expected_image}, actual {actual_image})."
-                ),
-            }
-        )
-        metadata["verification_level"] = "repository-match-tag-different"
-    elif expected_image and actual_image == expected_image:
-        metadata["verification_level"] = "exact-match"
-    return metadata
+    _WORKER_IMAGE_HISTORY_PATH.write_text(json.dumps({"latest": image}, indent=2), encoding="utf-8")
 
 
 def create_app(
@@ -1899,35 +1290,9 @@ def create_app(
     def api_instances() -> dict[str, Any]:
         return {"instances": manager.list_instances()}
 
-    @app.get("/api/seedvr2/recoveries")
-    def api_seedvr2_recoveries() -> dict[str, Any]:
-        return {"jobs": _list_seedvr2_recovery_jobs()}
-
     @app.post("/api/jobs/start")
     def api_start(request: StartJobRequest) -> dict[str, Any]:
         return manager.start_job(request)
-
-    @app.post("/api/jobs/recover-seedvr2")
-    def api_recover_seedvr2(request: Seedvr2RecoveryRequest) -> dict[str, Any]:
-        recovery = _load_seedvr2_recovery_job(request.recovery_job_id)
-        recovery_instance_id = int(recovery.get("instance_id"))
-        if request.instance_id is not None and request.instance_id != recovery_instance_id:
-            raise HTTPException(status_code=400, detail="Recovery job does not match the selected instance id.")
-        profile = str(recovery.get("seedvr2_profile") or "smoke")
-        input_path = str(recovery.get("local_input_path") or "").strip()
-        output_path = str(recovery.get("local_output_path") or "").strip()
-        report_path = str(recovery.get("local_report_path") or "").strip()
-        start_request = StartJobRequest(
-            mode="manual",
-            engine="seedvr2",
-            seedvr2_profile=profile,
-            input_path=input_path,
-            output_path=output_path,
-            report_path=report_path,
-            instance_id=recovery_instance_id,
-            recover_seedvr2_job_id=request.recovery_job_id,
-        )
-        return manager.start_job(start_request)
 
     @app.get("/api/jobs/{job_id}")
     def api_job(job_id: str) -> dict[str, Any]:
@@ -2379,18 +1744,6 @@ _INDEX_HTML = """
 
     <fieldset>
       <legend><span class="step-badge">4</span>Configurer et lancer l’upscale</legend>
-      <label for="engine">Moteur
-        <select id="engine">
-          <option value="realesrgan">Real-ESRGAN (stable)</option>
-          <option value="seedvr2">SeedVR2 (expérimental, manuel)</option>
-        </select>
-      </label>
-      <label for="seedvr2_profile">Profil SeedVR2
-        <select id="seedvr2_profile">
-          <option value="smoke">smoke</option>
-          <option value="reference">reference</option>
-        </select>
-      </label>
       <label for="mode">Mode Vast.ai
         <select id="mode">
           <option value="automatic">Automatique (recherche, création, traitement, nettoyage)</option>
@@ -2407,7 +1760,7 @@ _INDEX_HTML = """
       <label for="worker_image">Image Docker worker (tag/version)
         <input id="worker_image" />
       </label>
-      <div class="muted">Le tag proposé est le dernier connu pour le moteur sélectionné. Le dépôt doit correspondre au moteur choisi. En mode manuel, changer ce champ ne modifie pas l’image d’une instance déjà démarrée.</div>
+      <div class="muted">Le tag proposé est le dernier connu localement. En mode manuel, changer ce champ ne modifie pas l’image d’une instance déjà démarrée.</div>
       <label for="gpu_model">Modèle GPU <select id="gpu_model"></select></label>
       <label for="sort_by">Tri des offres (mode automatique)
         <select id="sort_by">
@@ -2436,10 +1789,6 @@ _INDEX_HTML = """
     <div class="actions">
       <button type="submit">Lancer le traitement</button>
       <button type="button" id="cancel-btn" class="secondary">Annuler</button>
-      <select id="recovery_job_id" class="secondary">
-        <option value="">-- Récupération SeedVR2 (job distant) --</option>
-      </select>
-      <button type="button" id="recover-btn" class="secondary">Récupérer les résultats</button>
     </div>
     </form>
 
@@ -2471,60 +1820,21 @@ _INDEX_HTML = """
 
   <script>
     let currentJobId = null;
-    let lastConsumedEventId = 0;
-    let latestSnapshotEventId = 0;
+    let lastEventId = 0;
     let es = null;
-    let trackedJobVersion = 0;
-    let sseRetryCount = 0;
-    let sseReconnectTimer = null;
-    let snapshotPollTimer = null;
-    let snapshotRefreshTimer = null;
-    let activePromptId = null;
     let promptDialogOpen = false;
     let latestAnalysisPayload = null;
     let latestPlanPayload = null;
     let analysisRequestToken = 0;
-    let currentBusinessState = "idle";
-    let latestWorkerImageByEngine = { realesrgan: "", seedvr2: "" };
-    let latestRecoveryJobs = [];
-    const expectedWorkerRepoByEngine = {
-      realesrgan: "ghcr.io/davbg67/vast-video-upscaler-worker",
-      seedvr2: "ghcr.io/davbg67/vast-video-upscaler-seedvr2",
-    };
     let sourcesIndex = new Map();
     let currentJobStartedAt = null;
-    let currentStageLabel = "n/a";
-    let latestProgressRatio = null;
-    let latestChunkProgress = null;
     const handledPromptIds = new Set();
     const unsupportedRemoteOps = new Set(["deinterlace", "denoise", "deblock"]);
-    const ACTIVE_JOB_STATUSES = new Set(["pending", "running"]);
-    const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
-    const MAX_EVENT_LINES = 1000;
-    const EVENT_FLUSH_INTERVAL_MS = 100;
-    const eventLines = [];
-    let eventFlushScheduled = false;
 
     function appendEvent(msg) {
-      eventLines.push(msg);
-      if (eventLines.length > MAX_EVENT_LINES) {
-        eventLines.shift();
-      }
-      if (eventFlushScheduled) return;
-      eventFlushScheduled = true;
-      setTimeout(() => {
-        eventFlushScheduled = false;
-        const box = document.getElementById("events");
-        box.textContent = eventLines.join("\\n");
-        box.scrollTop = box.scrollHeight;
-      }, EVENT_FLUSH_INTERVAL_MS);
-    }
-
-    function resetEventsLog() {
-      eventLines.length = 0;
-      eventFlushScheduled = false;
       const box = document.getElementById("events");
-      box.textContent = "";
+      box.textContent += msg + "\\n";
+      box.scrollTop = box.scrollHeight;
     }
 
     function prettyBytes(size) {
@@ -2555,216 +1865,13 @@ _INDEX_HTML = """
       document.getElementById("status").textContent = value || "n/a";
     }
 
-    function clearMonitoring() {
-      if (es) {
-        es.close();
-        es = null;
-      }
-      if (sseReconnectTimer) {
-        clearTimeout(sseReconnectTimer);
-        sseReconnectTimer = null;
-      }
-      if (snapshotPollTimer) {
-        clearInterval(snapshotPollTimer);
-        snapshotPollTimer = null;
-      }
-      if (snapshotRefreshTimer) {
-        clearInterval(snapshotRefreshTimer);
-        snapshotRefreshTimer = null;
-      }
-      sseRetryCount = 0;
-    }
-
-    function rememberTrackedJob(jobId) {
-      try {
-        if (jobId) {
-          window.localStorage.setItem("vast-upscaler-current-job-id", String(jobId));
-        } else {
-          window.localStorage.removeItem("vast-upscaler-current-job-id");
-        }
-      } catch (_err) {
-        // localStorage may be unavailable
-      }
-    }
-
-    function setJobStage(stage) {
-      if (!stage) return;
-      currentStageLabel = String(stage);
-      document.getElementById("job-stage").textContent = currentStageLabel;
-    }
-
-    function setJobProgressFromRatio(progressRatio, label) {
-      if (!Number.isFinite(Number(progressRatio))) return;
-      const clamped = Math.max(0, Math.min(1, Number(progressRatio)));
-      if (latestProgressRatio != null && clamped < latestProgressRatio) return;
-      latestProgressRatio = clamped;
-      const pct = (clamped * 100).toFixed(1);
-      document.getElementById("job-progress").textContent = label ? `${pct}% — ${label}` : `${pct}%`;
-    }
-
-    async function syncPendingPromptFromSnapshot(jobId, snapshot) {
-      const pending = snapshot && snapshot.pending_prompt ? snapshot.pending_prompt : null;
-      if (!pending || !pending.prompt_id || pending.prompt_id === activePromptId || promptDialogOpen) {
-        return;
-      }
-      if (handledPromptIds.has(pending.prompt_id)) {
-        return;
-      }
-      activePromptId = pending.prompt_id;
-      try {
-        await answerPrompt(jobId, pending);
-      } finally {
-        if (activePromptId === pending.prompt_id) {
-          activePromptId = null;
-        }
-      }
-    }
-
-    function applySnapshotToUi(snapshot) {
-      if (!snapshot || snapshot.job_id !== currentJobId) return;
-      if (snapshot.started_at) {
-        const parsed = Date.parse(String(snapshot.started_at));
-        if (Number.isFinite(parsed)) {
-          currentJobStartedAt = parsed;
-        }
-      }
-      currentBusinessState = String(snapshot.business_state || snapshot.status || currentBusinessState);
-      setStatusLabel(snapshot.status || currentBusinessState);
-      if (snapshot.stage) {
-        setJobStage(snapshot.stage);
-      }
-      if (Number.isFinite(Number(snapshot.chunk_current)) && Number.isFinite(Number(snapshot.chunk_total)) && Number(snapshot.chunk_total) > 0) {
-        const current = Number(snapshot.chunk_current);
-        const total = Number(snapshot.chunk_total);
-        const completed = Number.isFinite(Number(snapshot.chunks_completed))
-          ? Number(snapshot.chunks_completed)
-          : Math.max(0, current - 1);
-        latestChunkProgress = { current, total, completed };
-      }
-      if (Number.isFinite(Number(snapshot.progress))) {
-        setJobProgressFromRatio(Number(snapshot.progress), snapshot.chunk_current && snapshot.chunk_total
-          ? `chunk ${snapshot.chunk_current}/${snapshot.chunk_total}`
-          : null);
-      } else if (latestProgressRatio == null && snapshot.status === "running") {
-        document.getElementById("job-progress").textContent = "indéterminée";
-      }
-      if (Number.isFinite(Number(snapshot.elapsed_seconds))) {
-        document.getElementById("job-elapsed").textContent = prettyDuration(Number(snapshot.elapsed_seconds));
-      }
-      if (snapshot.result) {
-        const outputPath = snapshot.result.output_path || "n/a";
-        const reportPath = snapshot.result.report_path || "n/a";
-        document.getElementById("job-result").innerHTML = `Sortie : <code>${outputPath}</code><br/>Rapport : <code>${reportPath}</code>`;
-        if (Number.isFinite(Number(snapshot.result.duration_seconds))) {
-          document.getElementById("job-elapsed").textContent = prettyDuration(Number(snapshot.result.duration_seconds));
-        }
-      }
-      if (snapshot.error) {
-        document.getElementById("job-error").classList.remove("hidden");
-        document.getElementById("job-error").textContent = "Erreur : " + String(snapshot.error);
-      } else {
-        document.getElementById("job-error").classList.add("hidden");
-        document.getElementById("job-error").textContent = "";
-      }
-      if (snapshot.status === "completed") {
-        setJobProgressFromRatio(1.0, "Terminé");
-      }
-      if (TERMINAL_JOB_STATUSES.has(String(snapshot.status || ""))) {
-        clearMonitoring();
-        rememberTrackedJob(null);
-      }
-    }
-
-    async function resyncJobSnapshot(jobId, expectedVersion) {
-      const response = await fetch(`/api/jobs/${jobId}`);
-      if (!response.ok) throw new Error(`snapshot ${response.status}`);
-      const snapshot = await response.json();
-      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return snapshot;
-      latestSnapshotEventId = Math.max(latestSnapshotEventId, Number(snapshot.latest_event_id || 0));
-      const oldestEventId = Number(snapshot.oldest_event_id || 0);
-      if (oldestEventId > 0 && lastConsumedEventId < oldestEventId - 1) {
-        appendEvent(`[warning] Événements SSE expirés sur le serveur (reprise à id ${oldestEventId}).`);
-        lastConsumedEventId = oldestEventId - 1;
-      }
-      applySnapshotToUi(snapshot);
-      await syncPendingPromptFromSnapshot(jobId, snapshot);
-      return snapshot;
-    }
-
-    function scheduleSseReconnect(jobId, expectedVersion) {
-      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
-      if (sseReconnectTimer || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
-      const baseDelay = Math.min(5000, 500 * Math.pow(2, Math.min(sseRetryCount, 5)));
-      const delay = baseDelay + Math.floor(Math.random() * 250);
-      sseReconnectTimer = setTimeout(async () => {
-        sseReconnectTimer = null;
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
-        if (TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
-        try {
-          await resyncJobSnapshot(jobId, expectedVersion);
-        } catch (_err) {
-          // keep reconnect loop alive
-        }
-        if (expectedVersion !== trackedJobVersion || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
-        connectEventStream(jobId, expectedVersion);
-      }, delay);
-    }
-
-    function renderRecoveryJobs() {
-      const select = document.getElementById("recovery_job_id");
-      select.innerHTML = '<option value="">-- Récupération SeedVR2 (job distant) --</option>';
-      for (const item of latestRecoveryJobs) {
-        const id = item.recovery_job_id || "";
-        if (!id) continue;
-        const state = `${item.inference_state || "unknown"} / ${item.recovery_state || "unknown"}`;
-        const instance = item.instance_id != null ? `instance ${item.instance_id}` : "instance n/a";
-        const label = `${id} (${instance}, ${state})`;
-        const opt = document.createElement("option");
-        opt.value = id;
-        opt.textContent = label;
-        select.appendChild(opt);
-      }
-    }
-
     function setModeHelp() {
-      const modeSelect = document.getElementById("mode");
-      const mode = modeSelect.value;
-      const engine = document.getElementById("engine").value;
+      const mode = document.getElementById("mode").value;
       const box = document.getElementById("mode-help");
-      if (engine === "seedvr2" && mode !== "manual") {
-        modeSelect.value = "manual";
-      }
-      if (engine === "seedvr2") {
-        box.textContent = "SeedVR2 est disponible en mode manuel uniquement. L’extrait est préparé localement puis exécuté sur l’instance sélectionnée.";
-      } else if (modeSelect.value === "manual") {
+      if (mode === "manual") {
         box.textContent = "Mode manuel : vous louez et gérez l’instance vous-même. L’application ne crée ni ne détruit automatiquement l’instance.";
       } else {
         box.textContent = "Mode automatique : l’application recherche une offre, crée l’instance, exécute le traitement puis applique la logique de nettoyage existante.";
-      }
-      document.getElementById("seedvr2_profile").disabled = engine !== "seedvr2";
-      const automaticOption = document.querySelector("#mode option[value='automatic']");
-      if (automaticOption) {
-        automaticOption.disabled = engine === "seedvr2";
-      }
-    }
-
-    function syncWorkerImageForEngine() {
-      const engine = document.getElementById("engine").value;
-      const workerImage = document.getElementById("worker_image");
-      const expectedRepo = expectedWorkerRepoByEngine[engine] || "";
-      const current = workerImage.value.trim();
-      const suggested = (latestWorkerImageByEngine[engine] || "").trim();
-      const extractRepo = (value) => {
-        if (!value) return "";
-        return value.split("@", 1)[0].split(":", 1)[0].trim().toLowerCase();
-      };
-      const currentRepo = extractRepo(current);
-      if (!current) {
-        workerImage.value = suggested;
-        return;
-      }
-      if (currentRepo && expectedRepo && currentRepo !== expectedRepo) {
-        workerImage.value = suggested;
       }
     }
 
@@ -2818,13 +1925,6 @@ _INDEX_HTML = """
           excerpt_start: null,
           excerpt_duration_seconds: 10,
         };
-      }
-
-      function makeExecutionId() {
-        const now = new Date();
-        const stamp = now.toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
-        const random = Math.random().toString(36).slice(2, 8);
-        return `web-${stamp}-${random}`;
       }
       const startRaw = document.getElementById("excerpt_start").value.trim() || "00:00";
       const duration = Number(document.getElementById("excerpt_duration_seconds").value || 10);
@@ -3217,29 +2317,8 @@ _INDEX_HTML = """
     async function loadDefaults() {
       const res = await fetch("/api/config");
       const cfg = await res.json();
-      latestWorkerImageByEngine = cfg.worker_image_latest_by_engine || latestWorkerImageByEngine;
-      latestRecoveryJobs = cfg.seedvr2_recovery_jobs || [];
-      renderRecoveryJobs();
       document.getElementById("target_width").value = cfg.target_width;
       document.getElementById("target_height").value = cfg.target_height;
-      const engineSelect = document.getElementById("engine");
-      engineSelect.innerHTML = "";
-      for (const engine of (cfg.engines || ["realesrgan", "seedvr2"])) {
-        const opt = document.createElement("option");
-        opt.value = engine;
-        opt.textContent = engine === "seedvr2" ? "SeedVR2 (expérimental, manuel)" : "Real-ESRGAN (stable)";
-        engineSelect.appendChild(opt);
-      }
-      engineSelect.value = cfg.default_engine || "realesrgan";
-      const seedvr2Profile = document.getElementById("seedvr2_profile");
-      seedvr2Profile.innerHTML = "";
-      for (const profile of (cfg.seedvr2_profiles || ["smoke", "reference"])) {
-        const opt = document.createElement("option");
-        opt.value = profile;
-        opt.textContent = profile;
-        seedvr2Profile.appendChild(opt);
-      }
-      seedvr2Profile.value = "smoke";
       document.getElementById("worker_image").value = cfg.worker_image_latest_known;
       if (cfg.worker_image_required) {
         appendEvent("Aucun tag worker fiable par défaut n’est connu. Renseignez un tag explicite en mode automatique.");
@@ -3252,10 +2331,7 @@ _INDEX_HTML = """
         opt.textContent = model;
         gpu.appendChild(opt);
       }
-      appendEvent("Tag worker par défaut Real-ESRGAN : " + (latestWorkerImageByEngine.realesrgan || "n/a"));
-      appendEvent("Tag worker par défaut SeedVR2 : " + (latestWorkerImageByEngine.seedvr2 || "n/a"));
-      syncWorkerImageForEngine();
-      setModeHelp();
+      appendEvent("Tag worker par défaut (dernier connu) : " + cfg.worker_image_latest_known);
     }
 
     async function answerPrompt(jobId, prompt) {
@@ -3288,7 +2364,7 @@ _INDEX_HTML = """
       const snapshot = await snapshotResp.json();
       const pending = snapshot.pending_prompt;
       if (!pending || pending.prompt_id !== prompt.prompt_id) return;
-      await syncPendingPromptFromSnapshot(jobId, snapshot);
+      await answerPrompt(jobId, prompt);
     }
 
     function updateJobSummaryFromEvent(data) {
@@ -3296,49 +2372,26 @@ _INDEX_HTML = """
       const payload = data.payload || {};
       if (type === "status") {
         const state = payload.state || payload.message || "running";
-        currentBusinessState = String(state || currentBusinessState);
         setStatusLabel(state);
-        if (payload.message) setJobStage(payload.message);
-        if (state === "inference_succeeded_recovering") {
-          document.getElementById("job-result").textContent = "Inférence terminée. Récupération des artefacts en cours…";
-          if (latestProgressRatio == null || latestProgressRatio < 0.999) {
-            setJobProgressFromRatio(0.999, "Inférence terminée");
-          }
+        if (payload.message) {
+          document.getElementById("job-stage").textContent = payload.message;
         }
       } else if (type === "provisioning") {
         const phase = payload.phase || payload.status || "provisioning";
-        setJobStage(String(phase));
-      } else if (type === "instance") {
-        if (payload.state !== "manual-instance-preserved") {
-          setJobStage(String(payload.message || payload.state || "instance"));
-        }
+        document.getElementById("job-stage").textContent = String(phase);
       } else if (type === "worker") {
-        const stage = payload.stage || currentStageLabel || "worker";
-        setJobStage(String(stage));
+        const stage = payload.stage || "worker";
+        document.getElementById("job-stage").textContent = String(stage);
         const framesDone = payload.frames_done;
         const framesTotal = payload.frames_total;
         const fps = payload.fps_processing;
-        const chunkCurrent = Number(payload.chunk_current);
-        const chunkTotal = Number(payload.chunk_total);
-        const chunksCompleted = Number(payload.chunks_completed);
-        if (Number.isFinite(chunkCurrent) && Number.isFinite(chunkTotal) && chunkTotal > 0) {
-          latestChunkProgress = {
-            current: chunkCurrent,
-            total: chunkTotal,
-            completed: Number.isFinite(chunksCompleted) ? chunksCompleted : Math.max(0, chunkCurrent - 1),
-          };
-          if (Number.isFinite(Number(payload.progress))) {
-            setJobProgressFromRatio(Number(payload.progress), `chunk ${latestChunkProgress.current}/${latestChunkProgress.total}`);
-          } else {
-            const ratio = Math.max(0, Math.min(0.999, latestChunkProgress.completed / latestChunkProgress.total));
-            setJobProgressFromRatio(ratio, `chunk ${latestChunkProgress.current}/${latestChunkProgress.total}`);
-          }
-        } else if (Number.isFinite(Number(framesDone)) && Number.isFinite(Number(framesTotal)) && Number(framesTotal) > 0) {
-          setJobProgressFromRatio(Number(framesDone) / Number(framesTotal), `${framesDone}/${framesTotal} images`);
+        if (Number.isFinite(Number(framesDone)) && Number.isFinite(Number(framesTotal)) && Number(framesTotal) > 0) {
+          const pct = ((Number(framesDone) / Number(framesTotal)) * 100).toFixed(1);
+          document.getElementById("job-progress").textContent = `${pct}% (${framesDone}/${framesTotal})`;
         } else if (Number.isFinite(Number(framesDone))) {
           document.getElementById("job-progress").textContent = `${framesDone} images traitées`;
-        } else if (latestProgressRatio == null) {
-          document.getElementById("job-progress").textContent = "indéterminée";
+        } else {
+          document.getElementById("job-progress").textContent = "n/a";
         }
         if (Number.isFinite(Number(payload.elapsed_seconds))) {
           document.getElementById("job-elapsed").textContent = prettyDuration(Number(payload.elapsed_seconds));
@@ -3349,96 +2402,38 @@ _INDEX_HTML = """
         if (Number.isFinite(Number(fps))) {
           document.getElementById("analysis-summary").textContent = `Cadence de traitement en cours : ${prettyFps(Number(fps))}`;
         }
-      } else if (type === "worker-log") {
-        // Keep technical logs in the SSE stream; summary UI remains stage-focused.
       } else if (type === "result") {
-        currentBusinessState = "completed";
         setStatusLabel("completed");
-        setJobStage(String(payload.state || "completed"));
-        setJobProgressFromRatio(1.0, "Terminé");
+        document.getElementById("job-stage").textContent = String(payload.state || "completed");
+        document.getElementById("job-progress").textContent = "Terminé";
         document.getElementById("job-elapsed").textContent = prettyDuration(Number(payload.duration_seconds || 0));
         const outputPath = payload.output_path || "n/a";
         const reportPath = payload.report_path || "n/a";
         document.getElementById("job-result").innerHTML = `Sortie : <code>${outputPath}</code><br/>Rapport : <code>${reportPath}</code>`;
       } else if (type === "error") {
-        if (currentBusinessState === "inference_succeeded_recovering" || currentBusinessState === "failed_recovery") {
-          setStatusLabel("failed_recovery");
-          document.getElementById("job-result").textContent = "Inférence terminée mais récupération des artefacts échouée.";
-        } else {
-          setStatusLabel("failed");
-          document.getElementById("job-result").textContent = "Traitement échoué.";
-        }
+        setStatusLabel("failed");
         document.getElementById("job-error").classList.remove("hidden");
         document.getElementById("job-error").textContent = "Erreur : " + String(payload.message || "échec inconnu");
       } else if (type === "prompt") {
-        setJobStage("Confirmation requise");
+        document.getElementById("job-stage").textContent = "Confirmation requise";
       }
     }
 
-    function connectEventStream(jobId, expectedVersion) {
-      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
-      if (es) {
-        es.close();
-        es = null;
-      }
-      es = new EventSource(`/api/jobs/${jobId}/events?last_event_id=${lastConsumedEventId}`);
+    function watchEvents(jobId) {
+      if (es) es.close();
+      es = new EventSource(`/api/jobs/${jobId}/events?last_event_id=${lastEventId}`);
       es.onmessage = async (evt) => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
         const data = JSON.parse(evt.data);
-        const eventId = Number(data.id);
-        if (!Number.isFinite(eventId) || eventId <= lastConsumedEventId) {
-          return;
-        }
-        lastConsumedEventId = eventId;
+        lastEventId = data.id;
         appendEvent(`[${data.type}] ${JSON.stringify(data.payload)}`);
         updateJobSummaryFromEvent(data);
         if (data.type === "prompt") {
           await maybeHandlePrompt(jobId, data.payload);
         }
         if (data.type === "result" || data.type === "error") {
-          if (data.type === "result") {
-            setStatusLabel("completed");
-          } else if (currentBusinessState === "inference_succeeded_recovering" || currentBusinessState === "failed_recovery") {
-            setStatusLabel("failed_recovery");
-          } else {
-            setStatusLabel("failed");
-          }
-          clearMonitoring();
-          rememberTrackedJob(null);
+          setStatusLabel(data.type === "result" ? "completed" : "failed");
         }
       };
-      es.onerror = async () => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
-        sseRetryCount += 1;
-        try {
-          const snapshot = await resyncJobSnapshot(jobId, expectedVersion);
-          if (snapshot && TERMINAL_JOB_STATUSES.has(String(snapshot.status || ""))) {
-            return;
-          }
-        } catch (_err) {
-          // retry loop will continue
-        }
-        scheduleSseReconnect(jobId, expectedVersion);
-      };
-    }
-
-    function watchEvents(jobId) {
-      clearMonitoring();
-      trackedJobVersion += 1;
-      const expectedVersion = trackedJobVersion;
-      connectEventStream(jobId, expectedVersion);
-      snapshotPollTimer = setInterval(() => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
-        resyncJobSnapshot(jobId, expectedVersion).catch(() => {});
-      }, 3000);
-      snapshotRefreshTimer = setInterval(() => {
-        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId || TERMINAL_JOB_STATUSES.has(currentBusinessState)) return;
-        if (Number.isFinite(Number(currentJobStartedAt)) && latestProgressRatio == null && ACTIVE_JOB_STATUSES.has(document.getElementById("status").textContent || "")) {
-          const elapsed = (Date.now() - currentJobStartedAt) / 1000;
-          document.getElementById("job-elapsed").textContent = prettyDuration(elapsed);
-        }
-      }, 1000);
-      resyncJobSnapshot(jobId, expectedVersion).catch(() => {});
     }
 
     document.getElementById("job-form").addEventListener("submit", async (event) => {
@@ -3455,8 +2450,6 @@ _INDEX_HTML = """
       );
       const payload = {
         mode: document.getElementById("mode").value,
-        engine: document.getElementById("engine").value,
-        seedvr2_profile: document.getElementById("seedvr2_profile").value,
         source_name: sourceName,
         input_path: sourceName ? null : manualInput,
         output_path: document.getElementById("output_path").value || null,
@@ -3474,7 +2467,6 @@ _INDEX_HTML = """
         excerpt_enabled: excerptEnabled(),
         excerpt_start: excerptEnabled() ? (document.getElementById("excerpt_start").value.trim() || "00:00") : null,
         excerpt_duration_seconds: excerptEnabled() ? Number(document.getElementById("excerpt_duration_seconds").value || 10) : 10,
-        execution_id: makeExecutionId(),
       };
       const response = await fetch("/api/jobs/start", {
         method: "POST",
@@ -3492,66 +2484,17 @@ _INDEX_HTML = """
         appendEvent("Un plan manuel est défini : il priorise les choix de prétraitement de l’IHM.");
       }
       currentJobId = data.job_id;
-      rememberTrackedJob(currentJobId);
-      lastConsumedEventId = 0;
-      latestSnapshotEventId = 0;
+      lastEventId = 0;
       currentJobStartedAt = Date.now();
-      currentBusinessState = "running";
-      currentStageLabel = "Initialisation";
-      latestProgressRatio = null;
-      latestChunkProgress = null;
       handledPromptIds.clear();
-      activePromptId = null;
       promptDialogOpen = false;
-      resetEventsLog();
       document.getElementById("job-error").classList.add("hidden");
       document.getElementById("job-error").textContent = "";
       document.getElementById("job-result").textContent = "Traitement démarré…";
       document.getElementById("job-progress").textContent = "n/a";
-      setJobStage("Initialisation");
+      document.getElementById("job-stage").textContent = "Initialisation";
       setStatusLabel("running");
       appendEvent("Traitement démarré : " + currentJobId);
-      watchEvents(currentJobId);
-    });
-
-    document.getElementById("recover-btn").addEventListener("click", async () => {
-      const recoveryId = document.getElementById("recovery_job_id").value;
-      if (!recoveryId) {
-        appendEvent("Sélectionnez un job SeedVR2 à récupérer.");
-        return;
-      }
-      const response = await fetch("/api/jobs/recover-seedvr2", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ recovery_job_id: recoveryId }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        appendEvent("Échec de la récupération : " + (data.detail || JSON.stringify(data)));
-        document.getElementById("job-error").classList.remove("hidden");
-        document.getElementById("job-error").textContent = "Erreur : " + (data.detail || "récupération refusée");
-        return;
-      }
-      currentJobId = data.job_id;
-      rememberTrackedJob(currentJobId);
-      lastConsumedEventId = 0;
-      latestSnapshotEventId = 0;
-      currentJobStartedAt = Date.now();
-      currentBusinessState = "running";
-      currentStageLabel = "Récupération";
-      latestProgressRatio = null;
-      latestChunkProgress = null;
-      handledPromptIds.clear();
-      activePromptId = null;
-      promptDialogOpen = false;
-      resetEventsLog();
-      document.getElementById("job-error").classList.add("hidden");
-      document.getElementById("job-error").textContent = "";
-      document.getElementById("job-result").textContent = "Récupération des résultats démarrée…";
-      document.getElementById("job-progress").textContent = "indéterminée";
-      setJobStage("Récupération");
-      setStatusLabel("running");
-      appendEvent("Récupération SeedVR2 démarrée : " + currentJobId + " (source=" + recoveryId + ")");
       watchEvents(currentJobId);
     });
 
@@ -3562,10 +2505,6 @@ _INDEX_HTML = """
     });
 
     document.getElementById("mode").addEventListener("change", setModeHelp);
-    document.getElementById("engine").addEventListener("change", () => {
-      syncWorkerImageForEngine();
-      setModeHelp();
-    });
     document.getElementById("refresh-sources-btn").addEventListener("click", loadVideoSources);
     document.getElementById("source_name").addEventListener("change", selectedSourceChanged);
     document.getElementById("analyze-btn").addEventListener("click", analyzeSelectedSource);
@@ -3599,43 +2538,8 @@ _INDEX_HTML = """
     setCropInputsDisabled(true);
     setModeHelp();
     updateExcerptControls();
-    if (window.__VAST_TEST_HOOKS__) {
-      window.__VAST_TEST_HOOKS__.init({
-        watchEvents,
-        connectEventStream,
-        updateJobSummaryFromEvent,
-        resyncJobSnapshot,
-        clearMonitoring,
-        applySnapshotToUi,
-        syncPendingPromptFromSnapshot,
-        setCurrentJobId: (jobId) => { currentJobId = jobId; },
-        getState: () => ({
-          currentJobId,
-          lastConsumedEventId,
-          latestSnapshotEventId,
-          trackedJobVersion,
-          currentBusinessState,
-          currentStageLabel,
-          latestProgressRatio,
-          promptDialogOpen,
-        }),
-      });
-    }
-    if (!window.__VAST_SKIP_BOOTSTRAP__) {
-      loadDefaults();
-      loadVideoSources();
-      const rememberedJobId = (() => {
-        try {
-          return window.localStorage.getItem("vast-upscaler-current-job-id");
-        } catch (_err) {
-          return null;
-        }
-      })();
-      if (rememberedJobId) {
-        currentJobId = rememberedJobId;
-        watchEvents(currentJobId);
-      }
-    }
+    loadDefaults();
+    loadVideoSources();
   </script>
 </body>
 </html>
