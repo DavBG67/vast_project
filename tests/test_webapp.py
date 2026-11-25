@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
-import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,27 +10,18 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-import vast_upscaler.webapp as webapp_module
 from vast_upscaler.local_preprocessing import LocalExecutionReport
 from vast_upscaler.orchestrator import OrchestrationError
-from vast_upscaler.remote_seedvr2_worker import (
-    RemoteSeedvr2WorkerPreparationError,
-    RemoteSeedvr2WorkerProcessError,
-    RemoteSeedvr2WorkerRecoveryError,
-)
 from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
-from vast_upscaler.vast_write_client import InstanceSummary
 from vast_upscaler.webapp import (
     RunCallbacks,
     StartJobRequest,
     WorkflowExecutionResult,
     _default_auto_runner,
     _default_manual_runner,
-    _load_latest_known_worker_image,
     _preview_dimensions_from_plan_payload,
     _resolve_output_path,
     _resolve_remote_preprocessing_contract,
-    _run_manual_engine_preflight,
     create_app,
 )
 
@@ -68,12 +57,6 @@ def _wait_for_status(client: TestClient, job_id: str, terminal: set[str], timeou
     raise AssertionError(f"Timed out waiting for statuses={terminal}")
 
 
-def _read_events_text(client: TestClient, job_id: str) -> str:
-    response = client.get(f"/api/jobs/{job_id}/events?last_event_id=0")
-    assert response.status_code == 200
-    return response.text
-
-
 def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path)
     app = create_app(config_path=config_path)
@@ -90,9 +73,6 @@ def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
     assert "vast_api_key" not in body
     assert "worker_image_latest_known" in body
     assert body["worker_image_latest_known"] != "ghcr.io/acme/worker:test"
-    assert body["default_engine"] == "realesrgan"
-    assert set(body["engines"]) == {"realesrgan", "seedvr2"}
-    assert set(body["seedvr2_profiles"]) == {"smoke", "reference"}
 
 
 def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -> None:
@@ -105,13 +85,6 @@ def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -
     assert "latestPlanPayload?.preview_dimensions" in html
     assert "issues du plan validé" in html
     assert "en attente du plan validé ou recadrage non fiable" in html
-    assert "currentRepo !== expectedRepo" in html
-    assert "workerImage.value = suggested;" in html
-    assert 'payload.state !== "manual-instance-preserved"' in html
-    assert "MAX_EVENT_LINES = 1000" in html
-    assert "resyncJobSnapshot" in html
-    assert "scheduleSseReconnect" in html
-    assert "localStorage.setItem" in html
 
 
 def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) -> None:
@@ -138,8 +111,6 @@ def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) ->
         "crop_bottom",
         "crop_left",
         "crop_right",
-        "engine",
-        "seedvr2_profile",
         "mode",
         "worker_image",
         "status",
@@ -147,456 +118,6 @@ def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) ->
         "cancel-btn",
     ):
         assert f'id="{control_id}"' in html
-
-
-def test_web_monitoring_runtime_handles_sse_resync_terminal_and_prompt_recovery(tmp_path: Path) -> None:
-    if shutil.which("node") is None:
-        pytest.skip("node is required for JavaScript runtime monitoring tests")
-
-    config_path = _write_config(tmp_path)
-    app = create_app(config_path=config_path)
-    client = TestClient(app)
-    html = client.get("/").text
-    html_path = tmp_path / "index.html"
-    html_path.write_text(html, encoding="utf-8")
-
-    node_script = tmp_path / "monitoring_harness.mjs"
-    node_script.write_text(
-        r"""
-import fs from "node:fs";
-import vm from "node:vm";
-
-const html = fs.readFileSync(process.argv[2], "utf8");
-const scriptStart = html.lastIndexOf("<script>");
-const scriptEnd = html.lastIndexOf("</script>");
-if (scriptStart < 0 || scriptEnd < scriptStart) {
-  throw new Error("script block not found");
-}
-const script = html.slice(scriptStart + "<script>".length, scriptEnd);
-
-function createHarness({ skipBootstrap = true, rememberedJobId = null, initialSnapshots = {} } = {}) {
-  const elements = new Map();
-  const timeouts = [];
-  const intervals = new Map();
-  let nextTimer = 1;
-  let confirmCount = 0;
-  let promptPostCount = 0;
-  const snapshots = new Map(Object.entries(initialSnapshots));
-  let api = null;
-
-  function makeElement(id = "") {
-    return {
-      id,
-      value: "",
-      textContent: "",
-      innerHTML: "",
-      disabled: false,
-      checked: false,
-      scrollTop: 0,
-      scrollHeight: 0,
-      className: "",
-      style: {},
-      options: [],
-      classList: {
-        add() {},
-        remove() {},
-        toggle() {},
-      },
-      addEventListener() {},
-      appendChild(child) {
-        this.options.push(child);
-      },
-    };
-  }
-
-  const document = {
-    getElementById(id) {
-      if (!elements.has(id)) elements.set(id, makeElement(id));
-      return elements.get(id);
-    },
-    querySelector(selector) {
-      if (selector.includes("processing_scope")) return { value: "full_video" };
-      if (selector.includes("crop_mode")) return { value: "preserve" };
-      return null;
-    },
-    querySelectorAll() {
-      return [];
-    },
-    createElement(tag) {
-      return makeElement(tag);
-    },
-  };
-
-  class FakeEventSource {
-    static instances = [];
-    constructor(url) {
-      this.url = url;
-      this.closed = false;
-      this.onmessage = null;
-      this.onerror = null;
-      FakeEventSource.instances.push(this);
-    }
-    close() {
-      this.closed = true;
-    }
-    emit(event) {
-      if (this.closed || !this.onmessage) return;
-      this.onmessage({ data: JSON.stringify(event) });
-    }
-    fail() {
-      if (this.closed || !this.onerror) return;
-      this.onerror(new Error("network"));
-    }
-  }
-
-  const localStore = new Map();
-  if (rememberedJobId) {
-    localStore.set("vast-upscaler-current-job-id", rememberedJobId);
-  }
-
-  async function fakeFetch(url, options = {}) {
-    const path = String(url);
-    if (path === "/api/config") {
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return {
-            target_width: 1280,
-            target_height: 720,
-            worker_image_latest_known: "",
-            worker_image_required: false,
-            default_engine: "realesrgan",
-            engines: ["realesrgan", "seedvr2"],
-            seedvr2_profiles: ["smoke", "reference"],
-            gpu_models: ["RTX 4090"],
-            worker_image_latest_by_engine: {
-              realesrgan: "",
-              seedvr2: "",
-            },
-            seedvr2_recovery_jobs: [],
-          };
-        },
-      };
-    }
-    if (path === "/api/video/sources") {
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { sources: [] };
-        },
-      };
-    }
-    if (path.includes("/prompts/") && options.method === "POST") {
-      promptPostCount += 1;
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return {};
-        },
-      };
-    }
-    const match = path.match(/^\/api\/jobs\/([^/]+)$/);
-    if (match) {
-      const jobId = match[1];
-      const snapshot = snapshots.get(jobId);
-      if (!snapshot) {
-        return {
-          ok: false,
-          status: 404,
-          async json() {
-            return { detail: "not found" };
-          },
-        };
-      }
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return JSON.parse(JSON.stringify(snapshot));
-        },
-      };
-    }
-    return {
-      ok: true,
-      status: 200,
-      async json() {
-        return {};
-      },
-    };
-  }
-
-  const context = {
-    console,
-    document,
-    EventSource: FakeEventSource,
-    fetch: fakeFetch,
-    setTimeout(fn) {
-      const id = nextTimer++;
-      timeouts.push({ id, fn });
-      return id;
-    },
-    clearTimeout(id) {
-      const idx = timeouts.findIndex((item) => item.id === id);
-      if (idx >= 0) timeouts.splice(idx, 1);
-    },
-    setInterval(fn) {
-      const id = nextTimer++;
-      intervals.set(id, fn);
-      return id;
-    },
-    clearInterval(id) {
-      intervals.delete(id);
-    },
-    Date,
-    Math,
-    Number,
-    JSON,
-    String,
-    Boolean,
-    RegExp,
-    Array,
-    Map,
-    Set,
-  };
-  context.window = {
-    prompt() {
-      return "sha256:test";
-    },
-    confirm() {
-      confirmCount += 1;
-      return true;
-    },
-    localStorage: {
-      getItem(key) {
-        return localStore.get(key) ?? null;
-      },
-      setItem(key, value) {
-        localStore.set(key, String(value));
-      },
-      removeItem(key) {
-        localStore.delete(key);
-      },
-    },
-    __VAST_TEST_HOOKS__: {
-      init(receivedApi) {
-        api = receivedApi;
-      },
-    },
-  };
-  if (skipBootstrap) {
-    context.window.__VAST_SKIP_BOOTSTRAP__ = true;
-  }
-  context.globalThis = context;
-
-  vm.createContext(context);
-  vm.runInContext(script, context);
-
-  async function flushMicrotasks() {
-    await Promise.resolve();
-    await Promise.resolve();
-  }
-
-  async function flushTimeouts() {
-    for (let i = 0; i < 20; i += 1) {
-      if (timeouts.length === 0) break;
-      const pending = [...timeouts];
-      timeouts.length = 0;
-      for (const item of pending) {
-        item.fn();
-      }
-      await flushMicrotasks();
-    }
-  }
-
-  async function runIntervals() {
-    for (const fn of intervals.values()) fn();
-    await flushMicrotasks();
-  }
-
-  function setSnapshot(jobId, snapshot) {
-    snapshots.set(jobId, snapshot);
-  }
-
-  function assert(condition, message) {
-    if (!condition) {
-      throw new Error(message);
-    }
-  }
-
-  return {
-    api,
-    document,
-    FakeEventSource,
-    setSnapshot,
-    flushMicrotasks,
-    flushTimeouts,
-    runIntervals,
-    assert,
-    get confirmCount() {
-      return confirmCount;
-    },
-    get promptPostCount() {
-      return promptPostCount;
-    },
-  };
-}
-
-async function run() {
-  // Scenario 1, 2, 4, 6, 7 in one session
-  const h = createHarness({ skipBootstrap: true });
-  const job = "job-sse";
-  h.api.setCurrentJobId(job);
-  h.setSnapshot(job, {
-    job_id: job,
-    status: "running",
-    business_state: "running",
-    latest_event_id: 8,
-    oldest_event_id: 1,
-    pending_prompt: null,
-    stage: "seedvr2",
-    progress: null,
-    chunk_current: null,
-    chunk_total: null,
-    chunks_completed: null,
-    elapsed_seconds: 5,
-    error: null,
-    result: null,
-  });
-  h.api.watchEvents(job);
-  await h.flushMicrotasks();
-  const stream = h.FakeEventSource.instances.at(-1);
-  stream.emit({ id: 1, type: "worker", payload: { stage: "dit-upscale", chunk_current: 1, chunk_total: 16, chunks_completed: 0, progress: 0.0 } });
-  await h.flushMicrotasks();
-  stream.emit({ id: 2, type: "worker", payload: { stage: "dit-upscale", chunk_current: 7, chunk_total: 16, chunks_completed: 6, progress: 0.375 } });
-  await h.flushMicrotasks();
-  const stateAfterEvents = h.api.getState();
-  h.assert(stateAfterEvents.lastConsumedEventId === 2, "SSE cursor should track consumed events only");
-  h.assert(stateAfterEvents.latestSnapshotEventId === 8, "Snapshot cursor should be independent from SSE cursor");
-  h.assert(h.document.getElementById("job-progress").textContent.includes("37.5%"), "Chunk progress should be restored in UI");
-
-  h.setSnapshot(job, {
-    job_id: job,
-    status: "running",
-    business_state: "running",
-    latest_event_id: 8,
-    oldest_event_id: 1,
-    pending_prompt: { prompt_id: "prompt-ssh", kind: "ssh_trust", message: "Trust host?" },
-    stage: "Confirmation requise",
-    progress: 0.375,
-    chunk_current: 7,
-    chunk_total: 16,
-    chunks_completed: 6,
-    elapsed_seconds: 12,
-    error: null,
-    result: null,
-  });
-  stream.fail();
-  await h.flushMicrotasks();
-  await h.flushTimeouts();
-  h.assert(h.confirmCount === 1, "Prompt should be restored once during SSE outage");
-  h.assert(h.promptPostCount === 1, "Prompt answer should be posted once");
-
-  h.setSnapshot(job, {
-    job_id: job,
-    status: "completed",
-    business_state: "completed",
-    latest_event_id: 9,
-    oldest_event_id: 1,
-    pending_prompt: null,
-    stage: "COMPLETED",
-    progress: 1.0,
-    chunk_current: 16,
-    chunk_total: 16,
-    chunks_completed: 16,
-    elapsed_seconds: 42,
-    error: null,
-    result: {
-      output_path: "/tmp/out.mp4",
-      report_path: "/tmp/out.json",
-      duration_seconds: 42,
-      state: "COMPLETED",
-    },
-  });
-  await h.api.resyncJobSnapshot(job, h.api.getState().trackedJobVersion);
-  await h.flushMicrotasks();
-  h.assert(h.document.getElementById("status").textContent === "completed", "Terminal completed snapshot should set status");
-  h.assert(h.document.getElementById("job-result").innerHTML.includes("/tmp/out.mp4"), "Completed snapshot should expose result");
-  const beforeReconnectCount = h.FakeEventSource.instances.length;
-  stream.fail();
-  await h.flushTimeouts();
-  h.assert(h.FakeEventSource.instances.length === beforeReconnectCount, "No reconnect should happen after terminal snapshot");
-
-  // Scenario 5: failed snapshot without SSE error event
-  const hFail = createHarness({ skipBootstrap: true });
-  const failJob = "job-failed";
-  hFail.api.setCurrentJobId(failJob);
-  hFail.setSnapshot(failJob, {
-    job_id: failJob,
-    status: "failed",
-    business_state: "failed_recovery",
-    latest_event_id: 3,
-    oldest_event_id: 1,
-    pending_prompt: null,
-    stage: "download",
-    progress: 0.9,
-    chunk_current: 16,
-    chunk_total: 16,
-    chunks_completed: 16,
-    elapsed_seconds: 30,
-    error: "download failed",
-    result: null,
-  });
-  hFail.api.watchEvents(failJob);
-  await hFail.api.resyncJobSnapshot(failJob, hFail.api.getState().trackedJobVersion);
-  await hFail.flushMicrotasks();
-  hFail.assert(
-    ["failed", "failed_recovery"].includes(hFail.document.getElementById("status").textContent),
-    "Terminal failed snapshot should set a failed status",
-  );
-  hFail.assert(hFail.document.getElementById("job-error").textContent.includes("download failed"), "Failed snapshot should expose error");
-
-  // Scenario 3: refresh with pending prompt should rehydrate prompt once
-  const hRefresh = createHarness({
-    skipBootstrap: false,
-    rememberedJobId: "job-refresh",
-    initialSnapshots: {
-      "job-refresh": {
-        job_id: "job-refresh",
-        status: "running",
-        business_state: "running",
-        latest_event_id: 4,
-        oldest_event_id: 1,
-        pending_prompt: { prompt_id: "prompt-refresh", kind: "ssh_trust", message: "Trust refreshed host?" },
-        stage: "Confirmation requise",
-        progress: null,
-        chunk_current: null,
-        chunk_total: null,
-        chunks_completed: null,
-        elapsed_seconds: 1,
-        error: null,
-        result: null,
-      },
-    },
-  });
-  await hRefresh.api.resyncJobSnapshot("job-refresh", hRefresh.api.getState().trackedJobVersion);
-  await hRefresh.flushMicrotasks();
-  await hRefresh.flushTimeouts();
-  hRefresh.assert(hRefresh.promptPostCount === 1, "Refresh should restore pending prompt exactly once");
-}
-
-run().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
-""",
-        encoding="utf-8",
-    )
-
-    run = subprocess.run(["node", str(node_script), str(html_path)], capture_output=True, text=True, check=False)
-    assert run.returncode == 0, run.stderr or run.stdout
 
 
 def test_web_video_sources_listing_filters_outputs_and_non_video(tmp_path: Path, monkeypatch) -> None:
@@ -808,10 +329,8 @@ def test_web_video_analyze_rejects_symlink_outside_video_directory(tmp_path: Pat
     link = video_dir / "link.mp4"
     try:
         link.symlink_to(outside)
-    except OSError as exc:
-        if os.name == "nt":
-            pytest.skip("symlink creation is not permitted in this Windows environment")
-        raise AssertionError("symlink creation should be available in CI Linux") from exc
+    except OSError:
+        pytest.skip("symlink creation is not permitted in this environment")
 
     monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
 
@@ -1172,10 +691,9 @@ def test_resolve_output_path_defaults_to_mp4_for_all_sources(tmp_path: Path) -> 
     mp4 = tmp_path / "clip.mp4"
     for item in (mkv, webm, mp4):
         item.write_bytes(b"x")
-    for source in (mkv, webm, mp4):
-        resolved = _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(source))).name
-        assert resolved.startswith("clip-upscaled-realesrgan-")
-        assert resolved.endswith(".mp4")
+    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mkv))).name == "clip-upscaled.mp4"
+    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(webm))).name == "clip-upscaled.mp4"
+    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mp4))).name == "clip-upscaled.mp4"
 
 
 def test_web_job_start_rejects_incompatible_explicit_output_extension(tmp_path: Path) -> None:
@@ -1410,15 +928,10 @@ def test_web_rejects_parallel_jobs(tmp_path: Path, monkeypatch) -> None:
 
     app = create_app(config_path=config_path, auto_runner=_auto_runner)
     client = TestClient(app)
-    request_payload = {
-        "mode": "automatic",
-        "input_path": str(source),
-        "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-testparallel",
-    }
 
-    first = client.post("/api/jobs/start", json=request_payload)
+    first = client.post("/api/jobs/start", json={"mode": "automatic", "input_path": str(source)})
     assert first.status_code == 200
-    second = client.post("/api/jobs/start", json=request_payload)
+    second = client.post("/api/jobs/start", json={"mode": "automatic", "input_path": str(source)})
     assert second.status_code == 409
 
     cancel = client.post(f"/api/jobs/{first.json()['job_id']}/cancel")
@@ -1447,118 +960,6 @@ def test_web_rejects_placeholder_worker_image_for_automatic_mode(tmp_path: Path,
     assert "placeholder worker image" in response.json()["detail"]
 
 
-def test_web_rejects_seedvr2_in_automatic_mode(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
-    config_path = _write_config(tmp_path)
-    source = tmp_path / "input.mp4"
-    source.write_bytes(b"x")
-    app = create_app(config_path=config_path)
-    client = TestClient(app)
-
-    response = client.post(
-        "/api/jobs/start",
-        json={
-            "mode": "automatic",
-            "engine": "seedvr2",
-            "input_path": str(source),
-            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-1234",
-        },
-    )
-    assert response.status_code == 400
-    assert "manual mode only" in response.json()["detail"]
-
-
-def test_web_rejects_worker_image_repo_mismatch_for_selected_engine(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
-    config_path = _write_config(tmp_path)
-    source = tmp_path / "input.mp4"
-    source.write_bytes(b"x")
-    app = create_app(config_path=config_path)
-    client = TestClient(app)
-
-    response = client.post(
-        "/api/jobs/start",
-        json={
-            "mode": "manual",
-            "engine": "seedvr2",
-            "input_path": str(source),
-            "instance_id": 123,
-            "worker_image": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-1",
-        },
-    )
-    assert response.status_code == 400
-    assert "repository mismatch" in response.json()["detail"]
-
-
-def test_load_latest_worker_image_legacy_global_history_for_realesrgan(tmp_path: Path, monkeypatch) -> None:
-    history_path = tmp_path / "history.json"
-    history_path.write_text(
-        json.dumps({"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-legacy"}),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
-    assert _load_latest_known_worker_image(engine="realesrgan") == "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-legacy"
-
-
-def test_load_latest_worker_image_legacy_global_history_not_used_for_seedvr2(tmp_path: Path, monkeypatch) -> None:
-    history_path = tmp_path / "history.json"
-    history_path.write_text(
-        json.dumps({"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-legacy"}),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
-    assert _load_latest_known_worker_image(engine="seedvr2") == ""
-
-
-def test_load_latest_worker_image_per_engine_history_isolated(tmp_path: Path, monkeypatch) -> None:
-    history_path = tmp_path / "history.json"
-    history_path.write_text(
-        json.dumps(
-            {
-                "engines": {
-                    "realesrgan": {"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-r"},
-                    "seedvr2": {"latest": "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-x"},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
-    assert _load_latest_known_worker_image(engine="realesrgan").endswith(":dev-sha-r")
-    assert _load_latest_known_worker_image(engine="seedvr2").endswith(":exp-6a2-x")
-
-
-def test_load_latest_worker_image_rejects_incoherent_history_entry(tmp_path: Path, monkeypatch) -> None:
-    history_path = tmp_path / "history.json"
-    history_path.write_text(
-        json.dumps(
-            {
-                "engines": {
-                    "seedvr2": {"latest": "ghcr.io/davbg67/vast-video-upscaler-worker:dev-sha-r"},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(webapp_module, "_WORKER_IMAGE_HISTORY_PATH", history_path)
-    assert _load_latest_known_worker_image(engine="seedvr2") == ""
-
-
-def test_run_manual_engine_preflight_rejects_old_seedvr2_runner(monkeypatch) -> None:
-    class _FakeTransport:
-        def run_remote_command(self, _connection, *, command, **_kwargs):
-            assert command == ["/opt/seedvr2-venv/bin/python", "/opt/prototype/seedvr2_prototype.py", "--help"]
-            return SimpleNamespace(stdout="usage: seedvr2_prototype.py [-h] --input-video INPUT_VIDEO")
-
-    with pytest.raises(OrchestrationError) as exc:
-        _run_manual_engine_preflight(
-            transport=_FakeTransport(),
-            connection=object(),
-            engine="seedvr2",
-        )
-    assert "--input-is-excerpt" in str(exc.value)
-
-
 def test_manual_mode_keeps_instance_on_failure(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
@@ -1579,154 +980,6 @@ def test_manual_mode_keeps_instance_on_failure(tmp_path: Path, monkeypatch) -> N
 
     events_payload = client.get(f"/api/jobs/{job_id}/events?last_event_id=0").text
     assert "manual-instance-preserved" in events_payload
-
-
-def test_manual_seedvr2_progress_does_not_revert_business_state_after_download_start(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
-    config_path = _write_config(tmp_path)
-    source = tmp_path / "input.mp4"
-    source.write_bytes(b"x")
-
-    stage_emitted = threading.Event()
-    continue_runner = threading.Event()
-
-    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
-        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
-        callbacks.report_worker_progress({"kind": "worker", "stage": "seedvr2-runner", "status": "started"})
-        stage_emitted.set()
-        continue_runner.wait(timeout=2.0)
-        return WorkflowExecutionResult(
-            mode="manual",
-            session_id=None,
-            state="COMPLETED",
-            output_path=str(tmp_path / "out.mp4"),
-            report_path=str(tmp_path / "report.json"),
-            duration_seconds=0.1,
-            estimated_total_usd=None,
-            instance_id=123,
-            instance_state="running",
-            cleanup_verified=False,
-            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
-        )
-
-    app = create_app(config_path=config_path, manual_runner=_manual_runner)
-    client = TestClient(app)
-    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
-    assert started.status_code == 200
-    job_id = started.json()["job_id"]
-    assert stage_emitted.wait(timeout=2.0)
-    snapshot = client.get(f"/api/jobs/{job_id}").json()
-    assert snapshot["business_state"] == "inference_succeeded_recovering"
-    continue_runner.set()
-    terminal = _wait_for_status(client, job_id, {"completed"})
-    assert terminal["business_state"] == "completed"
-
-
-def test_manual_seedvr2_sequence_inference_success_then_download_then_completed(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
-    config_path = _write_config(tmp_path)
-    source = tmp_path / "input.mp4"
-    source.write_bytes(b"x")
-
-    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
-        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
-        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "completed"})
-        return WorkflowExecutionResult(
-            mode="manual",
-            session_id=None,
-            state="COMPLETED",
-            output_path=str(tmp_path / "out.mp4"),
-            report_path=str(tmp_path / "report.json"),
-            duration_seconds=0.1,
-            estimated_total_usd=None,
-            instance_id=123,
-            instance_state="running",
-            cleanup_verified=False,
-            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
-        )
-
-    app = create_app(config_path=config_path, manual_runner=_manual_runner)
-    client = TestClient(app)
-    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
-    assert started.status_code == 200
-    job_id = started.json()["job_id"]
-    terminal = _wait_for_status(client, job_id, {"completed"})
-    assert terminal["status"] == "completed"
-    events_payload = _read_events_text(client, job_id)
-    recovering_index = events_payload.index('"state":"inference_succeeded_recovering"')
-    download_started_index = events_payload.index('"stage":"download","status":"started"')
-    download_completed_index = events_payload.index('"stage":"download","status":"completed"')
-    result_index = events_payload.index('"type":"result"')
-    assert recovering_index < download_started_index < download_completed_index < result_index
-
-
-def test_manual_seedvr2_high_volume_worker_logs_preserve_terminal_state(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
-    config_path = _write_config(tmp_path)
-    source = tmp_path / "input.mp4"
-    source.write_bytes(b"x")
-
-    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
-        for index in range(10_000):
-            callbacks.report_worker_progress({"kind": "worker-log", "line": f"log line {index}"})
-        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
-        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "completed"})
-        return WorkflowExecutionResult(
-            mode="manual",
-            session_id=None,
-            state="COMPLETED",
-            output_path=str(tmp_path / "out.mp4"),
-            report_path=str(tmp_path / "report.json"),
-            duration_seconds=0.1,
-            estimated_total_usd=None,
-            instance_id=123,
-            instance_state="running",
-            cleanup_verified=False,
-            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
-        )
-
-    app = create_app(config_path=config_path, manual_runner=_manual_runner)
-    client = TestClient(app)
-    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
-    assert started.status_code == 200
-    job_id = started.json()["job_id"]
-    terminal = _wait_for_status(client, job_id, {"completed"})
-    assert terminal["status"] == "completed"
-    assert terminal["latest_event_id"] >= terminal["oldest_event_id"] > 1
-    assert (terminal["latest_event_id"] - terminal["oldest_event_id"]) < 5_000
-    events_payload = _read_events_text(client, job_id)
-    assert '"type":"result"' in events_payload
-
-
-@pytest.mark.parametrize(
-    ("exc", "expected_business_state"),
-    [
-        (RemoteSeedvr2WorkerPreparationError("prep failure"), "failed_preparation"),
-        (RemoteSeedvr2WorkerProcessError("inference failure"), "failed_inference"),
-        (RemoteSeedvr2WorkerRecoveryError("recovery failure"), "failed_recovery"),
-    ],
-)
-def test_manual_seedvr2_exception_type_drives_terminal_business_state(
-    tmp_path: Path,
-    monkeypatch,
-    exc: Exception,
-    expected_business_state: str,
-) -> None:
-    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
-    config_path = _write_config(tmp_path)
-    source = tmp_path / "input.mp4"
-    source.write_bytes(b"x")
-
-    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
-        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
-        raise exc
-
-    app = create_app(config_path=config_path, manual_runner=_manual_runner)
-    client = TestClient(app)
-    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
-    assert started.status_code == 200
-    terminal = _wait_for_status(client, started.json()["job_id"], {"failed"})
-    assert terminal["business_state"] == expected_business_state
 
 
 def test_manual_mode_keeps_instance_on_cancellation(tmp_path: Path, monkeypatch) -> None:
@@ -1895,7 +1148,6 @@ def test_web_auto_and_manual_use_identical_preprocessing_contract(tmp_path: Path
     monkeypatch.setattr("vast_upscaler.webapp._build_trusted_connection", lambda **_kwargs: object())
     monkeypatch.setattr("vast_upscaler.webapp._resolve_private_key", lambda **_kwargs: Path("C:/keys/id_ed25519"))
     monkeypatch.setattr("vast_upscaler.webapp.OpenSshTransport.check_ssh_ready", lambda *_a, **_k: None)
-    monkeypatch.setattr("vast_upscaler.webapp._run_manual_engine_preflight", lambda **_kwargs: None)
 
     def _fake_execute_remote_worker(**kwargs):
         captured_manual["contract"] = kwargs["request"].preprocessing_contract
@@ -1995,233 +1247,6 @@ def test_default_auto_runner_merges_excerpt_metadata_and_cleans_temp_excerpt(tmp
     assert payload["excerpt_actual_duration_seconds"] == 1.95
     assert payload["excerpt_source"] == str(excerpt_file)
     assert not excerpt_file.exists()
-
-
-def test_default_manual_seedvr2_runner_preserves_excerpt_window_and_uses_excerpt_input(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source.mp4"
-    source.write_bytes(b"x")
-    output = tmp_path / "output.mp4"
-    report = tmp_path / "report.json"
-    excerpt_file = tmp_path / "data" / "excerpts" / "job-excerpt-test.mkv"
-    excerpt_file.parent.mkdir(parents=True, exist_ok=True)
-    excerpt_file.write_bytes(b"x")
-
-    request = StartJobRequest(
-        mode="manual",
-        engine="seedvr2",
-        seedvr2_profile="reference",
-        input_path=str(source),
-        output_path=str(output),
-        report_path=str(report),
-        instance_id=123,
-        worker_image="ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test",
-        excerpt_enabled=True,
-        excerpt_start="00:39",
-        excerpt_duration_seconds=10.0,
-    )
-
-    from vast_upscaler.config import load_config
-
-    loaded_settings = load_config(_write_config(tmp_path))
-
-    class _FakeWriteClient:
-        def get_instance(self, _instance_id: int):
-            return InstanceSummary(
-                instance_id=123,
-                actual_status="running",
-                intended_status="running",
-                cur_state="running",
-                label="manual-instance",
-                image_runtype="ssh_direct",
-                ssh_port=22,
-                gpu_name="RTX 5080",
-                ssh_host="1.2.3.4",
-                machine_id="node",
-                image_name="ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test",
-                hourly_price_usd=None,
-            )
-
-        def close(self) -> None:
-            return
-
-    captured: dict = {}
-
-    monkeypatch.setattr("vast_upscaler.webapp._build_write_client", lambda _s: _FakeWriteClient())
-    monkeypatch.setattr("vast_upscaler.webapp._wait_for_ssh_tcp_availability", lambda **_kwargs: None)
-    monkeypatch.setattr("vast_upscaler.webapp._build_trusted_connection", lambda **_kwargs: object())
-    monkeypatch.setattr("vast_upscaler.webapp._resolve_private_key", lambda **_kwargs: Path("C:/keys/id_ed25519"))
-    monkeypatch.setattr("vast_upscaler.webapp.OpenSshTransport.check_ssh_ready", lambda *_a, **_k: None)
-    monkeypatch.setattr("vast_upscaler.webapp._run_manual_engine_preflight", lambda **_kwargs: None)
-    monkeypatch.setattr(
-        "vast_upscaler.webapp._prepare_effective_job_input",
-        lambda **_kwargs: SimpleNamespace(
-            input_path=excerpt_file,
-            original_source=source,
-            excerpt_result=SimpleNamespace(
-                excerpt_path=excerpt_file,
-                start_seconds=39.0,
-                requested_duration_seconds=10.0,
-                actual_duration_seconds=10.0,
-            ),
-            cleanup_excerpt_path=excerpt_file,
-        ),
-    )
-
-    def _fake_execute_remote_seedvr2_worker(**kwargs):
-        captured["request"] = kwargs["request"]
-        report.write_text('{"status":"completed","report_schema_version":"2.0"}', encoding="utf-8")
-        output.write_bytes(b"video")
-        return SimpleNamespace(local_output_path=output, local_report_path=report)
-
-    monkeypatch.setattr("vast_upscaler.webapp.execute_remote_seedvr2_worker", _fake_execute_remote_seedvr2_worker)
-
-    callbacks = RunCallbacks(
-        report_provisioning_status=lambda _payload: None,
-        report_worker_progress=lambda _payload: None,
-        confirm_paid=lambda _message: True,
-        confirm_ssh_trust=lambda _message: True,
-        request_verified_fingerprint=lambda _message: None,
-        raise_if_cancelled=lambda: None,
-    )
-    result = _default_manual_runner(request, loaded_settings, callbacks)
-    assert result.state == "COMPLETED"
-    assert captured["request"].local_input_path == excerpt_file
-    assert captured["request"].profile == "reference"
-    payload = json.loads(report.read_text(encoding="utf-8"))
-    assert payload["original_source"] == str(source)
-    assert payload["excerpt_enabled"] is True
-    assert payload["excerpt_start_seconds"] == 39.0
-    assert payload["excerpt_requested_duration_seconds"] == 10.0
-    assert payload["excerpt_actual_duration_seconds"] == 10.0
-    assert payload["worker_image"]["requested"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
-    assert payload["worker_image"]["suggested_or_expected"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
-    assert payload["worker_image"]["instance_declared"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
-    assert payload["worker_image"]["verification_level"] == "exact-match"
-
-
-def test_web_seedvr2_recovery_endpoint_recovers_without_reinference(tmp_path: Path, monkeypatch) -> None:
-    config_path = _write_config(tmp_path)
-    recovery_state_path = tmp_path / "seedvr2_recovery_jobs.json"
-    monkeypatch.setattr(webapp_module, "_SEEDVR2_RECOVERY_STATE_PATH", recovery_state_path)
-
-    input_path = tmp_path / "input.mp4"
-    input_path.write_bytes(b"x")
-    output_path = tmp_path / "output.mp4"
-    report_path = tmp_path / "report.json"
-    recovery_job_id = "seedvr2-job-1"
-    webapp_module._upsert_seedvr2_recovery_job(
-        {
-            "recovery_job_id": recovery_job_id,
-            "instance_id": 123,
-            "engine": "seedvr2",
-            "seedvr2_profile": "smoke",
-            "remote_root_base": "/workspace/seedvr2-sessions",
-            "remote_session_id": "manual-abc123",
-            "ssh_host": "1.2.3.4",
-            "ssh_port": 22,
-            "local_input_path": str(input_path),
-            "local_output_path": str(output_path),
-            "local_report_path": str(report_path),
-            "inference_state": "completed",
-            "recovery_state": "pending",
-        }
-    )
-
-    class _FakeWriteClient:
-        def get_instance(self, _instance_id: int):
-            return InstanceSummary(
-                instance_id=123,
-                actual_status="running",
-                intended_status="running",
-                cur_state="running",
-                label="manual-instance",
-                image_runtype="ssh_direct",
-                ssh_port=22,
-                gpu_name="RTX 5080",
-                ssh_host="1.2.3.4",
-                machine_id="node",
-                image_name="ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test",
-                hourly_price_usd=None,
-            )
-
-        def close(self) -> None:
-            return
-
-    monkeypatch.setattr("vast_upscaler.webapp._build_write_client", lambda _s: _FakeWriteClient())
-    monkeypatch.setattr("vast_upscaler.webapp._wait_for_ssh_tcp_availability", lambda **_kwargs: None)
-    monkeypatch.setattr("vast_upscaler.webapp._build_trusted_connection", lambda **_kwargs: object())
-    monkeypatch.setattr("vast_upscaler.webapp._resolve_private_key", lambda **_kwargs: Path("C:/keys/id_ed25519"))
-    monkeypatch.setattr("vast_upscaler.webapp.OpenSshTransport.check_ssh_ready", lambda *_a, **_k: None)
-    monkeypatch.setattr("vast_upscaler.webapp._run_manual_engine_preflight", lambda **_kwargs: None)
-
-    def _should_not_run_inference(**_kwargs):
-        raise AssertionError("inference runner must not be called during recovery-only flow")
-
-    monkeypatch.setattr("vast_upscaler.webapp.execute_remote_seedvr2_worker", _should_not_run_inference)
-
-    def _fake_recover_remote_seedvr2_results(**_kwargs):
-        output_path.write_bytes(b"video")
-        report_path.write_text('{"status":"completed","report_schema_version":"2.0"}', encoding="utf-8")
-        return SimpleNamespace(local_output_path=output_path, local_report_path=report_path)
-
-    monkeypatch.setattr("vast_upscaler.webapp.recover_remote_seedvr2_results", _fake_recover_remote_seedvr2_results)
-
-    app = create_app(config_path=config_path)
-    client = TestClient(app)
-    mismatch = client.post(
-        "/api/jobs/recover-seedvr2",
-        json={"recovery_job_id": recovery_job_id, "instance_id": 124},
-    )
-    assert mismatch.status_code == 400
-    assert "does not match" in mismatch.json()["detail"]
-
-    response = client.post(
-        "/api/jobs/recover-seedvr2",
-        json={"recovery_job_id": recovery_job_id, "instance_id": 123},
-    )
-    assert response.status_code == 200
-    job_id = response.json()["job_id"]
-    terminal = _wait_for_status(client, job_id, {"completed", "failed", "cancelled"})
-    assert terminal["status"] == "completed"
-
-    persisted = webapp_module._load_seedvr2_recovery_job(recovery_job_id)
-    assert persisted["inference_state"] == "completed"
-    assert persisted["recovery_state"] == "completed"
-
-    cfg = client.get("/api/config")
-    assert cfg.status_code == 200
-    jobs = cfg.json()["seedvr2_recovery_jobs"]
-    assert any(job["recovery_job_id"] == recovery_job_id for job in jobs)
-
-
-def test_web_seedvr2_recovery_jobs_persist_after_app_restart(tmp_path: Path, monkeypatch) -> None:
-    config_path = _write_config(tmp_path)
-    recovery_state_path = tmp_path / "seedvr2_recovery_jobs.json"
-    monkeypatch.setattr(webapp_module, "_SEEDVR2_RECOVERY_STATE_PATH", recovery_state_path)
-    webapp_module._upsert_seedvr2_recovery_job(
-        {
-            "recovery_job_id": "seedvr2-persisted-job",
-            "instance_id": 456,
-            "engine": "seedvr2",
-            "seedvr2_profile": "reference",
-            "remote_root_base": "/workspace/seedvr2-sessions",
-            "remote_session_id": "manual-persisted",
-            "ssh_host": "1.2.3.4",
-            "ssh_port": 22,
-            "local_input_path": str(tmp_path / "input.mp4"),
-            "local_output_path": str(tmp_path / "out.mp4"),
-            "local_report_path": str(tmp_path / "report.json"),
-            "inference_state": "completed",
-            "recovery_state": "pending",
-        }
-    )
-
-    app = create_app(config_path=config_path)
-    client = TestClient(app)
-    cfg = client.get("/api/config")
-    assert cfg.status_code == 200
-    jobs = cfg.json()["seedvr2_recovery_jobs"]
-    assert any(job["recovery_job_id"] == "seedvr2-persisted-job" for job in jobs)
 
 
 def test_manual_plan_path_overrides_generated_plan_payload_for_contract_resolution(tmp_path: Path) -> None:

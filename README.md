@@ -49,7 +49,6 @@ Detailed docs:
 - Integration audit: `docs/phase4-integration-audit.md`
 - Real-test runbook (do not execute without approval): `docs/runbook-first-real-test.md`
 - Security controls: `docs/security.md`
-- SeedVR2 prototype runbook (phase 6A.2): `docs/seedvr2-prototype.md`
 
 ## Worker (Phase 3)
 
