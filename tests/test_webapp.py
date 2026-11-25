@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,11 @@ from fastapi.testclient import TestClient
 import vast_upscaler.webapp as webapp_module
 from vast_upscaler.local_preprocessing import LocalExecutionReport
 from vast_upscaler.orchestrator import OrchestrationError
+from vast_upscaler.remote_seedvr2_worker import (
+    RemoteSeedvr2WorkerPreparationError,
+    RemoteSeedvr2WorkerProcessError,
+    RemoteSeedvr2WorkerRecoveryError,
+)
 from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
 from vast_upscaler.vast_write_client import InstanceSummary
 from vast_upscaler.webapp import (
@@ -59,6 +66,12 @@ def _wait_for_status(client: TestClient, job_id: str, terminal: set[str], timeou
             return payload
         time.sleep(0.05)
     raise AssertionError(f"Timed out waiting for statuses={terminal}")
+
+
+def _read_events_text(client: TestClient, job_id: str) -> str:
+    response = client.get(f"/api/jobs/{job_id}/events?last_event_id=0")
+    assert response.status_code == 200
+    return response.text
 
 
 def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
@@ -340,8 +353,10 @@ def test_web_video_analyze_rejects_symlink_outside_video_directory(tmp_path: Pat
     link = video_dir / "link.mp4"
     try:
         link.symlink_to(outside)
-    except OSError:
-        pytest.skip("symlink creation is not permitted in this environment")
+    except OSError as exc:
+        if os.name == "nt":
+            pytest.skip("symlink creation is not permitted in this Windows environment")
+        raise AssertionError("symlink creation should be available in CI Linux") from exc
 
     monkeypatch.setattr("vast_upscaler.webapp._project_root_path", lambda: tmp_path)
 
@@ -1110,6 +1125,116 @@ def test_manual_mode_keeps_instance_on_failure(tmp_path: Path, monkeypatch) -> N
     assert "manual-instance-preserved" in events_payload
 
 
+def test_manual_seedvr2_progress_does_not_revert_business_state_after_download_start(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    stage_emitted = threading.Event()
+    continue_runner = threading.Event()
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        callbacks.report_worker_progress({"kind": "worker", "stage": "seedvr2-runner", "status": "started"})
+        stage_emitted.set()
+        continue_runner.wait(timeout=2.0)
+        return WorkflowExecutionResult(
+            mode="manual",
+            session_id=None,
+            state="COMPLETED",
+            output_path=str(tmp_path / "out.mp4"),
+            report_path=str(tmp_path / "report.json"),
+            duration_seconds=0.1,
+            estimated_total_usd=None,
+            instance_id=123,
+            instance_state="running",
+            cleanup_verified=False,
+            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
+        )
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    assert stage_emitted.wait(timeout=2.0)
+    snapshot = client.get(f"/api/jobs/{job_id}").json()
+    assert snapshot["business_state"] == "inference_succeeded_recovering"
+    continue_runner.set()
+    terminal = _wait_for_status(client, job_id, {"completed"})
+    assert terminal["business_state"] == "completed"
+
+
+def test_manual_seedvr2_sequence_inference_success_then_download_then_completed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "completed"})
+        return WorkflowExecutionResult(
+            mode="manual",
+            session_id=None,
+            state="COMPLETED",
+            output_path=str(tmp_path / "out.mp4"),
+            report_path=str(tmp_path / "report.json"),
+            duration_seconds=0.1,
+            estimated_total_usd=None,
+            instance_id=123,
+            instance_state="running",
+            cleanup_verified=False,
+            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
+        )
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    terminal = _wait_for_status(client, job_id, {"completed"})
+    assert terminal["status"] == "completed"
+    events_payload = _read_events_text(client, job_id)
+    recovering_index = events_payload.index('"state":"inference_succeeded_recovering"')
+    download_started_index = events_payload.index('"stage":"download","status":"started"')
+    download_completed_index = events_payload.index('"stage":"download","status":"completed"')
+    result_index = events_payload.index('"type":"result"')
+    assert recovering_index < download_started_index < download_completed_index < result_index
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_business_state"),
+    [
+        (RemoteSeedvr2WorkerPreparationError("prep failure"), "failed_preparation"),
+        (RemoteSeedvr2WorkerProcessError("inference failure"), "failed_inference"),
+        (RemoteSeedvr2WorkerRecoveryError("recovery failure"), "failed_recovery"),
+    ],
+)
+def test_manual_seedvr2_exception_type_drives_terminal_business_state(
+    tmp_path: Path,
+    monkeypatch,
+    exc: Exception,
+    expected_business_state: str,
+) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        raise exc
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    terminal = _wait_for_status(client, started.json()["job_id"], {"failed"})
+    assert terminal["business_state"] == expected_business_state
+
+
 def test_manual_mode_keeps_instance_on_cancellation(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
     config_path = _write_config(tmp_path)
@@ -1478,6 +1603,131 @@ def test_default_manual_seedvr2_runner_preserves_excerpt_window_and_uses_excerpt
     assert payload["worker_image"]["suggested_or_expected"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
     assert payload["worker_image"]["instance_declared"] == "ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test"
     assert payload["worker_image"]["verification_level"] == "exact-match"
+
+
+def test_web_seedvr2_recovery_endpoint_recovers_without_reinference(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    recovery_state_path = tmp_path / "seedvr2_recovery_jobs.json"
+    monkeypatch.setattr(webapp_module, "_SEEDVR2_RECOVERY_STATE_PATH", recovery_state_path)
+
+    input_path = tmp_path / "input.mp4"
+    input_path.write_bytes(b"x")
+    output_path = tmp_path / "output.mp4"
+    report_path = tmp_path / "report.json"
+    recovery_job_id = "seedvr2-job-1"
+    webapp_module._upsert_seedvr2_recovery_job(
+        {
+            "recovery_job_id": recovery_job_id,
+            "instance_id": 123,
+            "engine": "seedvr2",
+            "seedvr2_profile": "smoke",
+            "remote_root_base": "/workspace/seedvr2-sessions",
+            "remote_session_id": "manual-abc123",
+            "ssh_host": "1.2.3.4",
+            "ssh_port": 22,
+            "local_input_path": str(input_path),
+            "local_output_path": str(output_path),
+            "local_report_path": str(report_path),
+            "inference_state": "completed",
+            "recovery_state": "pending",
+        }
+    )
+
+    class _FakeWriteClient:
+        def get_instance(self, _instance_id: int):
+            return InstanceSummary(
+                instance_id=123,
+                actual_status="running",
+                intended_status="running",
+                cur_state="running",
+                label="manual-instance",
+                image_runtype="ssh_direct",
+                ssh_port=22,
+                gpu_name="RTX 5080",
+                ssh_host="1.2.3.4",
+                machine_id="node",
+                image_name="ghcr.io/davbg67/vast-video-upscaler-seedvr2:exp-6a2-test",
+                hourly_price_usd=None,
+            )
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr("vast_upscaler.webapp._build_write_client", lambda _s: _FakeWriteClient())
+    monkeypatch.setattr("vast_upscaler.webapp._wait_for_ssh_tcp_availability", lambda **_kwargs: None)
+    monkeypatch.setattr("vast_upscaler.webapp._build_trusted_connection", lambda **_kwargs: object())
+    monkeypatch.setattr("vast_upscaler.webapp._resolve_private_key", lambda **_kwargs: Path("C:/keys/id_ed25519"))
+    monkeypatch.setattr("vast_upscaler.webapp.OpenSshTransport.check_ssh_ready", lambda *_a, **_k: None)
+    monkeypatch.setattr("vast_upscaler.webapp._run_manual_engine_preflight", lambda **_kwargs: None)
+
+    def _should_not_run_inference(**_kwargs):
+        raise AssertionError("inference runner must not be called during recovery-only flow")
+
+    monkeypatch.setattr("vast_upscaler.webapp.execute_remote_seedvr2_worker", _should_not_run_inference)
+
+    def _fake_recover_remote_seedvr2_results(**_kwargs):
+        output_path.write_bytes(b"video")
+        report_path.write_text('{"status":"completed","report_schema_version":"2.0"}', encoding="utf-8")
+        return SimpleNamespace(local_output_path=output_path, local_report_path=report_path)
+
+    monkeypatch.setattr("vast_upscaler.webapp.recover_remote_seedvr2_results", _fake_recover_remote_seedvr2_results)
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    mismatch = client.post(
+        "/api/jobs/recover-seedvr2",
+        json={"recovery_job_id": recovery_job_id, "instance_id": 124},
+    )
+    assert mismatch.status_code == 400
+    assert "does not match" in mismatch.json()["detail"]
+
+    response = client.post(
+        "/api/jobs/recover-seedvr2",
+        json={"recovery_job_id": recovery_job_id, "instance_id": 123},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    terminal = _wait_for_status(client, job_id, {"completed", "failed", "cancelled"})
+    assert terminal["status"] == "completed"
+
+    persisted = webapp_module._load_seedvr2_recovery_job(recovery_job_id)
+    assert persisted["inference_state"] == "completed"
+    assert persisted["recovery_state"] == "completed"
+
+    cfg = client.get("/api/config")
+    assert cfg.status_code == 200
+    jobs = cfg.json()["seedvr2_recovery_jobs"]
+    assert any(job["recovery_job_id"] == recovery_job_id for job in jobs)
+
+
+def test_web_seedvr2_recovery_jobs_persist_after_app_restart(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    recovery_state_path = tmp_path / "seedvr2_recovery_jobs.json"
+    monkeypatch.setattr(webapp_module, "_SEEDVR2_RECOVERY_STATE_PATH", recovery_state_path)
+    webapp_module._upsert_seedvr2_recovery_job(
+        {
+            "recovery_job_id": "seedvr2-persisted-job",
+            "instance_id": 456,
+            "engine": "seedvr2",
+            "seedvr2_profile": "reference",
+            "remote_root_base": "/workspace/seedvr2-sessions",
+            "remote_session_id": "manual-persisted",
+            "ssh_host": "1.2.3.4",
+            "ssh_port": 22,
+            "local_input_path": str(tmp_path / "input.mp4"),
+            "local_output_path": str(tmp_path / "out.mp4"),
+            "local_report_path": str(tmp_path / "report.json"),
+            "inference_state": "completed",
+            "recovery_state": "pending",
+        }
+    )
+
+    app = create_app(config_path=config_path)
+    client = TestClient(app)
+    cfg = client.get("/api/config")
+    assert cfg.status_code == 200
+    jobs = cfg.json()["seedvr2_recovery_jobs"]
+    assert any(job["recovery_job_id"] == "seedvr2-persisted-job" for job in jobs)
 
 
 def test_manual_plan_path_overrides_generated_plan_payload_for_contract_resolution(tmp_path: Path) -> None:
