@@ -490,12 +490,12 @@ class WebTaskManager:
                 )
         except Exception as exc:  # noqa: BLE001
             job.status = "failed"
-            details = str(exc)
-            lowered = details.lower()
-            if "could not download seedvr2" in lowered or "could not discover seedvr2" in lowered or "artifact" in lowered:
+            if isinstance(exc, RemoteSeedvr2WorkerRecoveryError):
                 job.business_state = "failed_recovery"
-            elif "exited with code" in lowered or "report status is not completed" in lowered:
+            elif isinstance(exc, RemoteSeedvr2WorkerProcessError):
                 job.business_state = "failed_inference"
+            elif isinstance(exc, RemoteSeedvr2WorkerPreparationError):
+                job.business_state = "failed_preparation"
             else:
                 job.business_state = "failed"
             job.error = str(exc)
@@ -524,7 +524,7 @@ class WebTaskManager:
         if kind == "transfer" and stage == "download" and status == "started":
             job.business_state = "inference_succeeded_recovering"
             job.append_event("status", {"state": "inference_succeeded_recovering", "message": "Inference finished, downloading artifacts."})
-        elif stage:
+        elif stage and job.business_state != "inference_succeeded_recovering":
             job.business_state = "running"
         job.append_event("worker", payload)
 

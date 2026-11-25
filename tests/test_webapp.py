@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,11 @@ from fastapi.testclient import TestClient
 import vast_upscaler.webapp as webapp_module
 from vast_upscaler.local_preprocessing import LocalExecutionReport
 from vast_upscaler.orchestrator import OrchestrationError
+from vast_upscaler.remote_seedvr2_worker import (
+    RemoteSeedvr2WorkerPreparationError,
+    RemoteSeedvr2WorkerProcessError,
+    RemoteSeedvr2WorkerRecoveryError,
+)
 from vast_upscaler.source_analysis import InterlaceInfo, SourceVideoAnalysis
 from vast_upscaler.vast_write_client import InstanceSummary
 from vast_upscaler.webapp import (
@@ -60,6 +66,12 @@ def _wait_for_status(client: TestClient, job_id: str, terminal: set[str], timeou
             return payload
         time.sleep(0.05)
     raise AssertionError(f"Timed out waiting for statuses={terminal}")
+
+
+def _read_events_text(client: TestClient, job_id: str) -> str:
+    response = client.get(f"/api/jobs/{job_id}/events?last_event_id=0")
+    assert response.status_code == 200
+    return response.text
 
 
 def test_web_config_endpoint_and_root(tmp_path: Path) -> None:
@@ -1111,6 +1123,116 @@ def test_manual_mode_keeps_instance_on_failure(tmp_path: Path, monkeypatch) -> N
 
     events_payload = client.get(f"/api/jobs/{job_id}/events?last_event_id=0").text
     assert "manual-instance-preserved" in events_payload
+
+
+def test_manual_seedvr2_progress_does_not_revert_business_state_after_download_start(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    stage_emitted = threading.Event()
+    continue_runner = threading.Event()
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        callbacks.report_worker_progress({"kind": "worker", "stage": "seedvr2-runner", "status": "started"})
+        stage_emitted.set()
+        continue_runner.wait(timeout=2.0)
+        return WorkflowExecutionResult(
+            mode="manual",
+            session_id=None,
+            state="COMPLETED",
+            output_path=str(tmp_path / "out.mp4"),
+            report_path=str(tmp_path / "report.json"),
+            duration_seconds=0.1,
+            estimated_total_usd=None,
+            instance_id=123,
+            instance_state="running",
+            cleanup_verified=False,
+            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
+        )
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    assert stage_emitted.wait(timeout=2.0)
+    snapshot = client.get(f"/api/jobs/{job_id}").json()
+    assert snapshot["business_state"] == "inference_succeeded_recovering"
+    continue_runner.set()
+    terminal = _wait_for_status(client, job_id, {"completed"})
+    assert terminal["business_state"] == "completed"
+
+
+def test_manual_seedvr2_sequence_inference_success_then_download_then_completed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "completed"})
+        return WorkflowExecutionResult(
+            mode="manual",
+            session_id=None,
+            state="COMPLETED",
+            output_path=str(tmp_path / "out.mp4"),
+            report_path=str(tmp_path / "report.json"),
+            duration_seconds=0.1,
+            estimated_total_usd=None,
+            instance_id=123,
+            instance_state="running",
+            cleanup_verified=False,
+            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
+        )
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    terminal = _wait_for_status(client, job_id, {"completed"})
+    assert terminal["status"] == "completed"
+    events_payload = _read_events_text(client, job_id)
+    recovering_index = events_payload.index('"state":"inference_succeeded_recovering"')
+    download_started_index = events_payload.index('"stage":"download","status":"started"')
+    download_completed_index = events_payload.index('"stage":"download","status":"completed"')
+    result_index = events_payload.index('"type":"result"')
+    assert recovering_index < download_started_index < download_completed_index < result_index
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_business_state"),
+    [
+        (RemoteSeedvr2WorkerPreparationError("prep failure"), "failed_preparation"),
+        (RemoteSeedvr2WorkerProcessError("inference failure"), "failed_inference"),
+        (RemoteSeedvr2WorkerRecoveryError("recovery failure"), "failed_recovery"),
+    ],
+)
+def test_manual_seedvr2_exception_type_drives_terminal_business_state(
+    tmp_path: Path,
+    monkeypatch,
+    exc: Exception,
+    expected_business_state: str,
+) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        raise exc
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    terminal = _wait_for_status(client, started.json()["job_id"], {"failed"})
+    assert terminal["business_state"] == expected_business_state
 
 
 def test_manual_mode_keeps_instance_on_cancellation(tmp_path: Path, monkeypatch) -> None:
