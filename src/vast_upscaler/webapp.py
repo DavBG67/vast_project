@@ -5,6 +5,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -98,6 +99,7 @@ _WORKER_IMAGE_REPO_BY_ENGINE: dict[EngineName, str] = {
     "realesrgan": "ghcr.io/davbg67/vast-video-upscaler-worker",
     "seedvr2": "ghcr.io/davbg67/vast-video-upscaler-seedvr2",
 }
+_MAX_JOB_EVENTS = 5_000
 _WORKER_IMAGE_PLACEHOLDERS = {
     "ghcr.io/acme/worker:test",
     "ghcr.io/<owner>/vast-video-upscaler-worker:dev-sha-<sha>",
@@ -146,6 +148,7 @@ class StartJobRequest(BaseModel):
     excerpt_start: str | None = None
     excerpt_duration_seconds: float = Field(default=10.0, gt=0)
     recover_seedvr2_job_id: str | None = None
+    execution_id: str | None = None
 
 
 class PromptReplyRequest(BaseModel):
@@ -230,7 +233,7 @@ class _Job:
         self.business_state = "pending"
         self.error: str | None = None
         self.result: WorkflowExecutionResult | None = None
-        self.events: list[dict[str, Any]] = []
+        self.events: deque[dict[str, Any]] = deque(maxlen=_MAX_JOB_EVENTS)
         self.next_event_id = 1
         self.condition = threading.Condition()
         self.thread: threading.Thread | None = None
@@ -392,6 +395,9 @@ class WebTaskManager:
             cursor = max(0, last_event_id)
             while True:
                 with job.condition:
+                    if job.events:
+                        oldest = int(job.events[0]["id"])
+                        cursor = max(cursor, oldest - 1)
                     pending = [e for e in job.events if int(e["id"]) > cursor]
                     if not pending:
                         if not job.is_active():
@@ -575,6 +581,8 @@ class WebTaskManager:
 
     @staticmethod
     def _job_snapshot(job: _Job) -> dict[str, Any]:
+        latest_event_id = int(job.events[-1]["id"]) if job.events else 0
+        oldest_event_id = int(job.events[0]["id"]) if job.events else 0
         payload: dict[str, Any] = {
             "job_id": job.job_id,
             "status": job.status,
@@ -586,6 +594,8 @@ class WebTaskManager:
             "updated_at": job.updated_at,
             "error": job.error,
             "pending_prompt": None,
+            "latest_event_id": latest_event_id,
+            "oldest_event_id": oldest_event_id,
         }
         if job.pending_prompt is not None:
             payload["pending_prompt"] = {
@@ -1115,13 +1125,27 @@ def _resolve_output_path(*, request: StartJobRequest) -> Path:
     if request.output_path:
         return Path(request.output_path)
     source = _resolve_input_video_path(request=request)
-    return source.with_name(f"{source.stem}-upscaled.mp4")
+    execution_id = _ensure_execution_id(request)
+    engine = _normalize_engine(request.engine)
+    return source.with_name(f"{source.stem}-upscaled-{engine}-{execution_id}.mp4")
 
 
 def _resolve_report_path(*, request: StartJobRequest, output_path: Path) -> Path:
     if request.report_path:
         return Path(request.report_path)
     return output_path.with_suffix(output_path.suffix + ".report.json")
+
+
+def _ensure_execution_id(request: StartJobRequest) -> str:
+    current = (request.execution_id or "").strip().lower()
+    if current:
+        normalized = re.sub(r"[^a-z0-9-]+", "-", current).strip("-")
+        if normalized:
+            request.execution_id = normalized
+            return normalized
+    generated = datetime.now(UTC).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:6]
+    request.execution_id = generated
+    return generated
 
 
 def _resolve_remote_preprocessing_contract(*, request: StartJobRequest) -> dict[str, Any] | None:
@@ -2387,11 +2411,19 @@ _INDEX_HTML = """
     let currentJobId = null;
     let lastEventId = 0;
     let es = null;
+    let sseRetryCount = 0;
+    let sseReconnectTimer = null;
+    let snapshotPollTimer = null;
+    let snapshotRefreshTimer = null;
+    let trackedJobVersion = 0;
     let promptDialogOpen = false;
     let latestAnalysisPayload = null;
     let latestPlanPayload = null;
     let analysisRequestToken = 0;
     let currentBusinessState = "idle";
+    let currentStageLabel = "n/a";
+    let latestProgressRatio = null;
+    let latestChunkProgress = null;
     let latestWorkerImageByEngine = { realesrgan: "", seedvr2: "" };
     let latestRecoveryJobs = [];
     const expectedWorkerRepoByEngine = {
@@ -2402,11 +2434,33 @@ _INDEX_HTML = """
     let currentJobStartedAt = null;
     const handledPromptIds = new Set();
     const unsupportedRemoteOps = new Set(["deinterlace", "denoise", "deblock"]);
+    const MAX_EVENT_LINES = 1000;
+    const EVENT_FLUSH_INTERVAL_MS = 100;
+    const eventLines = [];
+    let eventFlushScheduled = false;
+    const ACTIVE_JOB_STATUSES = new Set(["running"]);
+    const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
     function appendEvent(msg) {
+      eventLines.push(msg);
+      if (eventLines.length > MAX_EVENT_LINES) {
+        eventLines.shift();
+      }
+      if (eventFlushScheduled) return;
+      eventFlushScheduled = true;
+      setTimeout(() => {
+        eventFlushScheduled = false;
+        const box = document.getElementById("events");
+        box.textContent = eventLines.join("\\n");
+        box.scrollTop = box.scrollHeight;
+      }, EVENT_FLUSH_INTERVAL_MS);
+    }
+
+    function resetEventsLog() {
+      eventLines.length = 0;
+      eventFlushScheduled = false;
       const box = document.getElementById("events");
-      box.textContent += msg + "\\n";
-      box.scrollTop = box.scrollHeight;
+      box.textContent = "";
     }
 
     function prettyBytes(size) {
@@ -2435,6 +2489,105 @@ _INDEX_HTML = """
 
     function setStatusLabel(value) {
       document.getElementById("status").textContent = value || "n/a";
+    }
+
+    function clearMonitoring() {
+      if (es) {
+        es.close();
+        es = null;
+      }
+      if (sseReconnectTimer) {
+        clearTimeout(sseReconnectTimer);
+        sseReconnectTimer = null;
+      }
+      if (snapshotPollTimer) {
+        clearInterval(snapshotPollTimer);
+        snapshotPollTimer = null;
+      }
+      if (snapshotRefreshTimer) {
+        clearInterval(snapshotRefreshTimer);
+        snapshotRefreshTimer = null;
+      }
+    }
+
+    function rememberTrackedJob(jobId) {
+      try {
+        if (jobId) {
+          window.localStorage.setItem("vast-upscaler-current-job-id", String(jobId));
+        } else {
+          window.localStorage.removeItem("vast-upscaler-current-job-id");
+        }
+      } catch (_err) {
+        // localStorage may be unavailable in private contexts
+      }
+    }
+
+    function setJobStage(stage) {
+      if (!stage) return;
+      currentStageLabel = String(stage);
+      document.getElementById("job-stage").textContent = currentStageLabel;
+    }
+
+    function setJobProgressFromRatio(progressRatio, label) {
+      if (!Number.isFinite(Number(progressRatio))) return;
+      const clamped = Math.max(0, Math.min(1, Number(progressRatio)));
+      if (latestProgressRatio != null && clamped < latestProgressRatio) return;
+      latestProgressRatio = clamped;
+      const pct = (clamped * 100).toFixed(1);
+      document.getElementById("job-progress").textContent = label ? `${pct}% — ${label}` : `${pct}%`;
+    }
+
+    async function resyncJobSnapshot(jobId, expectedVersion) {
+      const response = await fetch(`/api/jobs/${jobId}`);
+      if (!response.ok) {
+        throw new Error(`snapshot ${response.status}`);
+      }
+      const snapshot = await response.json();
+      if (expectedVersion !== trackedJobVersion || snapshot.job_id !== currentJobId) return;
+      if (Number.isFinite(Number(snapshot.latest_event_id))) {
+        lastEventId = Math.max(lastEventId, Number(snapshot.latest_event_id));
+      }
+      const snapshotState = String(snapshot.business_state || snapshot.status || currentBusinessState);
+      currentBusinessState = snapshotState;
+      setStatusLabel(snapshot.status || snapshotState);
+      if (snapshot.error) {
+        document.getElementById("job-error").classList.remove("hidden");
+        document.getElementById("job-error").textContent = "Erreur : " + String(snapshot.error);
+      }
+      if (snapshot.result) {
+        const outputPath = snapshot.result.output_path || "n/a";
+        const reportPath = snapshot.result.report_path || "n/a";
+        document.getElementById("job-result").innerHTML = `Sortie : <code>${outputPath}</code><br/>Rapport : <code>${reportPath}</code>`;
+        if (Number.isFinite(Number(snapshot.result.duration_seconds))) {
+          document.getElementById("job-elapsed").textContent = prettyDuration(Number(snapshot.result.duration_seconds));
+        }
+      }
+      if (!TERMINAL_JOB_STATUSES.has(String(snapshot.status || ""))) {
+        if (currentJobStartedAt) {
+          const elapsed = (Date.now() - currentJobStartedAt) / 1000;
+          document.getElementById("job-elapsed").textContent = prettyDuration(elapsed);
+        }
+      } else {
+        clearMonitoring();
+        rememberTrackedJob(null);
+      }
+    }
+
+    function scheduleSseReconnect(jobId, expectedVersion) {
+      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+      if (sseReconnectTimer) return;
+      const baseDelay = Math.min(5000, 500 * Math.pow(2, Math.min(sseRetryCount, 5)));
+      const delay = baseDelay + Math.floor(Math.random() * 250);
+      sseReconnectTimer = setTimeout(async () => {
+        sseReconnectTimer = null;
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        try {
+          await resyncJobSnapshot(jobId, expectedVersion);
+        } catch (_err) {
+          // keep reconnect loop alive
+        }
+        connectEventStream(jobId, expectedVersion);
+      }, delay);
     }
 
     function renderRecoveryJobs() {
@@ -2545,6 +2698,13 @@ _INDEX_HTML = """
           excerpt_start: null,
           excerpt_duration_seconds: 10,
         };
+      }
+
+      function makeExecutionId() {
+        const now = new Date();
+        const stamp = now.toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+        const random = Math.random().toString(36).slice(2, 8);
+        return `web-${stamp}-${random}`;
       }
       const startRaw = document.getElementById("excerpt_start").value.trim() || "00:00";
       const duration = Number(document.getElementById("excerpt_duration_seconds").value || 10);
@@ -3018,32 +3178,47 @@ _INDEX_HTML = """
         const state = payload.state || payload.message || "running";
         currentBusinessState = String(state || currentBusinessState);
         setStatusLabel(state);
-        if (payload.message) {
-          document.getElementById("job-stage").textContent = payload.message;
-        }
+        if (payload.message) setJobStage(payload.message);
         if (state === "inference_succeeded_recovering") {
           document.getElementById("job-result").textContent = "Inférence terminée. Récupération des artefacts en cours…";
+          if (latestProgressRatio == null || latestProgressRatio < 0.999) {
+            setJobProgressFromRatio(0.999, "Inférence terminée");
+          }
         }
       } else if (type === "provisioning") {
         const phase = payload.phase || payload.status || "provisioning";
-        document.getElementById("job-stage").textContent = String(phase);
+        setJobStage(String(phase));
       } else if (type === "instance") {
         if (payload.state !== "manual-instance-preserved") {
-          document.getElementById("job-stage").textContent = String(payload.message || payload.state || "instance");
+          setJobStage(String(payload.message || payload.state || "instance"));
         }
       } else if (type === "worker") {
-        const stage = payload.stage || "worker";
-        document.getElementById("job-stage").textContent = String(stage);
+        const stage = payload.stage || currentStageLabel || "worker";
+        setJobStage(String(stage));
         const framesDone = payload.frames_done;
         const framesTotal = payload.frames_total;
         const fps = payload.fps_processing;
-        if (Number.isFinite(Number(framesDone)) && Number.isFinite(Number(framesTotal)) && Number(framesTotal) > 0) {
-          const pct = ((Number(framesDone) / Number(framesTotal)) * 100).toFixed(1);
-          document.getElementById("job-progress").textContent = `${pct}% (${framesDone}/${framesTotal})`;
+        const chunkCurrent = Number(payload.chunk_current);
+        const chunkTotal = Number(payload.chunk_total);
+        const chunksCompleted = Number(payload.chunks_completed);
+        if (Number.isFinite(chunkCurrent) && Number.isFinite(chunkTotal) && chunkTotal > 0) {
+          latestChunkProgress = {
+            current: chunkCurrent,
+            total: chunkTotal,
+            completed: Number.isFinite(chunksCompleted) ? chunksCompleted : Math.max(0, chunkCurrent - 1),
+          };
+          if (Number.isFinite(Number(payload.progress))) {
+            setJobProgressFromRatio(Number(payload.progress), `chunk ${latestChunkProgress.current}/${latestChunkProgress.total}`);
+          } else {
+            const ratio = Math.max(0, Math.min(0.999, latestChunkProgress.completed / latestChunkProgress.total));
+            setJobProgressFromRatio(ratio, `chunk ${latestChunkProgress.current}/${latestChunkProgress.total}`);
+          }
+        } else if (Number.isFinite(Number(framesDone)) && Number.isFinite(Number(framesTotal)) && Number(framesTotal) > 0) {
+          setJobProgressFromRatio(Number(framesDone) / Number(framesTotal), `${framesDone}/${framesTotal} images`);
         } else if (Number.isFinite(Number(framesDone))) {
           document.getElementById("job-progress").textContent = `${framesDone} images traitées`;
-        } else {
-          document.getElementById("job-progress").textContent = "n/a";
+        } else if (latestProgressRatio == null) {
+          document.getElementById("job-progress").textContent = "indéterminée";
         }
         if (Number.isFinite(Number(payload.elapsed_seconds))) {
           document.getElementById("job-elapsed").textContent = prettyDuration(Number(payload.elapsed_seconds));
@@ -3059,8 +3234,8 @@ _INDEX_HTML = """
       } else if (type === "result") {
         currentBusinessState = "completed";
         setStatusLabel("completed");
-        document.getElementById("job-stage").textContent = String(payload.state || "completed");
-        document.getElementById("job-progress").textContent = "Terminé";
+        setJobStage(String(payload.state || "completed"));
+        setJobProgressFromRatio(1.0, "Terminé");
         document.getElementById("job-elapsed").textContent = prettyDuration(Number(payload.duration_seconds || 0));
         const outputPath = payload.output_path || "n/a";
         const reportPath = payload.report_path || "n/a";
@@ -3076,16 +3251,25 @@ _INDEX_HTML = """
         document.getElementById("job-error").classList.remove("hidden");
         document.getElementById("job-error").textContent = "Erreur : " + String(payload.message || "échec inconnu");
       } else if (type === "prompt") {
-        document.getElementById("job-stage").textContent = "Confirmation requise";
+        setJobStage("Confirmation requise");
       }
     }
 
-    function watchEvents(jobId) {
-      if (es) es.close();
+    function connectEventStream(jobId, expectedVersion) {
+      if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+      if (es) {
+        es.close();
+        es = null;
+      }
       es = new EventSource(`/api/jobs/${jobId}/events?last_event_id=${lastEventId}`);
       es.onmessage = async (evt) => {
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
         const data = JSON.parse(evt.data);
+        if (Number.isFinite(Number(data.id)) && Number(data.id) <= lastEventId) {
+          return;
+        }
         lastEventId = data.id;
+        sseRetryCount = 0;
         appendEvent(`[${data.type}] ${JSON.stringify(data.payload)}`);
         updateJobSummaryFromEvent(data);
         if (data.type === "prompt") {
@@ -3099,8 +3283,38 @@ _INDEX_HTML = """
           } else {
             setStatusLabel("failed");
           }
+          clearMonitoring();
+          rememberTrackedJob(null);
         }
       };
+      es.onerror = async () => {
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        sseRetryCount += 1;
+        try {
+          await resyncJobSnapshot(jobId, expectedVersion);
+        } catch (_err) {
+          // ignored, next reconnect will retry
+        }
+        scheduleSseReconnect(jobId, expectedVersion);
+      };
+    }
+
+    function watchEvents(jobId) {
+      clearMonitoring();
+      trackedJobVersion += 1;
+      const expectedVersion = trackedJobVersion;
+      connectEventStream(jobId, expectedVersion);
+      snapshotPollTimer = setInterval(() => {
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        resyncJobSnapshot(jobId, expectedVersion).catch(() => {});
+      }, 3000);
+      snapshotRefreshTimer = setInterval(() => {
+        if (expectedVersion !== trackedJobVersion || jobId !== currentJobId) return;
+        if (currentJobStartedAt && ACTIVE_JOB_STATUSES.has(currentBusinessState) && latestProgressRatio == null) {
+          const elapsed = (Date.now() - currentJobStartedAt) / 1000;
+          document.getElementById("job-elapsed").textContent = prettyDuration(elapsed);
+        }
+      }, 1000);
     }
 
     document.getElementById("job-form").addEventListener("submit", async (event) => {
@@ -3136,6 +3350,7 @@ _INDEX_HTML = """
         excerpt_enabled: excerptEnabled(),
         excerpt_start: excerptEnabled() ? (document.getElementById("excerpt_start").value.trim() || "00:00") : null,
         excerpt_duration_seconds: excerptEnabled() ? Number(document.getElementById("excerpt_duration_seconds").value || 10) : 10,
+        execution_id: makeExecutionId(),
       };
       const response = await fetch("/api/jobs/start", {
         method: "POST",
@@ -3153,16 +3368,21 @@ _INDEX_HTML = """
         appendEvent("Un plan manuel est défini : il priorise les choix de prétraitement de l’IHM.");
       }
       currentJobId = data.job_id;
+      rememberTrackedJob(currentJobId);
       lastEventId = 0;
       currentJobStartedAt = Date.now();
       currentBusinessState = "running";
+      latestProgressRatio = null;
+      latestChunkProgress = null;
+      currentStageLabel = "Initialisation";
       handledPromptIds.clear();
       promptDialogOpen = false;
+      resetEventsLog();
       document.getElementById("job-error").classList.add("hidden");
       document.getElementById("job-error").textContent = "";
       document.getElementById("job-result").textContent = "Traitement démarré…";
       document.getElementById("job-progress").textContent = "n/a";
-      document.getElementById("job-stage").textContent = "Initialisation";
+      setJobStage("Initialisation");
       setStatusLabel("running");
       appendEvent("Traitement démarré : " + currentJobId);
       watchEvents(currentJobId);
@@ -3187,16 +3407,21 @@ _INDEX_HTML = """
         return;
       }
       currentJobId = data.job_id;
+      rememberTrackedJob(currentJobId);
       lastEventId = 0;
       currentJobStartedAt = Date.now();
       currentBusinessState = "running";
+      latestProgressRatio = null;
+      latestChunkProgress = null;
+      currentStageLabel = "Récupération";
       handledPromptIds.clear();
       promptDialogOpen = false;
+      resetEventsLog();
       document.getElementById("job-error").classList.add("hidden");
       document.getElementById("job-error").textContent = "";
       document.getElementById("job-result").textContent = "Récupération des résultats démarrée…";
       document.getElementById("job-progress").textContent = "indéterminée";
-      document.getElementById("job-stage").textContent = "Récupération";
+      setJobStage("Récupération");
       setStatusLabel("running");
       appendEvent("Récupération SeedVR2 démarrée : " + currentJobId + " (source=" + recoveryId + ")");
       watchEvents(currentJobId);
@@ -3248,6 +3473,18 @@ _INDEX_HTML = """
     updateExcerptControls();
     loadDefaults();
     loadVideoSources();
+    const rememberedJobId = (() => {
+      try {
+        return window.localStorage.getItem("vast-upscaler-current-job-id");
+      } catch (_err) {
+        return null;
+      }
+    })();
+    if (rememberedJobId) {
+      currentJobId = rememberedJobId;
+      watchEvents(currentJobId);
+      resyncJobSnapshot(currentJobId, trackedJobVersion).catch(() => {});
+    }
   </script>
 </body>
 </html>

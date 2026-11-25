@@ -108,6 +108,10 @@ def test_web_index_contains_plan_based_dimension_preview_logic(tmp_path: Path) -
     assert "currentRepo !== expectedRepo" in html
     assert "workerImage.value = suggested;" in html
     assert 'payload.state !== "manual-instance-preserved"' in html
+    assert "MAX_EVENT_LINES = 1000" in html
+    assert "resyncJobSnapshot" in html
+    assert "scheduleSseReconnect" in html
+    assert "localStorage.setItem" in html
 
 
 def test_web_index_contains_required_ux_controls_and_sections(tmp_path: Path) -> None:
@@ -718,9 +722,10 @@ def test_resolve_output_path_defaults_to_mp4_for_all_sources(tmp_path: Path) -> 
     mp4 = tmp_path / "clip.mp4"
     for item in (mkv, webm, mp4):
         item.write_bytes(b"x")
-    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mkv))).name == "clip-upscaled.mp4"
-    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(webm))).name == "clip-upscaled.mp4"
-    assert _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(mp4))).name == "clip-upscaled.mp4"
+    for source in (mkv, webm, mp4):
+        resolved = _resolve_output_path(request=StartJobRequest(mode="automatic", input_path=str(source))).name
+        assert resolved.startswith("clip-upscaled-realesrgan-")
+        assert resolved.endswith(".mp4")
 
 
 def test_web_job_start_rejects_incompatible_explicit_output_extension(tmp_path: Path) -> None:
@@ -1203,6 +1208,44 @@ def test_manual_seedvr2_sequence_inference_success_then_download_then_completed(
     download_completed_index = events_payload.index('"stage":"download","status":"completed"')
     result_index = events_payload.index('"type":"result"')
     assert recovering_index < download_started_index < download_completed_index < result_index
+
+
+def test_manual_seedvr2_high_volume_worker_logs_preserve_terminal_state(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("vast_upscaler.webapp._validate_local_decode_capability", lambda **_kwargs: None)
+    config_path = _write_config(tmp_path)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"x")
+
+    def _manual_runner(_request: StartJobRequest, _settings, callbacks: RunCallbacks) -> WorkflowExecutionResult:
+        for index in range(10_000):
+            callbacks.report_worker_progress({"kind": "worker-log", "line": f"log line {index}"})
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "started"})
+        callbacks.report_worker_progress({"kind": "transfer", "stage": "download", "status": "completed"})
+        return WorkflowExecutionResult(
+            mode="manual",
+            session_id=None,
+            state="COMPLETED",
+            output_path=str(tmp_path / "out.mp4"),
+            report_path=str(tmp_path / "report.json"),
+            duration_seconds=0.1,
+            estimated_total_usd=None,
+            instance_id=123,
+            instance_state="running",
+            cleanup_verified=False,
+            cleanup_warning="Manual mode leaves instance running. Destroy manually when done.",
+        )
+
+    app = create_app(config_path=config_path, manual_runner=_manual_runner)
+    client = TestClient(app)
+    started = client.post("/api/jobs/start", json={"mode": "manual", "engine": "seedvr2", "input_path": str(source), "instance_id": 123})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+    terminal = _wait_for_status(client, job_id, {"completed"})
+    assert terminal["status"] == "completed"
+    assert terminal["latest_event_id"] >= terminal["oldest_event_id"] > 1
+    assert (terminal["latest_event_id"] - terminal["oldest_event_id"]) < 5_000
+    events_payload = _read_events_text(client, job_id)
+    assert '"type":"result"' in events_payload
 
 
 @pytest.mark.parametrize(

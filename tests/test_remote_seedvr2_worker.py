@@ -279,8 +279,10 @@ def test_seedvr2_progress_parser_uses_expected_patterns() -> None:
     assert _parse_seedvr2_progress_line(line="chunk 1/4", state=state) == {
         "kind": "worker",
         "stage": "dit-upscale",
-        "chunk_done": 1,
+        "chunk_current": 1,
         "chunk_total": 4,
+        "chunks_completed": 0,
+        "progress": pytest.approx(0.0),
         "determinate": False,
     }
     frame_event = _parse_seedvr2_progress_line(line="frames 25/100", state=state)
@@ -306,11 +308,13 @@ def test_seedvr2_progress_parser_does_not_treat_chunk_internal_counters_as_globa
     assert event == {
         "kind": "worker",
         "stage": "dit-upscale",
-        "chunk_done": 2,
+        "chunk_current": 2,
         "chunk_total": 8,
+        "chunks_completed": 1,
+        "progress": pytest.approx(0.125),
         "determinate": False,
     }
-    assert state.last_progress == 0.0
+    assert state.last_progress == pytest.approx(0.125)
 
 
 def test_execute_remote_seedvr2_worker_emits_progress_before_inference_end(tmp_path: Path) -> None:
